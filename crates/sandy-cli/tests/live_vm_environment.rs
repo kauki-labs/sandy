@@ -1,9 +1,9 @@
-//! Live VM environment (#587, C3b): `sandyd` with `SANDY_ENV_BACKEND=vm-qemu` boots the t3 guest as a qemu microVM,
-//! reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no qemu process or
+//! Live VM environment (#587, C3b): `sandyd` with `SANDY_ENV_BACKEND=vm-qemu` boots the service guest as a qemu
+//! microVM, reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no qemu process or
 //! run directory behind once the environment is deleted.
 //!
 //! Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and `/dev/vhost-vsock`
-//! only; the first run builds a 3.7 GB guest image, so the provision timeout is far above the 120 s default.
+//! only; a cold first run builds the guest image, so the provision timeout is far above the 120 s default.
 //!
 //!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-cli --features live --test live_vm_environment
 //!
@@ -35,7 +35,7 @@ use tokio::net::UnixStream;
 mod common;
 use common::{guest_flake, require_live};
 
-/// A cold boot of the t3 guest plus its service; generous, and passed to the daemon as the provision timeout.
+/// A cold boot of the service guest plus its service; generous, and passed to the daemon as the provision timeout.
 const PROVISION_SECS: u64 = 900;
 
 /// Stops the daemon with SIGTERM first and SIGKILL as a fallback, then kills the qemu it started, so a failure
@@ -93,7 +93,15 @@ fn sandyd_bin() -> anyhow::Result<PathBuf> {
     }
     let sandy = PathBuf::from(env!("CARGO_BIN_EXE_sandy"));
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "sandyd", "--bin", "sandyd"])
+        .args([
+            "build",
+            "-p",
+            "sandyd",
+            "--bin",
+            "sandyd",
+            "--features",
+            "stub-trust-root",
+        ])
         .arg("--manifest-path")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
         .status()
@@ -173,10 +181,13 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     let flake = guest_flake();
     let build = Command::new("nix")
         .args(["build", "--no-link"])
-        .arg(format!("{}#packages.x86_64-linux.guest-runner-t3", flake.display()))
+        .arg(format!(
+            "{}#packages.x86_64-linux.guest-runner-service",
+            flake.display()
+        ))
         .status()
-        .context("spawn nix build for the t3 guest")?;
-    ensure!(build.success(), "nix build of the t3 guest runner failed");
+        .context("spawn nix build for the service guest")?;
+    ensure!(build.success(), "nix build of the service guest runner failed");
 
     let qemu_before = qemu_pids()?;
     // Under `/tmp`, not `$TMPDIR`: a nix shell's is long, and `sandyd.sock` and the run's sockets live under this dir.
@@ -194,17 +205,27 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     std::fs::create_dir(&tmp)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
     let sock = dir.path().join("sandyd.sock");
+    // A create needs a registry naming the profile (#704); the stub trust root named by `SANDYD_STUB_TRUST_ROOT` backs
+    // its credential (a feature-gated build of sandyd).
+    let profiles = dir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"profiles":[{"name":"live","credential":"live","targets":["o/r"],"capabilities":["read_code"]}]}"#,
+    )?;
+    std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o600))?;
     let _daemon = Daemon(
         Command::new(sandyd_bin()?)
             .env("SANDY_SOCK", &sock)
             .env("TMPDIR", &tmp)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
+            .env("SANDY_PROFILES", &profiles)
+            .env("SANDYD_STUB_TRUST_ROOT", "live")
             .env("SANDY_ENV_BACKEND", "vm-qemu")
             .env(
                 "SANDY_ENV_VM_TEMPLATE",
-                format!("{}#topologies.x86_64-linux.qemu-t3", flake.display()),
+                format!("{}#topologies.x86_64-linux.qemu-service", flake.display()),
             )
-            .env("SANDY_ENV_VM_COMMAND", "t3 serve --port {port}")
+            .env("SANDY_ENV_VM_COMMAND", "sandy-example-service --port {port}")
             .env("SANDY_ENV_VM_SERVICE_PORT", "3773")
             .env("SANDY_ENV_PROVISION_TIMEOUT_SECS", PROVISION_SECS.to_string())
             .stdout(Stdio::null())

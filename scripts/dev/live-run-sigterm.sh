@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live gate for #687, tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest under `sandy run`, sends SIGTERM (or SIGHUP) to the `sandy` process while the guest runs, or with
+# Boots the service guest under `sandy run`, sends SIGTERM (or SIGHUP) to the `sandy` process while the guest runs, or with
 # KILL runs `sandy kill <job-id>` from a second process (#695), and checks that it tears down instead of dying with the default action: sandy exits on its own within the time budget,
 # the job record is terminal (`cancelled`, not `running`), every process the box started is gone, and the run
 # directory is removed.
@@ -29,13 +29,13 @@ Linux)
     echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
     exit 2
   fi
-  guest_runner=packages.x86_64-linux.guest-runner-t3
-  topology=topologies.x86_64-linux.qemu-t3
+  guest_runner=packages.x86_64-linux.guest-runner-service
+  topology=topologies.x86_64-linux.qemu-service
   tools=(nixpkgs#qemu nixpkgs#virtiofsd)
   ;;
 Darwin)
-  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-t3
-  topology=topologies.aarch64-linux.vfkit-t3
+  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-service
+  topology=topologies.aarch64-linux.vfkit-service
   tools=(nixpkgs#vfkit)
   ;;
 *)
@@ -73,7 +73,7 @@ target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -I -c 'import
 echo "== building sandy and the egress proxy"
 cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
-echo "== building the T3 guest"
+echo "== building the service guest"
 nix build --no-link "$repo_root/nix/guest#$guest_runner"
 
 echo "== starting the guest"

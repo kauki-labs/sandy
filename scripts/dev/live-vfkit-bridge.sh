@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Live gate for the guest service bridge on vfkit (#590, KSB4), tier-3, never counted green from a fake (INV-S9).
 #
-# The macOS counterpart of live-vsock-bridge.sh. Boots the T3 guest (nix/guest, topology vfkit-t3) through
+# The macOS counterpart of live-vsock-bridge.sh. Boots the service guest (nix/guest, topology vfkit-service) through
 # `VfkitBackend::with_service_socket`, so vfkit's `connect` device exposes the guest's relay port at a host unix
-# socket. The guest runs `sandy-agent port-relay` and `t3 serve`; the sandy-conn live test then runs a Bridge over a
+# socket. The guest runs `sandy-agent port-relay` and `sandy-example-service`; the sandy-conn live test then runs a Bridge over a
 # UnixDialer to that socket, polls a GET until the status is below 500, then shuts the bridge down.
 #
 # Needs: an Apple-silicon macOS host with nix and the aarch64-linux builder (`sandy doctor` names what is missing).
@@ -40,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The job the guest runs: the relay as root (port 1000, the privileged relay port) and t3 as the service user.
+# The job the guest runs: the relay as root (port 1000, the privileged relay port) and the service as its user.
 # It holds the guest open past the host test's poll bound (120 s) plus its 60 s read timeout, then exits.
 cat >"$work/guest.sh" <<'GUEST'
 set -u
@@ -48,21 +48,21 @@ agent=$(ls -d /nix/store/*-sandy-agent-*/bin/sandy-agent 2>/dev/null | head -1)
 echo "SK> agent=$agent"
 "$agent" port-relay --vsock-port 1000 --to 127.0.0.1:3773 >/tmp/relay.log 2>&1 &
 relay_pid=$!
-mkdir -p /var/lib/t3/data
-chown -R t3:t3 /var/lib/t3
-runuser -u t3 -- t3 serve --host 127.0.0.1 --port 3773 --base-dir /var/lib/t3/data --no-browser >/tmp/t3.log 2>&1 &
-t3_pid=$!
+mkdir -p /var/lib/service/data
+chown -R service:service /var/lib/service
+runuser -u service -- sandy-example-service --port 3773 --dir /var/lib/service/data >/tmp/service.log 2>&1 &
+service_pid=$!
 i=0
-until sandy-t3-ready; do
+until sandy-http-ready; do
   i=$((i + 1))
-  if [ "$i" -gt 120 ]; then echo "SK> t3 never ready"; exit 3; fi
+  if [ "$i" -gt 120 ]; then echo "SK> service never ready"; exit 3; fi
   sleep 1
 done
-echo "SK> t3 ready after ${i}s"
-# Hold the guest open, and fail if the relay or t3 dies while the host test may still be using them.
+echo "SK> service ready after ${i}s"
+# Hold the guest open, and fail if the relay or the service dies while the host test may still be using them.
 for _ in $(seq 180); do
   kill -0 "$relay_pid" 2>/dev/null || { echo "SK> relay exited"; exit 4; }
-  kill -0 "$t3_pid" 2>/dev/null || { echo "SK> t3 exited"; exit 5; }
+  kill -0 "$service_pid" 2>/dev/null || { echo "SK> service exited"; exit 5; }
   sleep 1
 done
 echo "SK> done"
@@ -74,8 +74,8 @@ target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -I -c 'import
 cargo build -q -p sandy-cli --features live --bin live-vfkit-guest
 cargo nextest run -p sandy-conn --features live --test live_vsock_bridge --no-run
 
-echo "== building the T3 guest"
-nix build --no-link "$repo_root/nix/guest#packages.aarch64-darwin.guest-runner-vfkit-t3"
+echo "== building the service guest"
+nix build --no-link "$repo_root/nix/guest#packages.aarch64-darwin.guest-runner-vfkit-service"
 
 echo "== booting the guest"
 socket="$work/svc.sock"
@@ -107,7 +107,7 @@ echo "== service socket $socket; running the live test"
 status=0
 SANDY_LIVE_GUEST_SOCKET="$socket" cargo nextest run -p sandy-conn --features live --test live_vsock_bridge --no-capture || status=$?
 
-# The driver's own exit decides too: a guest job that fails after the host test passed (t3 never ready, a crash)
+# The driver's own exit decides too: a guest job that fails after the host test passed (service never ready, a crash)
 # must not read as green.
 driver=0
 wait "$sandy_pid" || driver=$?

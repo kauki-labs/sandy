@@ -4,10 +4,10 @@
 //! fails, rather than skips, when it is not pointed at a guest.
 //!
 //! The guest runs `sandy-agent port-relay --vsock-port 5100 --to 127.0.0.1:3773` and a service on that port (for
-//! example `t3 serve`). This test starts a [`Bridge`] over a [`VsockDialer`] to that guest's CID, makes an HTTP
-//! request through the bridge's loopback address, and checks the guest service answered. The dial window is long enough
-//! for the guest to boot, so it also exercises the readiness retry (the relay is not bound, then the service is not up,
-//! until it is).
+//! example `sandy-example-service`). This test starts a [`Bridge`] over a [`VsockDialer`] to that guest's CID, makes an
+//! HTTP request through the bridge's loopback address, and checks the guest service answered. The dial window is long
+//! enough for the guest to boot, so it also exercises the readiness retry (the relay is not bound, then the service is
+//! not up, until it is).
 //!
 //! On macOS the vfkit leg (KSB4) runs the same check over a [`UnixDialer`] to the host socket of vfkit's `connect`
 //! device, which `scripts/dev/live-vfkit-bridge.sh` sets up.

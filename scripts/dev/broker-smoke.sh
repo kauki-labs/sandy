@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts a real sandyd and sandy-broker on this machine and drives the broker's
-# environment endpoints with curl. It checks the wiring that T3 -> MCP -> broker -> sandyd
+# environment endpoints with curl. It checks the wiring that an agent -> MCP -> broker -> sandyd
 # depends on, not a VM. By default there is no launch backend, so an environment stays
 # `provisioning`. With BROKER_SMOKE_READY=1 sandyd runs the insecure process backend (no
 # isolation) with a stand-in service, and the environment must reach

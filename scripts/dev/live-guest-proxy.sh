@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 # Live gate for #609 (epic #597), tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest (nix/guest, topology qemu-t3 on a Linux KVM host, vfkit-t3 on Apple silicon) in egress-proxy
-# mode and shows that the harness binaries t3 launches (`claude`, `codex`) reach their provider through the guest's
-# proxy relay
-# (`HTTPS_PROXY=http://127.0.0.1:3128`), and that a host off the allow-list does not get through. The guest has no NIC,
-# so a request that reaches the provider can only have gone through the proxy. The harnesses get a fake key: the
-# provider's own 401 is the proof that the request arrived.
+# Boots the service guest (nix/guest, topology qemu-service on a Linux KVM host, vfkit-service on Apple silicon) in
+# egress-proxy mode and shows that an HTTPS client in the guest reaches an allow-listed host through the guest's proxy
+# relay (`HTTPS_PROXY=http://127.0.0.1:3128`), and that a host off the allow-list does not get through. The guest has
+# no NIC, so a reply from an outside host can only have gone through the proxy.
 #
 # Needs: a Linux host with KVM and /dev/vhost-vsock access, or an Apple silicon macOS host with the aarch64-linux
 # builder (`sandy doctor` names what is missing); nix. No root, tap or nft, no real credential. Run from the repo root:
 #
-#   scripts/dev/live-harness-proxy.sh
+#   scripts/dev/live-guest-proxy.sh
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -23,22 +21,22 @@ Linux)
     echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
     exit 2
   fi
-  topology=topologies.x86_64-linux.qemu-t3
-  guest_runner=packages.x86_64-linux.guest-runner-t3
+  topology=topologies.x86_64-linux.qemu-service
+  guest_runner=packages.x86_64-linux.guest-runner-service
   hypervisor_tools=(nixpkgs#qemu nixpkgs#virtiofsd)
   # sandy runs in its own session, so its qemu, virtiofsd and egress proxy share one process group.
   isolate=(setsid)
   ;;
 Darwin)
   # The vfkit leg (KHE5): the same checks on an Apple silicon guest. vfkit needs no privileges.
-  topology=topologies.aarch64-linux.vfkit-t3
-  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-t3
+  topology=topologies.aarch64-linux.vfkit-service
+  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-service
   hypervisor_tools=(nixpkgs#vfkit)
   # macOS has no setsid; the vfkit proxy listens on a socket under the run's work dir, which the path sweep finds.
   isolate=()
   ;;
 *)
-  echo "refusing: the harness proxy gate needs a Linux KVM host or an Apple silicon macOS host" >&2
+  echo "refusing: the guest proxy gate needs a Linux KVM host or an Apple silicon macOS host" >&2
   exit 2
   ;;
 esac
@@ -71,20 +69,12 @@ trap cleanup EXIT
 
 cat >"$work/guest.sh" <<'GUEST'
 set -u
-claude=$(ls -d /nix/store/*-claude-code-*/bin/claude 2>/dev/null | head -1)
-codex=$(ls -d /nix/store/*-codex-*/bin/codex 2>/dev/null | head -1)
-mkdir -p /tmp/h/c /tmp/h/x
 echo "SK> env: HTTPS_PROXY=${HTTPS_PROXY:-unset}"
 # No NIC: the only way out is the proxy relay, which is what makes a provider reply a proof of the proxy.
 echo "SK> netdevs: $(ls /sys/class/net | tr '\n' ' ')"
-echo "SK> binaries: claude=${claude:+yes} codex=${codex:+yes}"
 echo "SK> curl-allowed: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>&1 | tail -c 200)"
+echo "SK> curl-allowed-2: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://api.openai.com/ 2>&1 | tail -c 200)"
 echo "SK> curl-denied: $(timeout 30 curl -sS -o /dev/null -w '%{http_code}' https://example.org/ 2>&1 | tail -c 200)"
-echo "SK> claude-allowed: $(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake timeout 60 "$claude" -p hi 2>&1 | tail -c 300 | tr '\n' ' ')"
-echo "SK> codex-allowed: $(cd /tmp && HOME=/tmp/h CODEX_HOME=/tmp/h/x CODEX_API_KEY=sk-fake timeout 60 "$codex" exec --skip-git-repo-check hi 2>&1 | tail -c 300 | tr '\n' ' ')"
-(cd /tmp && HOME=/tmp/h CLAUDE_CONFIG_DIR=/tmp/h/c ANTHROPIC_API_KEY=sk-ant-fake ANTHROPIC_BASE_URL=https://example.org timeout 60 "$claude" -p hi >/tmp/denied.log 2>&1)
-denied_rc=$?
-echo "SK> claude-denied: rc=$denied_rc $(tail -c 300 /tmp/denied.log | tr '\n' ' ')"
 echo "SK> done: yes"
 GUEST
 
@@ -92,7 +82,7 @@ echo "== building sandy and the egress proxy"
 cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
 
-echo "== building the T3 guest"
+echo "== building the service guest"
 nix build --no-link "$repo_root/nix/guest#$guest_runner"
 
 echo "== running the guest"
@@ -119,7 +109,7 @@ result, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
 tail = (result.get("logs") or {}).get("tail", "").replace("\r", "\n")
 lines = {}
 for line in tail.splitlines():
-    m = re.search(r"SK> ([a-z-]+): ?(.*)", line)
+    m = re.search(r"SK> ([a-z0-9-]+): ?(.*)", line)
     if m:
         lines[m.group(1)] = m.group(2)
 for key, value in lines.items():
@@ -133,29 +123,19 @@ def check(ok, what):
     if not ok:
         failures.append(what)
 
-expected = ["env", "netdevs", "binaries", "curl-allowed", "curl-denied", "claude-allowed", "codex-allowed", "claude-denied", "done"]
+expected = ["env", "netdevs", "curl-allowed", "curl-allowed-2", "curl-denied", "done"]
 check(all(k in lines for k in expected), "the guest output is incomplete: " + ", ".join(k for k in expected if k not in lines))
 check(lines.get("netdevs", "").split() == ["lo"], "the guest has a network device besides lo, so a provider reply proves nothing about the proxy")
 check(lines.get("env") == "HTTPS_PROXY=http://127.0.0.1:3128", "the job env does not carry the proxy")
-check(lines.get("binaries") == "claude=yes codex=yes", "claude or codex is missing from the image")
-check(re.fullmatch(r"[1-5]\d\d", lines.get("curl-allowed", "")), "curl did not reach an allow-listed host")
+check(re.fullmatch(r"[1-5]\d\d", lines.get("curl-allowed", "")), "curl did not reach the first allow-listed host")
+check(re.fullmatch(r"[1-5]\d\d", lines.get("curl-allowed-2", "")), "curl did not reach the second allow-listed host")
 check("response 403" in lines.get("curl-denied", ""), "a host off the allow-list was not refused with 403")
-check("Invalid API key" in lines.get("claude-allowed", ""), "claude did not reach its provider through the proxy")
-# With CODEX_API_KEY set, OpenAI names the fake key it received, which also shows the key reached the provider.
-codex = lines.get("codex-allowed", "")
-check("Incorrect API key provided: sk-fake" in codex and "api.openai.com" in codex and "auth error: 401" in codex,
-      "codex did not reach its provider through the proxy")
-# The 403 itself is shown by curl-denied. claude must not succeed against a host off the allow-list: a clean exit or
-# the provider's reply means the request got through.
-denied = lines.get("claude-denied", "")
-check(denied.startswith("rc=") and not denied.startswith("rc=0 ") and "Invalid API key" not in denied,
-      "claude got a reply from a host off the allow-list")
 for what in failures:
     print("FAIL:", what, file=sys.stderr)
 sys.exit(1 if failures else 0)
 PY
 
 if [ "$status" -eq 0 ]; then
-  echo "live-harness-proxy: OK"
+  echo "live-guest-proxy: OK"
 fi
 exit "$status"
