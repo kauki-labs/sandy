@@ -582,6 +582,43 @@ mod tests {
         Ok(())
     }
 
+    /// A directory the pull creates counts as an entry: a 4 KiB name of one-character components would otherwise
+    /// make about 2000 directories for one file, and the file cap alone never stops a peer that sends many of them.
+    #[tokio::test]
+    async fn directories_count_against_the_entry_cap() -> anyhow::Result<()> {
+        let at = |max_entries| PullLimits {
+            max_bytes: 100,
+            max_entries,
+        };
+        let messages = [chunk("a/b/c/d", 0, b"x"), end()];
+
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, _peer) = run(&messages, false, &["a"], at(3), root.path()).await?;
+        assert!(
+            matches!(pulled, Err(PullError::TooManyEntries)),
+            "3 dirs and a file are 4 entries: {pulled:?}"
+        );
+
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, _peer) = run(&messages, false, &["a"], at(4), root.path()).await?;
+        assert_eq!(pulled.context("exactly at the cap")?.files, 1);
+        Ok(())
+    }
+
+    /// A directory that already exists is not charged again.
+    #[tokio::test]
+    async fn a_shared_directory_is_charged_once() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let limits = PullLimits {
+            max_bytes: 100,
+            max_entries: 3,
+        };
+        let messages = [chunk("a/x", 0, b"1"), chunk("a/y", 0, b"2"), end()];
+        let (pulled, _peer) = run(&messages, false, &["a"], limits, root.path()).await?;
+        assert_eq!(pulled.context("one dir and two files fit in 3")?.files, 2);
+        Ok(())
+    }
+
     /// An empty chunk is the zero-byte file's one chunk. A second one for the open file, at any offset, is refused:
     /// it makes no progress and no cap would ever stop a stream of them.
     #[tokio::test]
