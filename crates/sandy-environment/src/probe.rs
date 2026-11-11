@@ -95,17 +95,22 @@ impl std::str::FromStr for HostCheck {
     }
 }
 
-/// The connect check: send the bridge one byte, which makes it dial the guest relay, and wait for its count of ready
-/// dials to grow. The relay answers ready only after it connected to the service port, so a new ready dial proves
-/// the port accepted. Not proven within the probe budget is `false`.
+/// The connect check. The bridge's count of ready dials is per bridge, and a bridge lives as long as one run, so a
+/// count above zero is proof that the service port accepted a connection at some point in this run. The relay
+/// answers ready only after it connected to the service port. The probe then does not touch the service again: the
+/// driver probes every Ready environment each pass, and a repeat byte would reach the service for the environment's
+/// whole life.
 ///
-/// The byte is a newline: the bridge forwards it to the service once the dial is through, and a newline is the least
-/// likely byte to confuse a line-oriented service. Any ready dial after the count was read counts, this probe's or a
-/// real client's, since either proves the port accepted.
+/// With no ready dial yet, the probe sends the bridge one byte, which makes it dial the guest relay (it dials only
+/// after a client's first byte), and waits for the count to rise within the probe budget. The byte is a newline, the
+/// least likely byte to confuse a line-oriented service. A dial that succeeds after the budget (the bridge keeps
+/// dialing for its window) is counted by the next probe, which sends nothing then.
 fn dial_gets_through(addr: SocketAddr, ready_dials: &AtomicU64) -> bool {
+    if ready_dials.load(Ordering::SeqCst) > 0 {
+        return true;
+    }
     let start = Instant::now();
     let left = || PROBE_BUDGET.checked_sub(start.elapsed()).filter(|d| !d.is_zero());
-    let before = ready_dials.load(Ordering::SeqCst);
     let Some(connect_budget) = left().map(|d| d.min(Duration::from_millis(500))) else {
         return false;
     };
@@ -120,12 +125,12 @@ fn dial_gets_through(addr: SocketAddr, ready_dials: &AtomicU64) -> bool {
     }
     // The connection stays open until the wait ends, so the bridge's dial is not racing a closed client.
     while left().is_some() {
-        if ready_dials.load(Ordering::SeqCst) > before {
+        if ready_dials.load(Ordering::SeqCst) > 0 {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    ready_dials.load(Ordering::SeqCst) > before
+    ready_dials.load(Ordering::SeqCst) > 0
 }
 
 type Registry = Arc<Mutex<BTreeMap<String, Entry>>>;

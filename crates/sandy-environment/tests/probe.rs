@@ -319,13 +319,44 @@ fn connect_mode_is_starting_while_the_bridge_has_not_got_a_dial_through() -> Res
     Ok(())
 }
 
-/// A dial that got through earlier is not proof now: only a new one after this probe's byte counts.
+/// A dial that already got through is proof that the service port accepted, and the probe does not touch the
+/// service again: the driver probes every Ready environment each pass, so a repeat byte would reach the service for
+/// the environment's whole life (#748 review). Here nothing listens at the address at all.
 #[test]
-fn connect_mode_counts_a_new_dial_not_an_old_one() -> Result<()> {
-    let (addr, dials, t) = fake_bridge(false, b"", Duration::from_secs(3))?;
-    dials.store(5, Ordering::SeqCst);
+fn connect_mode_stays_ready_on_an_earlier_dial_without_touching_the_service() -> Result<()> {
+    let dials = Arc::new(AtomicU64::new(1));
+    let out = connect_probe("127.0.0.1:1".parse()?, &dials)?;
+    assert!(matches!(out, Probe::Ready { .. }), "{out:?}");
+    Ok(())
+}
+
+/// A dial that finished between two probes (a late success of the previous probe's byte) reads Ready at the next
+/// probe at once, without a new byte.
+#[test]
+fn connect_mode_sends_one_byte_only_while_no_dial_has_got_through() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let dials = Arc::new(AtomicU64::new(0));
+    // First probe: no dial gets through, so it connects and sends one byte, and reads Starting.
     assert!(matches!(connect_probe(addr, &dials)?, Probe::Starting { .. }));
-    t.join().map_err(|_| anyhow::anyhow!("server panicked"))?;
+    let (mut first, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(e.into()),
+        }
+    };
+    first.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut byte = [0u8; 1];
+    assert_eq!(first.read(&mut byte)?, 1, "the first probe sent its one byte");
+    // The dial then succeeds late. The next probe reads Ready and opens no new connection.
+    dials.store(1, Ordering::SeqCst);
+    assert!(matches!(connect_probe(addr, &dials)?, Probe::Ready { .. }));
+    assert!(
+        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no second connection"
+    );
     Ok(())
 }
 
