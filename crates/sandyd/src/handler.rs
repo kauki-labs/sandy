@@ -2717,6 +2717,39 @@ mod tests {
         Ok(())
     }
 
+    /// #482: outputs alone also earn a data link on a transfer host (the
+    /// gate is inputs OR outputs, not inputs only).
+    #[tokio::test]
+    async fn an_outputs_only_job_gets_a_data_link_on_a_transfer_host() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let request = req(
+            1,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"m".to_vec(),
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: Vec::new(),
+                outputs: vec![sandy_control_proto::Output {
+                    name: Some("result".to_owned()),
+                    dest: "/out".to_owned(),
+                }],
+                secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
+            }),
+        );
+        let (dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
+        assert_eq!(dispatch.data_link_token.len(), crate::link_auth::LINK_TOKEN_LEN);
+        assert!(job.data_link.is_some(), "outputs alone must bind a data link");
+        Ok(())
+    }
+
     /// #482: the handler-minted data link is bound to the placed host's IP,
     /// carries the token the Dispatch sent, and differs from the agent
     /// link's token; a stream from any other peer is refused.
