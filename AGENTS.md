@@ -92,7 +92,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   bridges sandyd's attach socket to an NDJSON stream behind a single-use ticket (#616); link
   answers `unsupported` for now. See `docs/decisions/broker-api.md`.
 - **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587): the opt-in,
-  trusted-only `ProcessEnvironmentBackend` (a service such as `t3 serve` as a host process group,
+  trusted-only `ProcessEnvironmentBackend` (a service such as an HTTP server as a host process group,
   cleared environment, no isolation, `SANDY_ENV_BACKEND=process-insecure`, decision 29), and
   `VmEnvironmentBackend`, one held agent-mode `VmBackend::run` per environment (decision 31). `sandyd` composes it
   as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 34) and `vm-vfkit` (macOS only, decision 35). A Ready VM environment cannot be linked yet: pairing in VM

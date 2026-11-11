@@ -32,7 +32,7 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness                                   |
 | [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state                               |
 | [broker-api](broker-api.md)                       | HTTP API tier over sandyd                                              |
-| [t3-guest-image](t3-guest-image.md)               | guest image with the t3 server and harnesses                           |
+| [t3-guest-image](t3-guest-image.md)               | history: the T3 guest image, removed from core 2026-11-11              |
 
 Invariants referenced across these records: **INV-1** secrets never reach
 argv/env/the store; **INV-3** liveness only through `VmBackend::boxes` + the job
