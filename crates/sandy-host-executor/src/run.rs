@@ -508,6 +508,7 @@ pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorM
             timed_out: outcome.timed_out,
             transport_error: outcome.transport_error,
             console: outcome.console,
+            outputs_follow: false,
         })),
     }
 }
@@ -528,6 +529,7 @@ pub fn failure_result_message(job_id: String, reason: String) -> HostExecutorMes
             timed_out: false,
             transport_error: Some(reason),
             console: String::new(),
+            outputs_follow: false,
         })),
     }
 }
@@ -717,6 +719,7 @@ mod tests {
                             inputs: Vec::new(),
                             outputs: Vec::new(),
                             secrets: Vec::new(),
+                            data_link_token: Vec::new(),
                         })),
                     },
                 )
@@ -860,6 +863,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )
@@ -935,6 +939,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )
@@ -1049,6 +1054,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -1107,6 +1113,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -1174,6 +1181,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -1239,6 +1247,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -1334,6 +1343,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -1425,6 +1435,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )
@@ -1538,6 +1549,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )
@@ -1610,6 +1622,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )
@@ -1732,6 +1745,7 @@ mod tests {
                         inputs: Vec::new(),
                         outputs: Vec::new(),
                         secrets: Vec::new(),
+                        data_link_token: Vec::new(),
                     })),
                 },
             )

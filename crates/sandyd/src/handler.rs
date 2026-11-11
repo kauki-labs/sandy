@@ -603,6 +603,8 @@ pub async fn handle(
                             inputs: path_inputs.clone(),
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
+                            // No data link yet (#482): nothing mints this token until the link exists.
+                            data_link_token: Vec::new(),
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -3812,6 +3814,7 @@ mod tests {
                         timed_out: false,
                         transport_error: None,
                         console: "hi\n".to_owned(),
+                        outputs_follow: false,
                     },
                 )),
             },

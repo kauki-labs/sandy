@@ -73,8 +73,8 @@ impl std::fmt::Debug for OutputChunk {
     }
 }
 
-/// `Dispatch.link_token` is a bearer secret (INV-1): a holder can authenticate
-/// the remote agent-link stream as that run's forwarder. `build.rs` skips
+/// `Dispatch.link_token` and `data_link_token` are bearer secrets (INV-1): a holder can authenticate the remote
+/// agent-link or data-link stream as that run's forwarder. `build.rs` skips
 /// prost's derived `Debug` for this message; this redacts the token the same
 /// way `sandy_control_proto::AttachResponse` redacts its cap.
 impl std::fmt::Debug for Dispatch {
@@ -87,6 +87,10 @@ impl std::fmt::Debug for Dispatch {
             .field(
                 "link_token",
                 &format_args!("<redacted {} bytes>", self.link_token.len()),
+            )
+            .field(
+                "data_link_token",
+                &format_args!("<redacted {} bytes>", self.data_link_token.len()),
             )
             .field("forward_back", &self.forward_back)
             .field("required_isolation_class", &self.required_isolation_class)
@@ -250,6 +254,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            data_link_token: Vec::new(),
         };
         let rendered = format!("{dispatch:?}");
 
@@ -309,6 +314,7 @@ mod tests {
                 timed_out: false,
                 transport_error: None,
                 console: "hi\n".to_owned(),
+                outputs_follow: false,
             })),
         };
         write_frame(&mut write_side, &message).await?;
@@ -357,6 +363,7 @@ mod tests {
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                     secrets: Vec::new(),
+                    data_link_token: Vec::new(),
                 })),
             },
         )
@@ -583,6 +590,65 @@ mod tests {
     fn an_empty_data_link_message_carries_no_op() -> anyhow::Result<()> {
         let decoded = DataLinkMessage::decode([].as_slice()).context("decode")?;
         assert!(decoded.op.is_none());
+        Ok(())
+    }
+
+    /// The data-link token is a second bearer secret (INV-1, #482): `Debug` prints its length only.
+    #[test]
+    fn dispatch_debug_redacts_the_data_link_token() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let marker = b"sandy-data-link-token-leak-marker";
+        let dispatch = Dispatch {
+            job_id: "job-1".to_owned(),
+            data_link_token: marker.to_vec(),
+            ..Dispatch::default()
+        };
+        let rendered = format!("{dispatch:?}");
+        let text = std::str::from_utf8(marker).context("the marker is UTF-8")?;
+        assert!(!rendered.contains(text), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("{:?}", marker.to_vec())),
+            "the numeric byte array leaked: {rendered}"
+        );
+        assert!(rendered.contains("data_link_token"), "{rendered}");
+        Ok(())
+    }
+
+    /// A Dispatch or JobResult from a sender that predates the data link decodes as "no data link, no outputs
+    /// coming", so the new fields change nothing for an old peer.
+    #[test]
+    fn a_message_from_before_the_data_link_decodes_with_the_new_fields_unset() -> anyhow::Result<()> {
+        // Field 1, a string `j`: the only field an old minimal message needs to be a valid proto3 message.
+        let old = [0x0a, 0x01, b'j'];
+        let dispatch = Dispatch::decode(old.as_slice())?;
+        assert!(dispatch.data_link_token.is_empty());
+        let result = JobResult::decode(old.as_slice())?;
+        assert!(!result.outputs_follow);
+        Ok(())
+    }
+
+    #[test]
+    fn the_data_link_token_and_the_outputs_marker_survive_the_codec() -> anyhow::Result<()> {
+        let dispatch = Dispatch {
+            job_id: "job-1".to_owned(),
+            link_token: vec![1u8; 32],
+            data_link_token: vec![2u8; 32],
+            ..Dispatch::default()
+        };
+        let back = Dispatch::decode(dispatch.encode_to_vec().as_slice())?;
+        assert_eq!(back.data_link_token, vec![2u8; 32]);
+        assert_eq!(
+            back.link_token,
+            vec![1u8; 32],
+            "the agent-link token is a separate field"
+        );
+
+        let result = JobResult {
+            job_id: "job-1".to_owned(),
+            outputs_follow: true,
+            ..JobResult::default()
+        };
+        assert!(JobResult::decode(result.encode_to_vec().as_slice())?.outputs_follow);
         Ok(())
     }
 }

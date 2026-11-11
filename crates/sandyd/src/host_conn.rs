@@ -800,6 +800,7 @@ mod tests {
             timed_out: false,
             transport_error: None,
             console: String::new(),
+            outputs_follow: false,
         };
         record_job_result(&store, &job_registry, &mut in_flight, result).await;
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
@@ -879,6 +880,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            data_link_token: Vec::new(),
         };
         registry.send_dispatch("remote-host", dispatch.clone()).await?;
 
@@ -1375,6 +1377,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            data_link_token: Vec::new(),
         }
     }
 

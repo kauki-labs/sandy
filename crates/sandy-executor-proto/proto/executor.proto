@@ -50,6 +50,14 @@ message JobResult {
   // `status`/`attach` to surface. This is the job's output, never the host's
   // own journald logs — the host-executor must not `tracing!`-log it.
   string console = 6;
+  // Outputs are still coming on the data link (#482, §22). `JobResult` (this
+  // connection) and the output transfer (the data link) are two connections
+  // with no ordering between them, so a result that arrives first must not
+  // read as the job being done. True: the orchestrator keeps the job
+  // non-terminal until the matching `OutputEnd` arrives or a `TransferError`
+  // or a disconnect ends the transfer. False (also a sender that predates the
+  // field): nothing follows.
+  bool outputs_follow = 7;
 }
 
 // Orchestrator -> host-executor.
@@ -193,6 +201,16 @@ message Dispatch {
   repeated Input inputs = 8;
   repeated Output outputs = 9;
   repeated SecretRef secrets = 10;
+  // The data-link token (#482, sandyd.md §22): the second `(job_id, token)` pair
+  // of a job whose manifest names `inputs`/`outputs`. The host-executor dials
+  // back to `forward_back` and claims the data link with it, as it claims the
+  // agent link with `link_token`; the orchestrator mints a distinct token for
+  // each, so one cannot claim the other's stream. A bearer secret (INV-1): held
+  // in memory only, never logged, never written to the manifest, env or mounts.
+  // Empty means the job has no data link, which is also how a Dispatch from a
+  // sender that predates the field decodes. The orchestrator sets it only for a
+  // host that declared `transfer`; nothing sets it until the link exists.
+  bytes data_link_token = 11;
 }
 
 // Mirrors `sandy.control.v1.Input` (sandy-control-proto) — kept as a
