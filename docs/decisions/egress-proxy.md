@@ -313,7 +313,9 @@ plaintext.
 **Decision.** The proxy matches on the CONNECT target and copies opaque bytes.
 It never terminates TLS. The minted token stays in the guest. TLS termination
 and the in-flight token swap are #372 item 1, the exit for #357's interim
-token risk.
+token risk. The owner ruled on 2026-11-10 that the swap does not belong in the
+proxy: it is a separate component, proposed in
+[`credential-injector.md`](credential-injector.md) (#707).
 
 **Consequences.** A pinned-certificate client works. The proxy cannot see the
 TLS SNI or the HTTP `Host`, so a tunnel to an allowed front can carry traffic
