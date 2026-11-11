@@ -104,12 +104,19 @@ pub enum ReceiveError {
     /// The transfer is past its entry cap.
     #[error("the transfer is past its entry cap")]
     TooManyEntries,
-    /// A destination could not be written without following a link, or a write failed.
+    /// A destination could not be written without following a link, or a write failed. The text is escaped: the
+    /// path in the underlying error can hold a name the peer chose, and an error is logged.
     #[error("writing an output: {0}")]
-    Write(#[from] sandy_fsutil::FsError),
+    Write(String),
     /// A file write failed.
     #[error("writing an output file: {0}")]
     Io(#[source] std::io::Error),
+}
+
+impl From<sandy_fsutil::FsError> for ReceiveError {
+    fn from(error: sandy_fsutil::FsError) -> Self {
+        Self::Write(error.to_string().chars().flat_map(char::escape_default).collect())
+    }
 }
 
 impl ReceiveError {
@@ -339,10 +346,11 @@ impl<'a> Receive<'a> {
             Some(declared) if key.1 == *declared => {
                 // The guest replaced the output directory with a file: it is the destination itself.
                 let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
-                    return Err(ReceiveError::Write(sandy_fsutil::FsError::Unsafe {
+                    return Err(sandy_fsutil::FsError::Unsafe {
                         path: dest.to_owned(),
                         reason: "a file output needs a destination with a file name".to_owned(),
-                    }));
+                    }
+                    .into());
                 };
                 Ok((parent.to_owned(), Vec::new(), name.to_string_lossy().into_owned()))
             }
