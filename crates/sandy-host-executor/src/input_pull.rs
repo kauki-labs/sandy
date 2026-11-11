@@ -165,7 +165,11 @@ async fn pull(
         current: None,
     };
     loop {
-        let message: DataLinkMessage = read_frame(link).await?.ok_or(PullError::Truncated)?;
+        // Each frame restarts the clock; a peer that stops, or trickles slower than `idle`, ends the pull.
+        let message: DataLinkMessage = tokio::time::timeout(limits.idle, read_frame(link))
+            .await
+            .map_err(|_| PullError::Idle)??
+            .ok_or(PullError::Truncated)?;
         message.validate()?;
         match message.op {
             Some(Op::InputChunk(chunk)) => pull.chunk(chunk).await?,
