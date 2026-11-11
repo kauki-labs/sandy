@@ -306,6 +306,7 @@ mod tests {
     async fn round_trip(
         inputs: &[sandy_executor_proto::Input],
         limits: SendLimits,
+        pull: PullLimits,
     ) -> anyhow::Result<(
         Result<Sent, SendError>,
         Result<PulledInputs, PullError>,
@@ -317,7 +318,7 @@ mod tests {
         let (sent, pulled) = tokio::time::timeout(Duration::from_secs(20), async {
             tokio::join!(
                 send_inputs(&mut sender_end, inputs, limits),
-                pull_inputs(&mut receiver_end, &names, root.path(), PullLimits::default()),
+                pull_inputs(&mut receiver_end, &names, root.path(), pull),
             )
         })
         .await
@@ -355,7 +356,7 @@ mod tests {
         write(&source.path().join("src/sub/empty"), b"")?;
         let inputs = [input(source.path(), "data"), input(source.path(), "src")];
 
-        let (sent, pulled, root) = round_trip(&inputs, SendLimits::default()).await?;
+        let (sent, pulled, root) = round_trip(&inputs, SendLimits::default(), PullLimits::default()).await?;
         let sent = sent.context("the send")?;
         pulled.context("the pull")?;
 
@@ -512,6 +513,17 @@ mod tests {
         assert_eq!(sent.context("exactly at the cap")?.bytes, 10);
         let (sent, _) = frames(&inputs, limits(9)).await?;
         assert!(matches!(sent, Err(SendError::TooManyBytes)), "got {sent:?}");
+
+        // The receiver, with the same caps, refuses at 9 and accepts at 10.
+        let pull = |max_bytes| PullLimits {
+            max_bytes,
+            ..PullLimits::default()
+        };
+        let (_, pulled, _root) = round_trip(&inputs, SendLimits::default(), pull(9)).await?;
+        assert!(matches!(pulled, Err(PullError::TooManyBytes)), "got {pulled:?}");
+        let (sent, pulled, _root) = round_trip(&inputs, limits(10), pull(10)).await?;
+        sent.context("the send")?;
+        pulled.context("the receiver accepts what the sender counted")?;
         Ok(())
     }
 
@@ -535,8 +547,14 @@ mod tests {
         let (sent, _) = frames(&inputs, limits(4)).await?;
         assert_eq!(sent.context("exactly at the cap")?.files, 1);
 
-        // And the receiver agrees on the same boundary.
-        let (sent, pulled, _root) = round_trip(&inputs, limits(4)).await?;
+        // The receiver, with the same caps, refuses at 3 and accepts at 4: one boundary on both sides.
+        let pull = |max_entries| PullLimits {
+            max_entries,
+            ..PullLimits::default()
+        };
+        let (_, pulled, _root) = round_trip(&inputs, SendLimits::default(), pull(3)).await?;
+        assert!(matches!(pulled, Err(PullError::TooManyEntries)), "got {pulled:?}");
+        let (sent, pulled, _root) = round_trip(&inputs, limits(4), pull(4)).await?;
         sent.context("the send")?;
         pulled.context("the receiver accepts what the sender counted")?;
         Ok(())
