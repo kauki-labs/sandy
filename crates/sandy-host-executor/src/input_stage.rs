@@ -71,12 +71,12 @@ pub async fn dial_data_link(
     job_id: &str,
     data_token: &[u8; REMOTE_LINK_TOKEN_LEN],
     mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
-    _control: &RunControl,
+    control: &RunControl,
 ) -> Result<Box<dyn sandy_conn::Conn>, StageError> {
     // The prefix is the claim: the orchestrator's accept loop tells the data link from the agent link by the token.
     // Neither an error nor a log line below carries it.
     let prefix = encode_remote_link_prefix(job_id, data_token).map_err(|e| StageError::Dial(e.to_string()))?;
-    let mut link = tokio::time::timeout(
+    let dial = tokio::time::timeout(
         DIAL_TIMEOUT,
         sandy_conn::connect_tls(
             forward_back,
@@ -84,10 +84,16 @@ pub async fn dial_data_link(
             mesh_tls.orchestrator_fingerprint,
             Some(sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
         ),
-    )
-    .await
-    .map_err(|_| StageError::Dial(format!("dialing {forward_back} timed out after {DIAL_TIMEOUT:?}")))?
-    .map_err(|e| StageError::Dial(e.to_string()))?;
+    );
+    // Control first: a job already cancelled, or past its deadline, never starts the dial, and a cancel during it
+    // ends the wait at once instead of after the dial timeout.
+    let mut link = tokio::select! {
+        biased;
+        ended = control_ended(control) => return Err(ended),
+        dialed = dial => dialed
+            .map_err(|_| StageError::Dial(format!("dialing {forward_back} timed out after {DIAL_TIMEOUT:?}")))?
+            .map_err(|e| StageError::Dial(e.to_string()))?,
+    };
     link.write_all(&prefix)
         .await
         .map_err(|e| StageError::Dial(format!("writing the link prefix: {e}")))?;
@@ -133,6 +139,11 @@ where
         () = tokio::time::sleep(total_cap) => return Err(StageError::TotalCapExceeded),
     }
 
+    // The pull can win the race in the same instant a cancel or the deadline lands: look once more before the run.
+    if let Some(ended) = control_ended_now(control) {
+        return Err(ended);
+    }
+
     let inputs = inputs
         .iter()
         .map(|input| Input {
@@ -148,14 +159,22 @@ where
     })
 }
 
-/// Resolves once `control` is cancelled or its live deadline has passed. A suspended deadline never ends it.
+/// Why `control` has ended the run, if it has: cancelled, or past a live deadline. A suspended deadline never ends it.
+fn control_ended_now(control: &RunControl) -> Option<StageError> {
+    if control.is_cancelled() {
+        Some(StageError::Cancelled)
+    } else if control.timed_out() {
+        Some(StageError::DeadlinePassed)
+    } else {
+        None
+    }
+}
+
+/// Resolves once [`control_ended_now`] says so; a cancel or a deadline has no way to wake an await, so it polls.
 async fn control_ended(control: &RunControl) -> StageError {
     loop {
-        if control.is_cancelled() {
-            return StageError::Cancelled;
-        }
-        if control.timed_out() {
-            return StageError::DeadlinePassed;
+        if let Some(ended) = control_ended_now(control) {
+            return ended;
         }
         tokio::time::sleep(CONTROL_POLL).await;
     }
