@@ -2785,6 +2785,10 @@ mod tests {
         let (_, kind) = registry.authenticate_incoming_link(job_id, peer_ip, &token)?;
         assert_eq!(kind, crate::link_auth::LinkKind::Data);
         assert!(job.data_link.is_some());
+        assert_eq!(
+            job.data_inputs, dispatch.inputs,
+            "the data link sends the dispatched path inputs"
+        );
         Ok(())
     }
 
