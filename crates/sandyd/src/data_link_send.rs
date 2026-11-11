@@ -14,13 +14,14 @@
 //! What this does NOT do: the Submit-time `stat` check of the caps, or the placement rule (slice 7), or send
 //! anything back over the link (slice 6).
 
-use std::time::Duration;
+use std::{collections::HashSet, ffi::OsStr, io::Read, path::PathBuf, time::Duration};
 
-use sandy_control_proto::FrameError;
-#[allow(unused_imports, reason = "the stub sends nothing; the real sender uses them")]
+use sandy_control_proto::{FrameError, write_frame};
 use sandy_executor_proto::{
-    DataLinkMessage, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, data_link_message::Op,
+    DataLinkMessage, InputChunk, InputEnd, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, TransferError,
+    data_link_message::Op,
 };
+use sandy_fsutil::beneath::{self, Beneath, EntryKind};
 use tokio::io::AsyncWrite;
 
 /// How long one frame may take to write. A peer that stops reading must not hold the sender, or the daemon's
@@ -109,17 +110,166 @@ impl SendError {
     }
 }
 
+/// Chunks buffered between the reader thread and the writer: enough to keep the link busy, little enough that a
+/// slow peer holds a few MiB, not a file.
+const QUEUE_DEPTH: usize = 4;
+
 /// Send `inputs` to `link`, then `InputEnd`. On a failure other than a dead link, the peer gets a `TransferError`
 /// first.
 ///
 /// # Errors
 /// See [`SendError`].
 pub async fn send_inputs(
-    _link: &mut (impl AsyncWrite + Unpin),
-    _inputs: &[sandy_executor_proto::Input],
-    _limits: SendLimits,
+    link: &mut (impl AsyncWrite + Unpin),
+    inputs: &[sandy_executor_proto::Input],
+    limits: SendLimits,
 ) -> Result<Sent, SendError> {
-    Err(SendError::Stopped)
+    let inputs: Vec<(String, PathBuf)> = inputs
+        .iter()
+        .map(|input| (input.name.clone(), PathBuf::from(&input.host)))
+        .collect();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(QUEUE_DEPTH);
+    let reader = tokio::task::spawn_blocking(move || read_inputs(&inputs, limits, &tx));
+    while let Some(chunk) = rx.recv().await {
+        let message = DataLinkMessage {
+            op: Some(Op::InputChunk(chunk)),
+        };
+        if let Err(e) = write(link, &message).await {
+            // Dropping the receiver stops the reader at its next hand-over.
+            drop(rx);
+            return Err(e);
+        }
+    }
+    let sent = match reader.await {
+        Ok(Ok(sent)) => sent,
+        Ok(Err(e)) => {
+            let reason = DataLinkMessage {
+                op: Some(Op::TransferError(TransferError {
+                    reason: e.peer_reason().to_owned(),
+                })),
+            };
+            // Best effort: the peer may already be gone, and the original failure is what the caller needs.
+            let _ = write(link, &reason).await;
+            return Err(e);
+        }
+        Err(_) => return Err(SendError::Stopped),
+    };
+    write(
+        link,
+        &DataLinkMessage {
+            op: Some(Op::InputEnd(InputEnd {})),
+        },
+    )
+    .await?;
+    Ok(sent)
+}
+
+async fn write(link: &mut (impl AsyncWrite + Unpin), message: &DataLinkMessage) -> Result<(), SendError> {
+    match tokio::time::timeout(WRITE_TIMEOUT, write_frame(link, message)).await {
+        Ok(written) => Ok(written?),
+        Err(_) => Err(SendError::WriteTimedOut),
+    }
+}
+
+/// What the reader thread has counted so far.
+struct Walk<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<InputChunk>,
+    limits: SendLimits,
+    sent: Sent,
+    /// Files plus the distinct directories their names imply: what the receiver creates, so what it caps.
+    entries: usize,
+    dirs: HashSet<String>,
+}
+
+/// Read every input on this thread and hand its chunks to the writer.
+fn read_inputs(
+    inputs: &[(String, PathBuf)],
+    limits: SendLimits,
+    tx: &tokio::sync::mpsc::Sender<InputChunk>,
+) -> Result<Sent, SendError> {
+    let mut walk = Walk {
+        tx,
+        limits,
+        sent: Sent { files: 0, bytes: 0 },
+        entries: 0,
+        dirs: HashSet::new(),
+    };
+    for (name, path) in inputs {
+        if name.is_empty() {
+            return Err(SendError::UnnamedInput);
+        }
+        let before = walk.sent.files;
+        match beneath::open_file(path) {
+            Ok(file) => walk.file(name, file)?,
+            Err(_) => walk.tree(name, &Beneath::open_dir(path)?)?,
+        }
+        if walk.sent.files == before {
+            return Err(SendError::EmptyInput);
+        }
+    }
+    Ok(walk.sent)
+}
+
+impl Walk<'_> {
+    /// Send every file below `dir`. An empty subdirectory has no wire form (#756) and is skipped.
+    fn tree(&mut self, prefix: &str, dir: &Beneath) -> Result<(), SendError> {
+        for entry in dir.entries()? {
+            let (name, kind) = entry?;
+            let name = name.to_str().ok_or(SendError::UnsupportedEntry)?;
+            let wire = format!("{prefix}/{name}");
+            match kind {
+                EntryKind::File => self.file(&wire, dir.open_file(OsStr::new(name))?)?,
+                EntryKind::Dir => self.tree(&wire, &dir.open_subdir(OsStr::new(name))?)?,
+                EntryKind::Symlink => return Err(SendError::Symlink),
+                EntryKind::Other => return Err(SendError::UnsupportedEntry),
+            }
+        }
+        Ok(())
+    }
+
+    fn count_entry(&mut self) -> Result<(), SendError> {
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            return Err(SendError::TooManyEntries);
+        }
+        Ok(())
+    }
+
+    /// Send one file as chunks in order from offset 0. A zero-byte file is one empty chunk, and no empty chunk
+    /// follows data.
+    fn file(&mut self, wire: &str, mut file: std::fs::File) -> Result<(), SendError> {
+        for (i, _) in wire.match_indices('/') {
+            if self.dirs.insert(wire[..i].to_owned()) {
+                self.count_entry()?;
+            }
+        }
+        self.count_entry()?;
+        let mut offset = 0u64;
+        let mut buf = vec![0u8; MAX_CHUNK_BYTES];
+        loop {
+            let n = file.read(&mut buf).map_err(SendError::Read)?;
+            if n == 0 && offset > 0 {
+                break;
+            }
+            let len = u64::try_from(n).unwrap_or(u64::MAX);
+            self.sent.bytes += len;
+            if self.sent.bytes > self.limits.max_bytes {
+                return Err(SendError::TooManyBytes);
+            }
+            let chunk = InputChunk {
+                name: wire.to_owned(),
+                offset,
+                bytes: buf[..n].to_vec(),
+            };
+            self.tx.blocking_send(chunk).map_err(|_| SendError::Stopped)?;
+            offset += len;
+            if n == 0 {
+                break;
+            }
+        }
+        self.sent.files += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
