@@ -176,7 +176,11 @@ pub async fn receive_outputs(
     limits: ReceiveLimits,
 ) -> Result<Received, ReceiveError> {
     let mut receive = Receive::new(outputs, limits);
-    let result = pump(link, &mut receive).await;
+    // `receive` lives outside the timed future, so the file in flight is still removed when the deadline drops it.
+    let result = match tokio::time::timeout(limits.total, pump(link, &mut receive)).await {
+        Ok(result) => result,
+        Err(_) => Err(ReceiveError::TotalDeadline),
+    };
     let Err(error) = result else {
         return result;
     };
@@ -201,11 +205,16 @@ async fn pump(
     link: &mut (impl AsyncRead + AsyncWrite + Unpin),
     receive: &mut Receive<'_>,
 ) -> Result<Received, ReceiveError> {
+    let mut frames = 0usize;
     loop {
         let frame = tokio::time::timeout(receive.limits.idle, read_frame::<DataLinkMessage>(link))
             .await
             .map_err(|_| ReceiveError::Idle)??;
         let message = frame.ok_or(ReceiveError::Truncated)?;
+        frames += 1;
+        if frames > receive.limits.max_frames {
+            return Err(ReceiveError::TooManyFrames);
+        }
         message.validate()?;
         match message.op {
             Some(Op::OutputChunk(chunk)) => receive.chunk(chunk).await?,

@@ -2026,6 +2026,10 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The receiver refuses an index past `Dispatch.outputs`, a name outside its named output, a file that arrives twice
   (outputs carry no offset), an empty chunk after data or repeated, a message that is not an output message, and a
   transfer past the byte, entry or idle limit. The peer is told a fixed text.
+- A receive is also bounded in total: `DEFAULT_TOTAL` (30 minutes, as the host's input pull) ends it with
+  `TotalDeadline` however steadily frames arrive, and `max_frames` (twice the entries plus one chunk per
+  `MAX_CHUNK_BYTES` of the byte cap) ends it with `TooManyFrames`, so a peer cannot hold the link and an open file
+  with a frame just inside each idle gap, or with one-byte chunks inside the byte cap (#781).
 - Known differences from local collection, which the host-executor sender (6b) matches by skipping: a symlink at
   the final file name is replaced here, where local `create_file` refuses it; the rename replaces the destination
   inode, so an existing file's mode, owner and hard links are lost where local truncates in place; empty directories
