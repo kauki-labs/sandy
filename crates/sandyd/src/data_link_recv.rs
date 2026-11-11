@@ -35,6 +35,16 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 /// The default longest gap between frames.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(30);
 
+/// The default longest a whole receive may take, however steadily frames arrive: the idle gap alone lets a peer that
+/// sends one byte just under it hold the link, an open file and a worker for days (#781). The same 30 minutes as the
+/// host's input pull.
+pub const DEFAULT_TOTAL: Duration = Duration::from_secs(30 * 60);
+
+/// The default most frames one receive reads. A full transfer is at most one chunk per `MAX_CHUNK_BYTES` of data
+/// (16,384 for the byte cap) plus one frame per file, so a sender that fills its chunks never comes near twice that;
+/// a peer sending tiny chunks does.
+pub const DEFAULT_MAX_FRAMES: usize = 2 * (MAX_TRANSFER_ENTRIES + 16_384);
+
 /// The caps one receive enforces. The default is the §22 pair and [`DEFAULT_IDLE`]; a test lowers them.
 #[derive(Debug, Clone, Copy)]
 pub struct ReceiveLimits {
@@ -44,6 +54,10 @@ pub struct ReceiveLimits {
     pub max_entries: usize,
     /// The longest gap between frames.
     pub idle: Duration,
+    /// The longest the whole receive may take.
+    pub total: Duration,
+    /// The most frames the receive reads, `OutputEnd` included.
+    pub max_frames: usize,
 }
 
 impl Default for ReceiveLimits {
@@ -52,6 +66,8 @@ impl Default for ReceiveLimits {
             max_bytes: MAX_TRANSFER_BYTES,
             max_entries: MAX_TRANSFER_ENTRIES,
             idle: DEFAULT_IDLE,
+            total: DEFAULT_TOTAL,
+            max_frames: DEFAULT_MAX_FRAMES,
         }
     }
 }
@@ -105,6 +121,12 @@ pub enum ReceiveError {
     /// The transfer is past its entry cap.
     #[error("the transfer is past its entry cap")]
     TooManyEntries,
+    /// The receive ran past its total time limit.
+    #[error("the receive ran past its total time limit")]
+    TotalDeadline,
+    /// The peer sent more frames than a transfer needs.
+    #[error("the peer sent more frames than a transfer needs")]
+    TooManyFrames,
     /// A destination could not be written without following a link, or a write failed. The text is escaped: the
     /// path in the underlying error can hold a name the peer chose, and an error is logged.
     #[error("writing an output: {0}")]
@@ -131,6 +153,8 @@ impl ReceiveError {
             Self::NoProgress => "an empty chunk made no progress",
             Self::TooManyBytes => "the transfer is past its byte cap",
             Self::TooManyEntries => "the transfer is past its entry cap",
+            Self::TotalDeadline => "the transfer took too long",
+            Self::TooManyFrames => "the transfer used too many frames",
             Self::Write(_) | Self::Io(_) => "an output could not be written",
         }
     }
@@ -152,7 +176,11 @@ pub async fn receive_outputs(
     limits: ReceiveLimits,
 ) -> Result<Received, ReceiveError> {
     let mut receive = Receive::new(outputs, limits);
-    let result = pump(link, &mut receive).await;
+    // `receive` lives outside the timed future, so the file in flight is still removed when the deadline drops it.
+    let result = match tokio::time::timeout(limits.total, pump(link, &mut receive)).await {
+        Ok(result) => result,
+        Err(_) => Err(ReceiveError::TotalDeadline),
+    };
     let Err(error) = result else {
         return result;
     };
@@ -177,11 +205,16 @@ async fn pump(
     link: &mut (impl AsyncRead + AsyncWrite + Unpin),
     receive: &mut Receive<'_>,
 ) -> Result<Received, ReceiveError> {
+    let mut frames = 0usize;
     loop {
         let frame = tokio::time::timeout(receive.limits.idle, read_frame::<DataLinkMessage>(link))
             .await
             .map_err(|_| ReceiveError::Idle)??;
         let message = frame.ok_or(ReceiveError::Truncated)?;
+        frames += 1;
+        if frames > receive.limits.max_frames {
+            return Err(ReceiveError::TooManyFrames);
+        }
         message.validate()?;
         match message.op {
             Some(Op::OutputChunk(chunk)) => receive.chunk(chunk).await?,
@@ -872,6 +905,72 @@ mod tests {
             "unescaped: {reason:?}"
         );
         Ok(())
+    }
+
+    /// A peer that sends a frame inside every idle gap, for ever, is stopped by the total limit, and the file in
+    /// flight is removed.
+    #[tokio::test]
+    async fn a_trickle_under_the_idle_limit_ends_at_the_total_deadline() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+        let sender = tokio::spawn(async move {
+            for _ in 0..60 {
+                if write_frame(&mut peer, &chunk(0, "f", b"x")).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            peer
+        });
+        let limits = ReceiveLimits {
+            idle: Duration::from_millis(400),
+            total: Duration::from_millis(500),
+            ..ReceiveLimits::default()
+        };
+        let received = tokio::time::timeout(Duration::from_secs(5), receive_outputs(&mut local, &outputs, limits))
+            .await
+            .context("the receive must end at its total deadline, not run on")?;
+        assert!(matches!(received, Err(ReceiveError::TotalDeadline)), "got {received:?}");
+        assert!(tree(dest.path())?.is_empty(), "the file in flight is removed");
+        sender.abort();
+        Ok(())
+    }
+
+    /// The frame cap counts every frame read, `OutputEnd` included: exactly at it passes, one past it stops.
+    #[tokio::test]
+    async fn the_frame_cap_stops_one_past() -> anyhow::Result<()> {
+        let limits = ReceiveLimits {
+            max_frames: 3,
+            ..quick()
+        };
+
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let at_cap = [chunk(0, "f", b"1"), chunk(0, "f", b"2"), end()];
+        let (received, _peer) = run(&at_cap, &outputs, limits, false).await?;
+        received.context("exactly at the cap")?;
+
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let past_cap = [chunk(0, "f", b"1"), chunk(0, "f", b"2"), chunk(0, "f", b"3"), end()];
+        let (received, mut peer) = run(&past_cap, &outputs, limits, false).await?;
+        assert!(matches!(received, Err(ReceiveError::TooManyFrames)), "got {received:?}");
+        assert!(tree(dest.path())?.is_empty(), "the file in flight is removed");
+        assert_eq!(
+            told(&mut peer).await.as_deref(),
+            Some("the transfer used too many frames")
+        );
+        Ok(())
+    }
+
+    /// The default frame cap leaves room for a full transfer a sender makes of full chunks: every entry, and one
+    /// chunk per `MAX_CHUNK_BYTES` of the byte cap.
+    #[test]
+    fn the_default_frame_cap_fits_a_full_transfer() {
+        let chunks = usize::try_from(MAX_TRANSFER_BYTES / u64::try_from(MAX_CHUNK_BYTES).unwrap_or(u64::MAX))
+            .unwrap_or(usize::MAX);
+        assert!(DEFAULT_MAX_FRAMES > MAX_TRANSFER_ENTRIES + chunks);
     }
 
     /// A silent peer ends the receive after the idle limit.
