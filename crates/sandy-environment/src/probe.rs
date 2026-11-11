@@ -142,7 +142,7 @@ type Entry = (u64, SocketAddr, Option<Arc<AtomicU64>>);
 /// Reads readiness from an HTTP service behind a registered loopback address.
 ///
 /// A status below 500 is Ready: a service may answer 503 while it starts and 401 once auth is on, so Ready proves an
-/// HTTP listener, not that the service's API is up (as `sandy-http-ready` in the guest image). Any HTTP answer counts,
+/// HTTP listener, not that the service's API is up (as `sandy-t3-ready` in the guest image). Any HTTP answer counts,
 /// a 404 too, so an address must only stay registered while the bridge that owns it lives: see [`Registration`].
 #[derive(Debug, Default)]
 pub struct HttpServiceProbe {
