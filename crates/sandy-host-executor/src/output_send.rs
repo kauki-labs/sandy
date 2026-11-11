@@ -18,13 +18,16 @@
 //! What this does NOT do: stage the outputs or call this from `handle_dispatch` (6c), or set
 //! `JobResult.outputs_follow` (6c).
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::HashSet, ffi::OsStr, io::Read, path::PathBuf, time::Duration};
 
-use sandy_control_proto::FrameError;
-#[allow(unused_imports, reason = "the stub sends nothing; the real sender uses them")]
+use sandy_control_proto::{FrameError, write_frame};
 use sandy_executor_proto::{
     DataLinkMessage, DataLinkViolation, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, OutputChunk,
     OutputEnd, TransferError, data_link_message::Op,
+};
+use sandy_fsutil::{
+    FsError,
+    beneath::{self, Beneath, EntryKind},
 };
 use tokio::io::AsyncWrite;
 
@@ -119,17 +122,178 @@ impl SendError {
     }
 }
 
+/// Messages buffered between the reader thread and the writer: enough to keep the link busy, little enough that a
+/// slow peer holds a few MiB, not a file.
+const QUEUE_DEPTH: usize = 4;
+
 /// Send the staged `outputs` to `link`, then `OutputEnd`. On a failure other than a dead link, the peer gets a
 /// `TransferError` first.
 ///
 /// # Errors
 /// See [`SendError`].
 pub async fn send_outputs(
-    _link: &mut (impl AsyncWrite + Unpin),
-    _outputs: &[OutputSource],
-    _limits: SendLimits,
+    link: &mut (impl AsyncWrite + Unpin),
+    outputs: &[OutputSource],
+    limits: SendLimits,
 ) -> Result<Sent, SendError> {
-    Err(SendError::Stopped)
+    let outputs = outputs.to_vec();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DataLinkMessage>(QUEUE_DEPTH);
+    let reader = tokio::task::spawn_blocking(move || read_outputs(&outputs, limits, &tx));
+    while let Some(message) = rx.recv().await {
+        if let Err(e) = write(link, &message).await {
+            // Dropping the receiver stops the reader at its next hand-over.
+            drop(rx);
+            return Err(e);
+        }
+    }
+    let sent = match reader.await {
+        Ok(Ok(sent)) => sent,
+        Ok(Err(e)) => {
+            let reason = DataLinkMessage {
+                op: Some(Op::TransferError(TransferError {
+                    reason: e.peer_reason().to_owned(),
+                })),
+            };
+            // Best effort: the peer may already be gone, and the original failure is what the caller needs.
+            let _ = write(link, &reason).await;
+            return Err(e);
+        }
+        Err(_) => return Err(SendError::Stopped),
+    };
+    write(
+        link,
+        &DataLinkMessage {
+            op: Some(Op::OutputEnd(OutputEnd {})),
+        },
+    )
+    .await?;
+    Ok(sent)
+}
+
+async fn write(link: &mut (impl AsyncWrite + Unpin), message: &DataLinkMessage) -> Result<(), SendError> {
+    match tokio::time::timeout(WRITE_TIMEOUT, write_frame(link, message)).await {
+        Ok(written) => Ok(written?),
+        Err(_) => Err(SendError::WriteTimedOut),
+    }
+}
+
+/// What the reader thread has counted so far.
+struct Walk<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<DataLinkMessage>,
+    limits: SendLimits,
+    sent: Sent,
+    /// The position of the output being read, on the wire as `output_index`.
+    index: u32,
+    /// Files plus the distinct directories below a root, as the receiver counts them.
+    entries: usize,
+    dirs: HashSet<(u32, String)>,
+}
+
+/// Read every staged output on this thread and hand its frames to the writer.
+fn read_outputs(
+    outputs: &[OutputSource],
+    limits: SendLimits,
+    tx: &tokio::sync::mpsc::Sender<DataLinkMessage>,
+) -> Result<Sent, SendError> {
+    let mut walk = Walk {
+        tx,
+        limits,
+        sent: Sent { files: 0, bytes: 0 },
+        index: 0,
+        entries: 0,
+        dirs: HashSet::new(),
+    };
+    for (position, output) in outputs.iter().enumerate() {
+        walk.index = u32::try_from(position).unwrap_or(u32::MAX);
+        match beneath::open_file(&output.root) {
+            // The guest replaced the named output directory with a file: the bare declared name.
+            Ok(file) => match &output.name {
+                Some(name) => walk.file(name, "", file)?,
+                None => return Err(SendError::UnsupportedEntry),
+            },
+            Err(_) => match Beneath::open_dir(&output.root) {
+                Ok(dir) => walk.tree(output.name.as_deref(), "", &dir)?,
+                // Declared and never written: local collection collects nothing for it.
+                Err(FsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+    }
+    Ok(walk.sent)
+}
+
+impl Walk<'_> {
+    /// Send every file below `dir`. An empty subdirectory has no wire form and is skipped, as local collection
+    /// creates it but a file-only transfer cannot say so (#756). `wire` is the declared name prefix (none for a
+    /// catch-all) and `rel` the path below the root, which is what the receiver counts directories by.
+    fn tree(&mut self, wire: Option<&str>, rel: &str, dir: &Beneath) -> Result<(), SendError> {
+        for entry in dir.entries()? {
+            let (name, kind) = entry?;
+            let name = name.to_str().ok_or(SendError::UnsupportedEntry)?;
+            let rel_path = if rel.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let wire_path = wire.map_or_else(|| rel_path.clone(), |prefix| format!("{prefix}/{rel_path}"));
+            match kind {
+                EntryKind::File => self.file(&wire_path, &rel_path, dir.open_file(OsStr::new(name))?)?,
+                EntryKind::Dir => {
+                    let sub = dir.open_subdir(OsStr::new(name))?;
+                    self.tree(wire, &rel_path, &sub)?;
+                }
+                EntryKind::Symlink => return Err(SendError::Symlink),
+                EntryKind::Other => return Err(SendError::UnsupportedEntry),
+            }
+        }
+        Ok(())
+    }
+
+    fn count_entry(&mut self) -> Result<(), SendError> {
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            return Err(SendError::TooManyEntries);
+        }
+        Ok(())
+    }
+
+    /// Send one file as chunks in order. A zero-byte file is one empty chunk, and no empty chunk follows data.
+    fn file(&mut self, wire: &str, rel: &str, mut file: std::fs::File) -> Result<(), SendError> {
+        for (i, _) in rel.match_indices('/') {
+            if self.dirs.insert((self.index, rel[..i].to_owned())) {
+                self.count_entry()?;
+            }
+        }
+        self.count_entry()?;
+        let mut buf = vec![0u8; MAX_CHUNK_BYTES];
+        let mut first = true;
+        loop {
+            let n = file.read(&mut buf).map_err(SendError::Read)?;
+            if n == 0 && !first {
+                break;
+            }
+            let len = u64::try_from(n).unwrap_or(u64::MAX);
+            self.sent.bytes += len;
+            if self.sent.bytes > self.limits.max_bytes {
+                return Err(SendError::TooManyBytes);
+            }
+            let message = DataLinkMessage {
+                op: Some(Op::OutputChunk(OutputChunk {
+                    name: wire.to_owned(),
+                    bytes: buf[..n].to_vec(),
+                    output_index: self.index,
+                })),
+            };
+            message.validate()?;
+            self.tx.blocking_send(message).map_err(|_| SendError::Stopped)?;
+            first = false;
+            if n == 0 {
+                break;
+            }
+        }
+        self.sent.files += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -361,12 +525,18 @@ mod tests {
     /// A name the receiver would refuse is refused here, before it is sent: one past `MAX_CHUNK_NAME_BYTES`.
     #[tokio::test]
     async fn a_name_the_receiver_would_refuse_is_refused_at_the_source() -> anyhow::Result<()> {
+        use std::io::Write as _;
+
         let root = tempfile::tempdir().context("root")?;
-        let mut deep = root.path().to_path_buf();
-        for _ in 0..8 {
-            deep.push("d".repeat(200));
+        // Built through directory handles: the path is longer than `PATH_MAX` where it is 1 KiB.
+        let mut dir = Beneath::open_dir(root.path()).context("open root")?;
+        for _ in 0..18 {
+            dir = dir.create_dir(OsStr::new(&"d".repeat(250))).context("create dir")?;
         }
-        write(&deep.join("f"), b"x")?;
+        dir.create_new_file(OsStr::new("f"))
+            .context("create file")?
+            .write_all(b"x")
+            .context("write file")?;
         let (sent, messages) = frames(&[src(None, root.path())], SendLimits::default()).await?;
         assert!(matches!(sent, Err(SendError::Violation(_))), "got {sent:?}");
         assert!(chunks(&messages).is_empty());

@@ -2026,6 +2026,31 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The receiver refuses an index past `Dispatch.outputs`, a name outside its named output, a file that arrives twice
   (outputs carry no offset), an empty chunk after data or repeated, a message that is not an output message, and a
   transfer past the byte, entry or idle limit. The peer is told a fixed text.
+- Known differences from local collection, which the host-executor sender (6b) matches by skipping: a symlink at
+  the final file name is replaced here, where local `create_file` refuses it; the rename replaces the destination
+  inode, so an existing file's mode, owner and hard links are lost where local truncates in place; empty directories
+  and symlinks in the guest output are not carried (local creates empty directories and skips symlinks). A reader
+  never sees a partial file at the final name, but the `.sandy-recv-*` temp is listable while the file is in flight
+  and a crash leaves it (#782).
+- The receiver trusts `Dispatch.outputs[].dest`: `Beneath::create_dir_at` resolves and creates the ancestors of a
+  destination by path, as local collection does (#607). The caller must pass only Submit-validated destinations. A
+  symlink in an ancestor is followed, and one test pins it (#784).
+
+### Slice 6b: the host-executor output sender
+
+- `output_send::send_outputs` reads one staged tree per declared output, in `Dispatch.outputs` order, and writes
+  `OutputChunk`s with that position as `output_index`, then `OutputEnd`. A file several outputs cover is sent once per
+  output, from that output's own staged tree. The wire name is `<name>/<rel>` for a named output, the bare `<name>` for
+  a file the guest wrote in place of the directory, and `<rel>` for a catch-all.
+- An output with nothing staged sends nothing and is not an error, as local collection collects nothing for it.
+  Empty directories and symlinks are not carried; a symlink inside a staged tree is refused (`Symlink`), never
+  followed, and a socket, fifo or device is `UnsupportedEntry`.
+- Every frame passes `DataLinkMessage::validate` before it is sent, so a name the receiver would refuse is refused at
+  the source. Chunks are at most `MAX_CHUNK_BYTES`, in order, never empty after data. Entries count files plus the
+  distinct directories below a root, as the receiver counts them. A failure other than a dead link sends a
+  `TransferError` with a fixed reason and no path.
+- The sender is not called yet: 6c stages the outputs under a host-local root, calls it after the run, and sets
+  `JobResult.outputs_follow`.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
