@@ -734,6 +734,7 @@ mod tests {
                     timed_out: false,
                     transport_error: None,
                     console: "done\n".to_owned(),
+                    outputs_follow: false,
                 })),
             },
         )
@@ -829,6 +830,7 @@ mod tests {
                     timed_out: false,
                     transport_error: None,
                     console: "done\n".to_owned(),
+                    outputs_follow: false,
                 })),
             },
         )
@@ -1111,6 +1113,7 @@ mod tests {
                     timed_out: false,
                     transport_error: None,
                     console: String::new(),
+                    outputs_follow: false,
                 })),
             },
         )
@@ -1150,6 +1153,7 @@ mod tests {
                     timed_out: false,
                     transport_error: None,
                     console: format!("env: GITHUB_TOKEN={TOKEN}\ndone\n"),
+                    outputs_follow: false,
                 })),
             },
         )
@@ -1217,6 +1221,7 @@ mod tests {
                     timed_out: false,
                     transport_error: None,
                     console: "done\n".to_owned(),
+                    outputs_follow: false,
                 })),
             },
         )

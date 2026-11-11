@@ -643,6 +643,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             secrets: Vec::new(),
+            data_link_token: Vec::new(),
         }
     }
 
