@@ -221,11 +221,11 @@ impl Beneath {
     ///
     /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`] (`to` is a directory, or
     /// `from` is missing).
-    pub fn rename(&self, _from: &OsStr, _to: &OsStr) -> Result<(), FsError> {
-        Err(FsError::Unsafe {
-            path: self.path.clone(),
-            reason: "rename is not implemented".to_owned(),
-        })
+    pub fn rename(&self, from: &OsStr, to: &OsStr) -> Result<(), FsError> {
+        let from = component(from, &self.path)?;
+        let to = component(to, &self.path)?;
+        rustix::fs::renameat(&self.fd, from, &self.fd, to)
+            .map_err(|e| FsError::io("rename entry", &self.path.join(from), e))
     }
 
     /// Remove the file or symlink `name`. A symlink is removed, not followed. A directory is refused.
@@ -233,11 +233,10 @@ impl Beneath {
     /// # Errors
     ///
     /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`].
-    pub fn remove_file(&self, _name: &OsStr) -> Result<(), FsError> {
-        Err(FsError::Unsafe {
-            path: self.path.clone(),
-            reason: "remove_file is not implemented".to_owned(),
-        })
+    pub fn remove_file(&self, name: &OsStr) -> Result<(), FsError> {
+        let name = component(name, &self.path)?;
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty())
+            .map_err(|e| FsError::io("remove file", &self.path.join(name), e))
     }
 
     /// The target text of the symlink `name`. The host never follows it.
