@@ -58,11 +58,11 @@ at the latest, which revokes the live token on every path (decision 1) —
 whichever comes first, not the token's full native TTL. The token's narrow
 scope bounds the damage further, but egress has to allow the forge for git to
 work at all, so the token leaving with the job is not prevented today. The
-exit is an in-flight token swap at the #360 mediation
-proxy, tracked in #372: the proxy terminates TLS and inserts the token on the
-wire as the request leaves, so the token never has to sit in the guest. #360's
-v1 deliberately leaves TLS termination out, so the swap waits on #372. The
-owner ruled that no sandy component terminates TLS; the exit is the credential-broker, see
+exit was an in-flight token swap at the #360 mediation proxy, tracked in #372:
+the proxy would terminate TLS and insert the token on the wire, so the token
+never has to sit in the guest. The owner ruled that no sandy component
+terminates TLS, so that design is withdrawn. The exit is the credential-broker,
+whose proxied mode keeps the upstream token out of the guest; see
 [`credential-broker.md`](credential-broker.md) (proposed, #707). If that is dropped, this residual risk becomes a permanent, accepted one.
 
 ## 3. Mid-run refresh

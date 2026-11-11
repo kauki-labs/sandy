@@ -110,6 +110,11 @@ This is the mode that closes the exfiltration. It works without any sandy compon
   broker repo before this slice.
 - **Set aside.** A host relay that takes plain HTTP from the guest over vsock and adds the mTLS to the broker. It reads
   guest plaintext, which the owner ruled out (answer 3). A TLS-intercepting proxy mode, ruled out earlier.
+- **Compatibility.** Mode A is an opt-in per profile and per client. The staged token and the refresh of decision 38
+  are not removed for anyone: a profile that does not opt in keeps mode B or the local trust root, and a service that
+  reads the staged file at use time keeps working. A profile that opts in loses the staged file, so every client it
+  runs must be one of the converted clients above. `gh` needs a credential configured before most commands run, which
+  the wrapper and its shim supply.
 - This mode depends on broker blocks 2, 4 and 5, none of which exist.
 
 ## 4. Capability table
