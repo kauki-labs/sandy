@@ -16,6 +16,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     net::TcpStream,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -171,11 +172,19 @@ async fn a_vfkit_environment_becomes_ready_answers_http_and_leaves_nothing_after
     let staging_before = staging_entries();
     let dir = tempfile::tempdir().context("temp dir")?;
     let sock = dir.path().join("sandyd.sock");
+    // A create needs a registry naming the profile (#704); the service guest never mints, so the entry is a stand-in.
+    let profiles = dir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"profiles":[{"name":"live","credential":"live","targets":["o/r"],"capabilities":["read_code"]}]}"#,
+    )?;
+    std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o600))?;
     let _daemon = Daemon {
         vfkit_before: vfkit_before.clone(),
         child: Command::new(sandyd_bin()?)
             .env("SANDY_SOCK", &sock)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
+            .env("SANDY_PROFILES", &profiles)
             .env("SANDY_ENV_BACKEND", "vm-vfkit")
             .env(
                 "SANDY_ENV_VM_TEMPLATE",
