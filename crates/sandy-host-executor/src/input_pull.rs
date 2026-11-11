@@ -21,13 +21,19 @@ use sandy_executor_proto::{
 };
 use tokio::io::AsyncWriteExt;
 
+/// The default for [`PullLimits::idle`].
+pub const DEFAULT_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The caps one pull enforces. The default is the §22 pair; a test lowers them.
 #[derive(Debug, Clone, Copy)]
 pub struct PullLimits {
     /// The most file bytes the pull accepts.
     pub max_bytes: u64,
-    /// The most files the pull accepts.
+    /// The most entries the pull accepts: files plus the directories it creates.
     pub max_entries: usize,
+    /// How long the pull waits for the next frame before it gives up. A link that stays open and silent would
+    /// otherwise hold the pull, and the host-executor's one-at-a-time dispatch, forever.
+    pub idle: std::time::Duration,
 }
 
 impl Default for PullLimits {
@@ -35,6 +41,7 @@ impl Default for PullLimits {
         Self {
             max_bytes: MAX_TRANSFER_BYTES,
             max_entries: MAX_TRANSFER_ENTRIES,
+            idle: DEFAULT_IDLE,
         }
     }
 }
@@ -72,6 +79,9 @@ pub enum PullError {
     /// sign that the sender skipped one.
     #[error("InputEnd arrived but a declared input received no file")]
     Missing,
+    /// No frame arrived within [`PullLimits::idle`].
+    #[error("no frame arrived within the idle timeout")]
+    Idle,
     /// A message that is not an input message arrived.
     #[error("an unexpected message arrived during the input pull")]
     Unexpected,
@@ -512,6 +522,7 @@ mod tests {
         let limits = PullLimits {
             max_bytes: 10,
             max_entries: 100,
+            ..PullLimits::default()
         };
         let (pulled, _peer) = run(
             &[chunk("data", 0, b"123456"), chunk("data", 6, b"78901"), end()],
@@ -527,6 +538,7 @@ mod tests {
         let limits = PullLimits {
             max_bytes: 100,
             max_entries: 1,
+            ..PullLimits::default()
         };
         let (pulled, _peer) = run(
             &[chunk("a", 0, b"1"), chunk("b", 0, b"2"), end()],
@@ -547,6 +559,7 @@ mod tests {
         let limits = PullLimits {
             max_bytes: 4,
             max_entries: 2,
+            ..PullLimits::default()
         };
         let (pulled, _peer) = run(
             &[chunk("a", 0, b"12"), chunk("b", 0, b"34"), end()],
@@ -603,6 +616,7 @@ mod tests {
         let at = |max_entries| PullLimits {
             max_bytes: 100,
             max_entries,
+            ..PullLimits::default()
         };
         let messages = [chunk("a/b/c/d", 0, b"x"), end()];
 
@@ -626,10 +640,51 @@ mod tests {
         let limits = PullLimits {
             max_bytes: 100,
             max_entries: 3,
+            ..PullLimits::default()
         };
         let messages = [chunk("a/x", 0, b"1"), chunk("a/y", 0, b"2"), end()];
         let (pulled, _peer) = run(&messages, false, &["a"], limits, root.path()).await?;
         assert_eq!(pulled.context("one dir and two files fit in 3")?.files, 2);
+        Ok(())
+    }
+
+    /// A peer that opens the link and sends nothing, or sends one chunk and stops, ends the pull with `Idle` once
+    /// `idle` passes, and is told. Real short durations: a paused clock races the real file I/O.
+    #[tokio::test]
+    async fn a_silent_link_ends_the_pull_with_idle() -> anyhow::Result<()> {
+        let limits = PullLimits {
+            idle: std::time::Duration::from_millis(200),
+            ..PullLimits::default()
+        };
+        for messages in [vec![], vec![chunk("a", 0, b"x")]] {
+            let root = tempfile::tempdir().context("root")?;
+            let (pulled, mut peer) = run(&messages, false, &["a"], limits, root.path()).await?;
+            assert!(matches!(pulled, Err(PullError::Idle)), "got {pulled:?}");
+            assert!(answered(&mut peer).await?.is_some(), "the peer must be told");
+        }
+        Ok(())
+    }
+
+    /// Each frame restarts the clock: a transfer slower than `idle` in total but never quiet for `idle` completes.
+    #[tokio::test]
+    async fn a_steady_trickle_is_not_idle() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let limits = PullLimits {
+            idle: std::time::Duration::from_millis(400),
+            ..PullLimits::default()
+        };
+        let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+        let sender = tokio::spawn(async move {
+            for (i, byte) in b"abcd".iter().copied().enumerate() {
+                write_frame(&mut peer, &chunk("a", i as u64, &[byte])).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            write_frame(&mut peer, &end()).await?;
+            anyhow::Ok(peer)
+        });
+        let pulled = pull_inputs(&mut local, &declared(&["a"]), root.path(), limits).await;
+        let _peer = sender.await.context("sender task")?.context("sender")?;
+        assert_eq!(pulled.context("a trickle under the idle gap")?.bytes, 4);
         Ok(())
     }
 
