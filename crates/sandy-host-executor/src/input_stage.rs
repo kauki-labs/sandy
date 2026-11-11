@@ -388,6 +388,27 @@ mod tests {
         Ok(())
     }
 
+    /// A pull stopped by a passed deadline leaves nothing under the parent, even when a `tokio::fs` create it
+    /// started is still running on a blocking thread when the future drops. One run is a race, so loop it.
+    #[tokio::test]
+    async fn a_stopped_pull_never_leaves_its_root() -> anyhow::Result<()> {
+        for round in 0..30 {
+            let parent = tempfile::tempdir().context("parent")?;
+            let control = RunControl::new(std::time::Instant::now());
+            let (staged, _peer) = stage(
+                &[chunk("data", 0, b"x")],
+                &[declared("data", None)],
+                parent.path(),
+                &control,
+                CAP,
+            )
+            .await?;
+            assert!(matches!(staged, Err(StageError::DeadlinePassed)), "round {round}");
+            assert_eq!(entries(parent.path())?, 0, "round {round}: a root was left behind");
+        }
+        Ok(())
+    }
+
     /// A peer that sends a frame inside every idle gap, forever, is stopped by the total cap.
     #[tokio::test]
     async fn a_trickle_under_the_idle_gap_hits_the_total_cap() -> anyhow::Result<()> {
