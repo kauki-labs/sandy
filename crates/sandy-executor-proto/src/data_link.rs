@@ -39,18 +39,29 @@ pub enum DataLinkViolation {
     /// A chunk name holds a NUL byte.
     #[error("a chunk name holds a NUL byte")]
     NameNul,
-    /// An input chunk's `offset` plus its length does not fit in a `u64`.
-    #[error("an input chunk's offset plus its length overflows")]
+    /// An input chunk's `offset` plus its length is past `i64::MAX`, the largest file position.
+    #[error("an input chunk's offset plus its length is past the largest file position")]
     OffsetOverflow,
+    /// A `TransferError` reason is longer than `MAX_TRANSFER_REASON_BYTES`.
+    #[error("a transfer error reason is {len} bytes, over the {MAX_TRANSFER_REASON_BYTES} allowed")]
+    ReasonTooLong {
+        /// The reason's byte length.
+        len: usize,
+    },
 }
+
+/// The longest `TransferError.reason` a data-link peer may send, in bytes. A reason is attacker-chosen text that a
+/// receiver logs or shows, so it is bounded, and the receiver still escapes control characters before printing it.
+pub const MAX_TRANSFER_REASON_BYTES: usize = 4096;
 
 impl DataLinkMessage {
     /// Checks the message against the limits §22 sets, before anything acts on it.
     ///
     /// A chunk's `bytes` are at most `MAX_CHUNK_BYTES` and its `name` at most `MAX_CHUNK_NAME_BYTES`; the name is a
     /// relative path of plain components (no empty, `.` or `..` component, not absolute, no NUL); an input chunk's
-    /// `offset + len` must not overflow. A symlink in the destination is a check on the filesystem, made when the
-    /// bytes are written, not one a name can show.
+    /// `offset + len` must not pass `i64::MAX`, and a `TransferError` reason is at most `MAX_TRANSFER_REASON_BYTES`. A
+    /// symlink in the destination is a check on the filesystem, made when the bytes are written, not one a name can
+    /// show.
     ///
     /// # Errors
     /// The first [`DataLinkViolation`] found.
@@ -58,14 +69,20 @@ impl DataLinkMessage {
         match self.op.as_ref().ok_or(DataLinkViolation::Empty)? {
             Op::InputChunk(chunk) => {
                 validate_chunk(&chunk.name, chunk.bytes.len())?;
-                // The file offset after this chunk must be representable, or the receiver's running count wraps.
+                // The writer's file position is a signed `off_t`: an end past `i64::MAX` would wrap negative at a cast.
                 u64::try_from(chunk.bytes.len())
                     .ok()
                     .and_then(|len| chunk.offset.checked_add(len))
+                    .filter(|end| i64::try_from(*end).is_ok())
                     .map(drop)
                     .ok_or(DataLinkViolation::OffsetOverflow)
             }
             Op::OutputChunk(chunk) => validate_chunk(&chunk.name, chunk.bytes.len()),
+            Op::TransferError(error) if error.reason.len() > MAX_TRANSFER_REASON_BYTES => {
+                Err(DataLinkViolation::ReasonTooLong {
+                    len: error.reason.len(),
+                })
+            }
             Op::InputEnd(_) | Op::OutputEnd(_) | Op::TransferError(_) => Ok(()),
         }
     }
@@ -188,18 +205,36 @@ mod tests {
         }
     }
 
+    /// The offset is a file position, and `off_t` is signed: an end past `i64::MAX` would wrap negative at an
+    /// `as i64` cast in the writer. So the bound is `i64::MAX`, not `u64::MAX`.
     #[test]
-    fn an_input_offset_plus_length_that_overflows_is_refused() {
+    fn an_input_offset_plus_length_past_a_signed_file_position_is_refused() {
+        let max = i64::MAX.cast_unsigned();
+        assert_eq!(input("in", max - 1, 1).validate(), Ok(()), "ends exactly at i64::MAX");
+        assert_eq!(input("in", max, 0).validate(), Ok(()), "no bytes, ends at i64::MAX");
+        for (offset, len) in [(max, 1), (max - 1, 2), (u64::MAX, 1), (u64::MAX - 1, 2), (u64::MAX, 0)] {
+            assert_eq!(
+                input("in", offset, len).validate(),
+                Err(DataLinkViolation::OffsetOverflow),
+                "offset {offset} len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transfer_error_reason_is_bounded() {
+        let reason = |len: usize| DataLinkMessage {
+            op: Some(Op::TransferError(TransferError {
+                reason: "r".repeat(len),
+            })),
+        };
+        assert_eq!(reason(MAX_TRANSFER_REASON_BYTES).validate(), Ok(()));
         assert_eq!(
-            input("in", u64::MAX, 1).validate(),
-            Err(DataLinkViolation::OffsetOverflow)
+            reason(MAX_TRANSFER_REASON_BYTES + 1).validate(),
+            Err(DataLinkViolation::ReasonTooLong {
+                len: MAX_TRANSFER_REASON_BYTES + 1
+            })
         );
-        assert_eq!(
-            input("in", u64::MAX - 1, 2).validate(),
-            Err(DataLinkViolation::OffsetOverflow)
-        );
-        assert_eq!(input("in", u64::MAX - 1, 1).validate(), Ok(()));
-        assert_eq!(input("in", u64::MAX, 0).validate(), Ok(()), "no bytes, no overflow");
     }
 
     #[test]

@@ -1896,10 +1896,18 @@ decisions, not itself an owner decision.
   renamed into place only once fully received and validated, never
   streamed directly onto the final path. The name and size checks are one pure function, `DataLinkMessage::validate`
   (`sandy-executor-proto`, slice 2): a chunk of at most `MAX_CHUNK_BYTES` with a relative name of at most
-  `MAX_CHUNK_NAME_BYTES` (no empty, `.` or `..` component, not absolute, no NUL), and an input chunk whose
-  `offset + len` does not overflow. The codec enforces none of it (a frame decodes to a chunk four times the cap), so
-  every receiver calls it before acting on a message, whatever the sender claims to keep. A symlink component is a
-  filesystem check made at write time, not one a name can show. Its errors never repeat the peer's name or bytes.
+  `MAX_CHUNK_NAME_BYTES` (no empty, `.` or `..` component, not absolute, no NUL), an input chunk whose `offset + len`
+  does not pass `i64::MAX` (a file position is a signed `off_t`), and a `TransferError` reason of at most
+  `MAX_TRANSFER_REASON_BYTES` (4096). The codec enforces none of it (a frame decodes to a chunk four times the cap),
+  so every receiver calls it before acting on a message, whatever the sender claims to keep. Its errors never repeat
+  the peer's name or bytes. It is stateless, so the receiver slices owe what it cannot check: an input chunk's
+  `offset` equals the running byte count of that file (else a one-byte chunk at offset 2^62 makes a huge sparse
+  file), a per-transfer cap, and the first component of an input name matching a declared `Input.name`. Write-time
+  failures are a `TransferError`, never a panic: a component over 255 bytes, a destination plus name over `PATH_MAX`,
+  a file-versus-directory clash, a case collision on a case-insensitive filesystem. A symlink component is a
+  filesystem check made at write time (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, an
+  `O_NOFOLLOW` walk elsewhere), not one a name can show. A receiver escapes control characters before it logs or
+  shows a name or a reason.
 - **Disk I/O off the connection-driving task.** Reading a local input
   file to send, or writing a received output chunk, goes through a
   bounded channel into a blocking task, the same shape `spawn_blocking`
