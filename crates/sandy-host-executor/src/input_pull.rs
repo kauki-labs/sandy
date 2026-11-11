@@ -65,6 +65,10 @@ pub enum PullError {
     /// The link closed before `InputEnd`.
     #[error("the link closed before InputEnd")]
     Truncated,
+    /// `InputEnd` arrived but a declared input received no file. `InputEnd` carries no manifest, so this is the only
+    /// sign that the sender skipped one.
+    #[error("InputEnd arrived but a declared input received no file")]
+    Missing,
     /// A message that is not an input message arrived.
     #[error("an unexpected message arrived during the input pull")]
     Unexpected,
@@ -502,6 +506,62 @@ mod tests {
         )
         .await?;
         assert!(matches!(pulled, Err(PullError::TooManyEntries)), "got {pulled:?}");
+        Ok(())
+    }
+
+    /// Exactly at a cap is fine; one past it stops the pull.
+    #[tokio::test]
+    async fn a_transfer_exactly_at_the_caps_succeeds() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let limits = PullLimits {
+            max_bytes: 4,
+            max_entries: 2,
+        };
+        let (pulled, _peer) = run(
+            &[chunk("a", 0, b"12"), chunk("b", 0, b"34"), end()],
+            false,
+            &["a", "b"],
+            limits,
+            root.path(),
+        )
+        .await?;
+        let pulled = pulled.context("a transfer at exactly its caps")?;
+        assert_eq!((pulled.files, pulled.bytes), (2, 4));
+        Ok(())
+    }
+
+    /// A declared input that received no file is `Missing`, and the peer is told: `InputEnd` has no manifest.
+    #[tokio::test]
+    async fn an_end_with_a_declared_input_missing_is_refused_and_reported() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, mut peer) = run(
+            &[chunk("a", 0, b"1"), end()],
+            false,
+            &["a", "b"],
+            PullLimits::default(),
+            root.path(),
+        )
+        .await?;
+        assert!(matches!(pulled, Err(PullError::Missing)), "got {pulled:?}");
+        assert!(answered(&mut peer).await?.is_some(), "the peer must be told");
+        Ok(())
+    }
+
+    /// A zero-byte file is one empty chunk at offset 0: it creates the empty file and counts as received.
+    #[tokio::test]
+    async fn an_empty_chunk_creates_a_zero_byte_file() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, _peer) = run(
+            &[chunk("empty", 0, b""), end()],
+            false,
+            &["empty"],
+            PullLimits::default(),
+            root.path(),
+        )
+        .await?;
+        let pulled = pulled.context("the pull")?;
+        assert_eq!((pulled.files, pulled.bytes), (1, 0));
+        assert_eq!(read(root.path().join("empty"))?, b"");
         Ok(())
     }
 
