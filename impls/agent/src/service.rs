@@ -596,7 +596,7 @@ mod tests {
     /// program cannot make the root agent run it); with no user it runs as given.
     #[test]
     fn a_command_probe_runs_as_the_service_user_when_there_is_one() {
-        let argv = vec!["sandy-t3-ready".to_owned(), "3773".to_owned()];
+        let argv = vec!["sandy-http-ready".to_owned(), "3773".to_owned()];
         assert_eq!(probe_argv(None, &argv), argv);
         let wrapped = probe_argv(Some("service"), &argv);
         assert_eq!(
