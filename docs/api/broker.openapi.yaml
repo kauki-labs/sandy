@@ -264,7 +264,7 @@ paths:
       operationId: linkEnvironment
       summary: Pair the environment with a primary, server-side.
       description: >-
-        The pairing code is generated and consumed inside the API tier. It never appears in a request or response. Returns unsupported until T3 offers an external link interface (#585 open point 1).
+        The pairing code is generated and consumed inside the API tier. It never appears in a request or response. Returns unsupported until a service offers an external link interface (#585 open point 1).
       requestBody:
         required: true
         content:

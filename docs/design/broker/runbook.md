@@ -9,7 +9,7 @@ Contract: [`../../api/broker.openapi.yaml`](../../api/broker.openapi.yaml).
 ## What runs
 
 ```text
-T3 / an agent --stdio--> sandy-mcp --HTTP, bearer--> sandy-broker --UDS, control RPC--> sandyd
+An agent --stdio--> sandy-mcp --HTTP, bearer--> sandy-broker --UDS, control RPC--> sandyd
 ```
 
 `sandy-mcp` holds no state. `sandy-broker` authenticates the caller, owns per-client
@@ -34,7 +34,7 @@ broker and stores jobs and environments.
    ```json
    [
      {
-       "id": "t3",
+       "id": "example",
        "token_sha256": "<the 64 lowercase hex digits above>",
        "max_isolation_class": "untrusted",
        "profiles": ["dev"],
@@ -84,13 +84,13 @@ broker and stores jobs and environments.
 
 `SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
 process. It has no isolation. While it is on, sandyd refuses an environment create from a client
-whose `max_isolation_class` is not `trusted` (`forbidden`, #641): give the `t3` client
+whose `max_isolation_class` is not `trusted` (`forbidden`, #641): give the `example` client
 `"max_isolation_class": "trusted"` and use it on a dev machine only. Upgrade sandyd and the broker together: a broker that does not send the class gets every create refused. Lowering a client does not stop its stopped environments from resuming; delete them to revoke. Set the
 variables on sandyd (names and meanings in `crates/sandyd/src/environment_backend.rs`):
 
 ```bash
 SANDY_ENV_BACKEND=process-insecure \
-SANDY_ENV_PROCESS_COMMAND='t3 serve --port {port} --base-dir {base_dir}' \
+SANDY_ENV_PROCESS_COMMAND='example-service serve --port {port} --base-dir {base_dir}' \
 SANDY_ENV_STATE_DIR=/path/environments \
 SANDY_SOCK=/path/sandyd.sock SANDY_DB=/path/sandyd.db sandyd
 ```
@@ -104,7 +104,7 @@ stops the process on the driver's next tick (about a second).
 
 - Without `SANDY_ENV_BACKEND` a spawn stays `provisioning` and `connection` is absent. The
   isolated VM backend is #587 slice C.
-- `link` returns `unsupported` until T3 offers an external link interface.
+- `link` returns `unsupported` until a service offers an external link interface.
 - No TLS or remote callers. mTLS client auth is an owner decision (#607).
 - A create whose reply times out and is never retried leaves an environment with no owner
   (#621). sandyd collects deleted rows after `SANDY_ENV_RETENTION_SECS` (default one day) (#633).

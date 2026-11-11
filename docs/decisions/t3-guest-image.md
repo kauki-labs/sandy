@@ -2,10 +2,14 @@
 title: "Decisions: the T3 guest image"
 status: accepted
 project: sandy
-updated: 2026-11-03
+updated: 2026-11-11
 ---
 
 # Decisions: the T3 guest image
+
+> **Status note, 2026-11-11.** Owner decision: sandy core carries no T3. The T3 guest was removed. `nix/guest` now builds
+> a generic service guest (`qemu-service`, `vfkit-service`) with an example HTTP service and no T3, claude or codex
+> package. This record stays as history; its decisions no longer describe the tree.
 
 The guest an on-demand T3 environment boots (epic #597, #608): the t3 server and the harness binaries it launches,
 and nothing else. Starting the server is the service workload kind's job (#589), and the provider config comes from
