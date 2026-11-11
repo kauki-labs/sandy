@@ -62,9 +62,8 @@ exit is an in-flight token swap at the #360 mediation
 proxy, tracked in #372: the proxy terminates TLS and inserts the token on the
 wire as the request leaves, so the token never has to sit in the guest. #360's
 v1 deliberately leaves TLS termination out, so the swap waits on #372. The
-owner ruled that the swap is a separate injector component, not the proxy; see
-[`credential-injector.md`](credential-injector.md) (proposed, #707). If #372
-is dropped, this residual risk becomes a permanent, accepted one.
+owner ruled that no sandy component terminates TLS; the exit is the credential-broker, see
+[`credential-broker.md`](credential-broker.md) (proposed, #707). If that is dropped, this residual risk becomes a permanent, accepted one.
 
 ## 3. Mid-run refresh
 

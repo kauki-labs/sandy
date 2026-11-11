@@ -2563,8 +2563,7 @@ separate task with its own lock.
 **Mid-run refresh: environments only (#706, owner decision of 2026-11-11, recorded on #481 and #587).** A GitHub
 token lives about an hour and an environment lives longer, so the token minted at boot must be replaced while the
 guest runs. The owner chose one path per consumer. A job gets no refresh (option A, decision 37). An environment gets
-the refresh described here (option B). A separate host-side injector with its own credential capabilities is a later
-option (C, #707); nothing here waits for it.
+the refresh described here (option B). The credential-broker's proxied mode is a later option (C, #707, `credential-broker.md`); nothing here waits for it.
 
 - **The host writes, the guest reads.** The host driver already renews in place (the renewal bullet above) and needs
   no second writer. The owner's words "the guest rewrites the file" name the visible effect: a file in the guest
@@ -2588,7 +2587,7 @@ option (C, #707); nothing here waits for it.
   archive masking (`TokenRedactor`) reads that same file, so a guest that replaces it makes the host mask the
   guest's value and not the real token. Qemu is not affected.
 - **Not covered.** A service that holds the token in memory (an SDK that read it once) fails after the first expiry;
-  the remedy is the injector (C), where the guest never holds a token. The process backend has no secret channel and
+  the remedy is the broker's proxied mode (C), where the guest never holds the upstream token. The process backend has no secret channel and
   no refresh. A job loses forge access at expiry, by decision (A).
 
 **Set aside** (refresh). A guest-side writer. A signal into the guest after a renewal. A second copy of the token
