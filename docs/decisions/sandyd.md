@@ -1906,8 +1906,13 @@ decisions, not itself an owner decision.
   failures are a `TransferError`, never a panic: a component over 255 bytes, a destination plus name over `PATH_MAX`,
   a file-versus-directory clash, a case collision on a case-insensitive filesystem. A symlink component is a
   filesystem check made at write time (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` on Linux, an
-  `O_NOFOLLOW` walk elsewhere), not one a name can show. A receiver escapes control characters before it logs or
-  shows a name or a reason.
+  `O_NOFOLLOW` walk elsewhere), not one a name can show. The host-executor's input receiver (`input_pull`, #753)
+  does not make that walk. It checks each directory component with `symlink_metadata` and opens the file with
+  `create_new`: a check-then-use path walk, safe only because the staging root is private (this process creates it
+  empty and nothing else can write to it). A caller that passes a root another process can write breaks that
+  contract. The sandyd output receiver writes into the submitter's destination, which is not private, so it needs
+  the `openat2` or `O_NOFOLLOW` walk. A receiver escapes control characters before it logs or shows a name or a
+  reason.
 - **Disk I/O off the connection-driving task.** Reading a local input
   file to send, or writing a received output chunk, goes through a
   bounded channel into a blocking task, the same shape `spawn_blocking`

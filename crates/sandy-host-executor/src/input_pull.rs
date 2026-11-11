@@ -151,6 +151,9 @@ async fn pull(
             Some(Op::InputChunk(chunk)) => pull.chunk(chunk).await?,
             Some(Op::InputEnd(_)) => {
                 pull.finish_file().await?;
+                if declared.iter().any(|name| !pull.names.contains(name)) {
+                    return Err(PullError::Missing);
+                }
                 return Ok(PulledInputs {
                     files: pull.files,
                     bytes: pull.bytes,
