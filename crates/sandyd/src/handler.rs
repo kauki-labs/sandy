@@ -574,14 +574,27 @@ pub async fn handle(
                     required_sandbox_kind.into(),
                     require_local,
                 )?;
-                match RemoteLink::new(candidate.peer_ip)
-                    .and_then(|link| Ok((link, RemoteLink::new(candidate.peer_ip)?)))
-                {
+                // The data link exists only for a host that declared `transfer`
+                // and a job that names inputs or outputs (#482 decision 22): an
+                // executor that dials on a non-empty token would otherwise
+                // connect and wait for a transfer that never comes.
+                let wants_data_link =
+                    candidate.capabilities.transfer && (!path_inputs.is_empty() || !path_outputs.is_empty());
+                let minted = RemoteLink::new(candidate.peer_ip).and_then(|link| {
+                    let data_link = wants_data_link
+                        .then(|| RemoteLink::new(candidate.peer_ip))
+                        .transpose()?;
+                    Ok((link, data_link))
+                });
+                match minted {
                     Ok((link, data_link)) => {
                         let link_token = link.token().as_bytes().to_vec();
-                        let data_link_token = data_link.token().as_bytes().to_vec();
+                        let data_link_token = data_link
+                            .as_ref()
+                            .map(|l| l.token().as_bytes().to_vec())
+                            .unwrap_or_default();
                         job_channel.remote_link = Some(link);
-                        job_channel.data_link = Some(data_link);
+                        job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
