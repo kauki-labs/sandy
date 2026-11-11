@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn a_stat_line_names_its_state_and_group_even_when_the_command_holds_parentheses() {
-        assert_eq!(parse_stat("4242 (fake-t3) S 1 4242 4242 0 -1"), Some(('S', 4242)));
+        assert_eq!(parse_stat("4242 (fake-service) S 1 4242 4242 0 -1"), Some(('S', 4242)));
         assert_eq!(parse_stat("4243 (a) b) c (d) Z 4242 4242 4242 0"), Some(('Z', 4242)));
         assert_eq!(parse_stat("garbage"), None);
     }

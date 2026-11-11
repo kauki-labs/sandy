@@ -31,7 +31,7 @@ name = "acceptance-vm"
 path = "src/bin/acceptance_vm.rs"
 required-features = ["live"]
 
-# The vfkit half of the guest service bridge's live gate (#590, KSB4): boots the T3 guest with the relay exposed
+# The vfkit half of the guest service bridge's live gate (#590, KSB4): boots the service guest with the relay exposed
 # at a host socket. Driven by scripts/dev/live-vfkit-bridge.sh.
 [[bin]]
 name = "live-vfkit-guest"

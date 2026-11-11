@@ -298,7 +298,7 @@ mod tests {
             (SERVICE_ENV.to_string(), service.to_string()),
         ];
         assert_eq!(
-            agent_command_argv(program, 5000, &["t3".to_string()], &with_service)[..3],
+            agent_command_argv(program, 5000, &["service".to_string()], &with_service)[..3],
             [
                 "env".to_string(),
                 format!("{SERVICE_ENV}={service}"),

@@ -96,7 +96,7 @@ impl VmBackend for Holding {
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
         environment_id: id.to_owned(),
-        template: "t3".to_owned(),
+        template: "service".to_owned(),
         size: None,
         env: vec![("K".to_owned(), "V".to_owned())],
         service_port: Some(3773),
@@ -124,7 +124,7 @@ fn stubborn_backend(
                 stubborn: stubborn.clone(),
             }))
         }),
-        VmEnvironmentConfig::new(vec!["t3".to_owned(), "serve".to_owned()]),
+        VmEnvironmentConfig::new(vec!["service".to_owned(), "serve".to_owned()]),
     );
     (b, seen)
 }
@@ -155,7 +155,7 @@ fn the_run_gets_the_service_command_and_no_deadline() -> Result<()> {
     let (b, seen) = backend(None, Duration::ZERO);
     b.launch(&spec("env-a"))?;
     wait_for("the run to start", || seen.runs.load(Ordering::SeqCst) == 1)?;
-    assert_eq!(seen.commands.lock().unwrap()[0], ["t3", "serve"]);
+    assert_eq!(seen.commands.lock().unwrap()[0], ["service", "serve"]);
     assert!(
         seen.agent_grant.lock().unwrap()[0],
         "agent mode: the agent grant on, secrets off"
@@ -361,7 +361,7 @@ fn dropping_the_backend_does_not_hang_on_a_run_that_ignores_cancel() -> Result<(
 fn the_config_env_follows_the_spec_env_and_the_boot_budget_reaches_the_run() -> Result<()> {
     let seen = Arc::new(Seen::default());
     let s = Arc::clone(&seen);
-    let mut config = VmEnvironmentConfig::new(vec!["t3".to_owned()]);
+    let mut config = VmEnvironmentConfig::new(vec!["service".to_owned()]);
     config.env = vec![
         ("SANDY_SERVICE".to_owned(), "{}".to_owned()),
         ("K".to_owned(), "config-wins".to_owned()),
@@ -476,7 +476,7 @@ fn printing_backend(launches: &[&'static str], printed: Arc<AtomicBool>, with_ta
                 printed: Arc::clone(&printed),
             }))
         }),
-        VmEnvironmentConfig::new(vec!["t3".to_owned()]),
+        VmEnvironmentConfig::new(vec!["service".to_owned()]),
     );
     if with_taps { b.with_console_taps(taps) } else { b }
 }

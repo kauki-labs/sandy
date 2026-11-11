@@ -1,8 +1,8 @@
 //! The host half of the service bridge (#590): a loopback listener that splices each accepted connection to a
 //! stream from a [`Dialer`].
 //!
-//! The guest service (for example `t3 serve`) listens on guest loopback, and `sandy-agent port-relay` exposes it on
-//! a vsock port (`docs/decisions/agent-fabric.md` decision 10a). A [`Dialer`] opens one stream to that relay: over
+//! The guest service (for example `service serve`) listens on guest loopback, and `sandy-agent port-relay` exposes it
+//! on a vsock port (`docs/decisions/agent-fabric.md` decision 10a). A [`Dialer`] opens one stream to that relay: over
 //! vhost-vsock on qemu, over a unix socket on vfkit. The bridge owns the host side: it binds `127.0.0.1` on an
 //! ephemeral port, reports the address (the endpoint `Probe::Ready` carries), caps concurrent connections, retries
 //! a dial for a short window while the relay comes up, and, when shut down or dropped, closes every live connection
@@ -14,7 +14,7 @@
 //!
 //! The bridge parses nothing and adds no TLS or auth. Any local user can connect to a loopback port, so until the
 //! owner decides the exposure (`docs/decisions/agent-fabric.md` decision 10b) it is a development aid for a
-//! single-user host: the service authenticates its own clients (t3's pairing token), and tailnet exposure is the
+//! single-user host: the service authenticates its own clients (its own token), and tailnet exposure is the
 //! host's job (`tailscale serve`).
 //! It must run inside a tokio runtime.
 

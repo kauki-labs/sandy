@@ -297,7 +297,7 @@ mod tests {
     fn spec(id: &str) -> EnvironmentSpec {
         EnvironmentSpec {
             environment_id: id.to_owned(),
-            template: "t3".to_owned(),
+            template: "service".to_owned(),
             size: None,
             env: Vec::new(),
             service_port: Some(3773),

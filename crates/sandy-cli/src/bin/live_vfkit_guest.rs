@@ -1,4 +1,4 @@
-//! `live-vfkit-guest`: boots the T3 guest on vfkit with the service relay exposed at a host socket (#590, KSB4).
+//! `live-vfkit-guest`: boots the service guest on vfkit with the service relay exposed at a host socket (#590, KSB4).
 //!
 //! The vfkit half of the guest service bridge's live gate. It runs one job through `VfkitBackend` with
 //! `with_service_socket`, so vfkit's `connect` device listens at the given path, and holds the guest for the job's

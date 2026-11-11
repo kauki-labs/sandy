@@ -262,14 +262,14 @@ mod tests {
             cpu: Some(4),
             mem: Some(2_048),
             timeout_secs: Some(120),
-            service: Some(t3_service()),
+            service: Some(example_service()),
         };
         let bytes = encode_flake_manifest(&manifest)?;
         assert_eq!(decode_flake_manifest(&bytes)?, manifest);
         Ok(())
     }
 
-    fn t3_service() -> ServiceSpec {
+    fn example_service() -> ServiceSpec {
         ServiceSpec {
             user: "dev".to_owned(),
             probe: HealthProbe {
@@ -285,13 +285,13 @@ mod tests {
 
     /// A service manifest with `change` applied, encoded the way a submitter would send it.
     fn service_manifest_bytes(change: impl FnOnce(&mut ServiceSpec)) -> Result<Vec<u8>, serde_json::Error> {
-        let mut service = t3_service();
+        let mut service = example_service();
         change(&mut service);
         encode_flake_manifest(&FlakeManifestV1 {
             flake: "./fixture".to_owned(),
             kind: None,
             attr: None,
-            command: vec!["t3".to_owned(), "serve".to_owned()],
+            command: vec!["service".to_owned(), "serve".to_owned()],
             history_lines: default_history_lines(),
             env: Vec::new(),
             cpu: None,
@@ -322,7 +322,7 @@ mod tests {
                 "user {user:?} must be refused as a bad account"
             );
         }
-        for user in ["dev", "_t3", "t3-user", "svc_1"] {
+        for user in ["dev", "_svc", "svc-user", "svc_1"] {
             decode_flake_manifest(&service_manifest_bytes(|s| s.user = user.to_owned())?)?;
         }
         Ok(())
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn the_service_schema_refuses_unknown_shapes() -> Result<(), serde_json::Error> {
         let base = |service: &str| {
-            format!(r#"{{"flake":".","kind":null,"attr":null,"command":["t3","serve"],"service":{service}}}"#)
+            format!(r#"{{"flake":".","kind":null,"attr":null,"command":["service","serve"],"service":{service}}}"#)
         };
         for service in [
             r#"{"user":"dev","probe":{"check":{"type":"tcp","port":1}},"extra":1}"#,
@@ -471,14 +471,15 @@ mod tests {
         Ok(())
     }
 
-    /// The bare-spec check the agent uses accepts the T3 shape and refuses what the manifest check refuses.
+    /// The bare-spec check the agent uses accepts the example service shape and refuses what the manifest check
+    /// refuses.
     #[test]
     fn validate_service_spec_checks_a_spec_without_a_manifest() {
-        assert_eq!(validate_service_spec(&t3_service()), Ok(()));
-        let mut zero_interval = t3_service();
+        assert_eq!(validate_service_spec(&example_service()), Ok(()));
+        let mut zero_interval = example_service();
         zero_interval.probe.interval_secs = 0;
         assert!(validate_service_spec(&zero_interval).is_err());
-        let mut root = t3_service();
+        let mut root = example_service();
         root.user = "root".to_owned();
         assert!(validate_service_spec(&root).is_err());
     }
@@ -496,10 +497,10 @@ mod tests {
         Ok(())
     }
 
-    /// The T3 shape decodes, and an omitted restart policy and probe timing take their defaults.
+    /// The example service shape decodes, and an omitted restart policy and probe timing take their defaults.
     #[test]
     fn a_minimal_service_takes_the_defaults() -> Result<(), serde_json::Error> {
-        let json = r#"{"flake":".","kind":null,"attr":null,"command":["t3","serve"],
+        let json = r#"{"flake":".","kind":null,"attr":null,"command":["service","serve"],
             "service":{"user":"dev","probe":{"check":{"type":"tcp","port":3773}}}}"#;
         let service = decode_flake_manifest(json.as_bytes())?
             .service

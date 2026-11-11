@@ -81,7 +81,7 @@ fn wait_for(what: &str, mut ok: impl FnMut() -> bool) -> Result<()> {
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
         environment_id: "env-a".to_owned(),
-        template: "t3".to_owned(),
+        template: "service".to_owned(),
         size: None,
         env: vec![],
         service_port: None,

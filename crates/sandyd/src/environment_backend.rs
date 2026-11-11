@@ -27,7 +27,7 @@
 //! | `SANDY_ENV_VM_SERVICE_PORT` | the guest loopback port the service listens on |
 //! | `SANDY_ENV_VM_SERVICE_USER` | the guest account the service runs as; default `t3`, never root |
 //! | `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` | sizes the hypervisor's connect budgets (not a deadline); default 600 |
-//! | `SANDY_ENV_VM_HOST_CHECK` | how the host decides the service is Ready: `http` (default: `GET /` answers below 500, as t3 does) or `connect` (the service port accepted a connection through the bridge, for a service that does not speak HTTP); any other value is refused |
+//! | `SANDY_ENV_VM_HOST_CHECK` | how the host decides the service is Ready: `http` (default: `GET /` answers below 500, as a typical service does) or `connect` (the service port accepted a connection through the bridge, for a service that does not speak HTTP); any other value is refused |
 
 use std::{path::PathBuf, time::Duration};
 
@@ -413,7 +413,7 @@ mod tests {
         vec![
             ("SANDY_ENV_BACKEND", "vm-qemu"),
             ("SANDY_ENV_VM_TEMPLATE", "/srv/guest#topologies.x86_64-linux.qemu-t3"),
-            ("SANDY_ENV_VM_COMMAND", "t3 serve --port {port}"),
+            ("SANDY_ENV_VM_COMMAND", "service serve --port {port}"),
             ("SANDY_ENV_VM_SERVICE_PORT", "3773"),
         ]
     }
@@ -430,7 +430,7 @@ mod tests {
             ("SANDY_ENV_BACKEND", "process-insecure"),
             (
                 "SANDY_ENV_PROCESS_COMMAND",
-                "t3 serve --port {port} --base-dir {base_dir}",
+                "service serve --port {port} --base-dir {base_dir}",
             ),
         ]
     }
@@ -485,7 +485,7 @@ mod tests {
         }
         let no_port = parse(&[
             ("SANDY_ENV_BACKEND", "process-insecure"),
-            ("SANDY_ENV_PROCESS_COMMAND", "t3 serve --base-dir {base_dir}"),
+            ("SANDY_ENV_PROCESS_COMMAND", "service serve --base-dir {base_dir}"),
         ]);
         assert_eq!(
             no_port.err(),
@@ -499,12 +499,12 @@ mod tests {
         pairs.extend([
             (
                 "SANDY_ENV_PROCESS_COMMAND",
-                "  t3   serve --port {port}  --base-dir {base_dir} ",
+                "  service   serve --port {port}  --base-dir {base_dir} ",
             ),
-            ("SANDY_ENV_PAIR_COMMAND", "t3 pair  --base-dir {base_dir}"),
+            ("SANDY_ENV_PAIR_COMMAND", "service pair  --base-dir {base_dir}"),
             ("SANDY_ENV_STATE_DIR", "/var/lib/sandy/envs"),
             ("SANDY_ENV_PASS_ENV", "ANTHROPIC_API_KEY, OPENAI_API_KEY ,"),
-            ("SANDY_ENV_PATH", "/opt/t3/bin:/usr/bin"),
+            ("SANDY_ENV_PATH", "/opt/service/bin:/usr/bin"),
             ("SANDY_ENV_PROVISION_TIMEOUT_SECS", "300"),
             ("SANDY_ENV_IDLE_TIMEOUT_SECS", "900"),
         ]);
@@ -512,15 +512,15 @@ mod tests {
         let cfg = parse(&pairs)?.ok_or_else(|| anyhow::anyhow!("expected a backend"))?;
         assert_eq!(
             process_of(&cfg).command,
-            ["t3", "serve", "--port", "{port}", "--base-dir", "{base_dir}"]
+            ["service", "serve", "--port", "{port}", "--base-dir", "{base_dir}"]
         );
         assert_eq!(
             process_of(&cfg).pair_command.as_deref(),
-            Some(&["t3", "pair", "--base-dir", "{base_dir}"].map(String::from)[..])
+            Some(&["service", "pair", "--base-dir", "{base_dir}"].map(String::from)[..])
         );
         assert_eq!(process_of(&cfg).state_dir, PathBuf::from("/var/lib/sandy/envs"));
         assert_eq!(process_of(&cfg).pass_env, ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
-        assert_eq!(process_of(&cfg).path, "/opt/t3/bin:/usr/bin");
+        assert_eq!(process_of(&cfg).path, "/opt/service/bin:/usr/bin");
         assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(300));
         assert_eq!(cfg.driver.idle_timeout, Some(Duration::from_secs(900)));
         Ok(())
@@ -689,7 +689,7 @@ mod tests {
         let BackendSettings::VmVfkit(vm) = &cfg.backend else {
             anyhow::bail!("expected the vfkit backend, got {:?}", cfg.backend);
         };
-        assert_eq!(vm.command, ["t3", "serve", "--port", "3773"]);
+        assert_eq!(vm.command, ["service", "serve", "--port", "3773"]);
         assert_eq!(cfg.driver.service_port, Some(3773));
         // Same defaults as vm-qemu: the boot budget plus 300 s.
         assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(900));
@@ -735,7 +735,7 @@ mod tests {
             Err(E::Missing("SANDY_ENV_VM_TEMPLATE"))
         ));
         let mut no_port = vm_base();
-        no_port.push(("SANDY_ENV_VM_COMMAND", "t3 serve"));
+        no_port.push(("SANDY_ENV_VM_COMMAND", "service serve"));
         assert_eq!(
             parse_on("linux", &no_port).err(),
             Some(E::MissingPort("SANDY_ENV_VM_COMMAND"))
@@ -773,7 +773,7 @@ mod tests {
         Ok(vm.host_check)
     }
 
-    /// The default keeps t3's semantics (503 while starting, 401 with auth, below 500 is Ready) (#732).
+    /// The default keeps a typical service's semantics (503 while starting, 401 with auth, below 500 is Ready) (#732).
     #[test]
     fn the_vm_host_check_defaults_to_http_when_unset_or_blank() -> anyhow::Result<()> {
         use sandy_environment::HostCheck;
@@ -840,7 +840,7 @@ mod tests {
         let BackendSettings::VmQemu(vm) = &cfg.backend else {
             anyhow::bail!("expected the vm backend");
         };
-        assert_eq!(vm.command, ["t3", "serve", "--port", "3773"]);
+        assert_eq!(vm.command, ["service", "serve", "--port", "3773"]);
         assert_eq!(vm.boot_timeout_secs, 900);
         assert_eq!(cfg.driver.template, "/srv/guest#topologies.x86_64-linux.qemu-t3");
         assert_eq!(cfg.driver.service_port, Some(3773));

@@ -823,7 +823,7 @@ mod tests {
 
     fn vm_settings() -> crate::environment_backend::VmSettings {
         crate::environment_backend::VmSettings {
-            command: vec!["t3".to_owned()],
+            command: vec!["service".to_owned()],
             service_env: "{}".to_owned(),
             boot_timeout_secs: 5,
             host_check: sandy_environment::HostCheck::default(),

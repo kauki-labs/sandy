@@ -903,7 +903,7 @@ fn scenario(stack: &Stack) -> Result<()> {
     script["fixtures"]["ready_timeout_ms"] = json!((PROVISION_SECS + 60) * 1000);
     script["fixtures"]["ready_poll_ms"] = json!(250);
     // The live stack has only the vm environment backend and no job host, so a job submit is refused by design.
-    // `link_environment` is T3-specific and answers `unsupported` on a real broker until open point 1 of #585 is
+    // `link_environment` is service-specific and answers `unsupported` on a real broker until open point 1 of #585 is
     // decided (AT-8 and AT-17 are the blocked rows below). All of them stay covered at tier-2 against the fake.
     script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel", "link_environment"]);
     let mut mcp = stack.mcp()?;
@@ -950,8 +950,8 @@ fn a_profile_secret_canary_is_absent_everywhere_but_the_guest_secret_path() {
 }
 
 #[test]
-#[ignore = "owner decision on #585: sandy core has no T3 internals, so AT-7 (delegate_task round trip) has no live row \
-            here"]
+#[ignore = "owner decision on #585: sandy core has no service-specific internals, so AT-7 (delegate_task round trip) \
+            has no live row here"]
 fn a_stand_in_primary_runs_a_delegate_task_in_the_guest() {
     unimplemented!("AT-7 is blocked, see the ignore reason");
 }
@@ -964,8 +964,8 @@ fn the_parent_task_ends_failed_within_60_seconds_of_a_delete() {
 }
 
 #[test]
-#[ignore = "owner decision on #585 and open point 1: pairing and link are T3-specific, so AT-17 (pairing code absent) \
-            is blocked"]
+#[ignore = "owner decision on #585 and open point 1: pairing and link are service-specific, so AT-17 (pairing code \
+            absent) is blocked"]
 fn a_pairing_code_is_absent_from_every_result_and_log() {
     unimplemented!("AT-17 is blocked, see the ignore reason");
 }

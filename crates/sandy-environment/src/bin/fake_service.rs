@@ -1,14 +1,14 @@
-//! A stand-in for `t3 serve` and `t3 pair`, used by the tests.
+//! A stand-in for `service serve` and `service pair`, used by the tests.
 //!
-//! `fake-t3 serve --port P --base-dir D [--ready-after-ms N] [--exit-after-ms N]
+//! `fake-service serve --port P --base-dir D [--ready-after-ms N] [--exit-after-ms N]
 //! [--child-beat-file F] [--split-status] [--dump-env] [--port-file F] [--no-bind]` answers `503` until N ms after
 //! start and `200` after, optionally exits on its own, optionally starts a child that beats into
 //! the file F (outside the environment directory, so a test can tell a live child
 //! from a removed directory), optionally writes its environment to `D/env.txt`, optionally writes its port to F,
 //! and with `--no-bind` never listens (it just stays up), so a test can take the port itself.
-//! `fake-t3 pair --base-dir D [--fail]` prints a pairing code (or fails).
-//! `fake-t3 pair-hang [--beat-file F]` starts a beating child and then hangs.
-//! `fake-t3 beat --file F` rewrites F with a counter every 20 ms.
+//! `fake-service pair --base-dir D [--fail]` prints a pairing code (or fails).
+//! `fake-service pair-hang [--beat-file F]` starts a beating child and then hangs.
+//! `fake-service beat --file F` rewrites F with a counter every 20 ms.
 
 use std::{
     io::{Read, Write},
@@ -110,7 +110,7 @@ fn serve(args: &[String]) -> ExitCode {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let n = stream.read(&mut buf).unwrap_or(0);
                 // A client that sends `HOLD` keeps its connection open until it closes it, like a
-                // paired T3 client.
+                // paired client.
                 if buf[..n].starts_with(b"HOLD") {
                     std::thread::spawn(move || {
                         let _ = stream.set_read_timeout(None);

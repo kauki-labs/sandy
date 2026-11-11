@@ -1,5 +1,5 @@
 //! Acceptance tests for the process-backed environment backend, over real
-//! processes (`fake-t3`, a stand-in for `t3 serve` and `t3 pair`).
+//! processes (`fake-service`, a stand-in for `service serve` and `service pair`).
 
 use std::{
     io::Write,
@@ -15,7 +15,7 @@ use sandy_api::{
 };
 use sandy_environment::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 
-const FAKE: &str = env!("CARGO_BIN_EXE_fake-t3");
+const FAKE: &str = env!("CARGO_BIN_EXE_fake-service");
 
 /// A temp dir the backend accepts as a state dir: `tempfile` makes 0755 ones here.
 fn private_tempdir() -> Result<tempfile::TempDir> {

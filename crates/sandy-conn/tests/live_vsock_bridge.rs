@@ -4,9 +4,9 @@
 //! fails, rather than skips, when it is not pointed at a guest.
 //!
 //! The guest runs `sandy-agent port-relay --vsock-port 5100 --to 127.0.0.1:3773` and a service on that port (for
-//! example `t3 serve`). This test starts a [`Bridge`] over a [`VsockDialer`] to that guest's CID, makes an HTTP request
-//! through the bridge's loopback address, and checks the guest service answered. The dial window is long enough for
-//! the guest to boot, so it also exercises the readiness retry (the relay is not bound, then the service is not up,
+//! example `t3 serve`). This test starts a [`Bridge`] over a [`VsockDialer`] to that guest's CID, makes an HTTP
+//! request through the bridge's loopback address, and checks the guest service answered. The dial window is long enough
+//! for the guest to boot, so it also exercises the readiness retry (the relay is not bound, then the service is not up,
 //! until it is).
 //!
 //! On macOS the vfkit leg (KSB4) runs the same check over a [`UnixDialer`] to the host socket of vfkit's `connect`
@@ -63,8 +63,9 @@ async fn get(addr: std::net::SocketAddr) -> anyhow::Result<u16> {
 
 /// A client on the bridge's loopback address reaches the guest's service through the vsock relay.
 ///
-/// The bridge reaches the relay as soon as the relay is up, which can be before the service is ready: t3 answers 503
-/// while it starts. So, as the environment probe will, poll through the bridge until the status is below 500.
+/// The bridge reaches the relay as soon as the relay is up, which can be before the service is ready: a service may
+/// answer 503 while it starts. So, as the environment probe will, poll through the bridge until the status is below
+/// 500.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn http_reaches_a_guest_service_through_the_vsock_bridge() -> anyhow::Result<()> {
