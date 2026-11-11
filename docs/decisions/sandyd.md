@@ -1755,7 +1755,7 @@ operator deploying the host-executor.
 
 ## 22. Remote input/output streaming (#482): a per-job dial-back data link, reopening #459's "control connection" wording
 
-**Status:** proposed.
+**Status:** accepted (ratified by the owner, 2026-11-11).
 
 **Context.** #459's spec (`docs/design/manifest-parity/spec.md`) originally
 decided remote `inputs`/`outputs` "stream over the control connection,"
@@ -1939,7 +1939,7 @@ of-line blocking against `Dispatch`/`Cancel`/`AttachStateChanged` for every
 other job sharing that host-executor's one connection was judged worse
 than the added complexity of a second dial-back link.
 
-**Implementation, slice 1 (this decision is still proposed).** The wire
+**Implementation, slice 1.** The wire
 only: `Capabilities.transfer`, the `DataLinkMessage` set with its
 `MAX_CHUNK_BYTES` (256 KiB) cap, and a `Debug` for the two chunk messages
 that prints a length and never file content. The orchestrator ignores
