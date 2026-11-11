@@ -59,7 +59,8 @@ pub const MAX_TRANSFER_REASON_BYTES: usize = 4096;
 /// the send.
 pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// The most files one transfer may carry, in either direction.
+/// The most entries one transfer may carry, in either direction: files plus the directories the receiver creates for
+/// their names. A sender counts the same way, or Submit passes a tree the receiver refuses.
 pub const MAX_TRANSFER_ENTRIES: usize = 100_000;
 
 impl DataLinkMessage {
