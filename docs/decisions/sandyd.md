@@ -2043,8 +2043,9 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   output, from that output's own staged tree. The wire name is `<name>/<rel>` for a named output, the bare `<name>` for
   a file the guest wrote in place of the directory, and `<rel>` for a catch-all.
 - An output with nothing staged sends nothing and is not an error, as local collection collects nothing for it.
-  Empty directories and symlinks are not carried; a symlink inside a staged tree is refused (`Symlink`), never
-  followed, and a socket, fifo or device is `UnsupportedEntry`.
+  Empty directories are not carried. A symlink, a socket, a fifo or a device inside a staged tree, a name that is not
+  UTF-8, and a staged root that is a symlink or a special file are skipped with a warning, never opened and so never
+  followed, and every other file still arrives, as local collection skips them.
 - Every frame passes `DataLinkMessage::validate` before it is sent, so a name the receiver would refuse is refused at
   the source. Chunks are at most `MAX_CHUNK_BYTES`, in order, never empty after data. Entries count files plus the
   distinct directories below a root, as the receiver counts them. A failure other than a dead link sends a

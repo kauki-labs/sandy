@@ -2,8 +2,9 @@
 //! host-local staging directories and write them to the data link as `OutputChunk`s, then `OutputEnd`.
 //!
 //! The reads go through `sandy_fsutil::beneath`, as the input sender in sandyd does: each directory is opened once
-//! with `O_NOFOLLOW` and everything below it is read through that handle, so a link planted in a staged tree is
-//! refused, never followed. Disk I/O runs on a blocking thread behind a bounded channel.
+//! with `O_NOFOLLOW` and everything below it is read through that handle. A symlink in a staged tree is skipped
+//! (with a warning) and never opened, so never followed, as local collection skips it. Disk I/O runs on a blocking
+//! thread behind a bounded channel.
 //!
 //! One [`OutputSource`] per declared output, in `Dispatch.outputs` order; its position is `output_index` on the wire.
 //! A file several outputs cover is sent once per output, each from that output's own staged tree, as local
@@ -86,12 +87,6 @@ pub enum SendError {
     /// A staged file read failed.
     #[error("reading a staged output file: {0}")]
     Read(#[source] std::io::Error),
-    /// An entry inside a staged tree is a symlink: refused, never followed, and it has no wire form.
-    #[error("a staged output holds a symlink")]
-    Symlink,
-    /// An entry in a staged tree is a socket, a fifo or a device: it has no wire form.
-    #[error("a staged output holds an entry that is not a file or a directory")]
-    UnsupportedEntry,
     /// A frame breaks a rule the receiver would refuse it for (a name too long, or not a plain relative path).
     #[error("a frame breaks a wire rule: {0}")]
     Violation(#[from] DataLinkViolation),
@@ -113,8 +108,6 @@ impl SendError {
         match self {
             Self::Link(_) | Self::WriteTimedOut | Self::Stopped => "the sender's link failed",
             Self::Source(_) | Self::Read(_) => "an output could not be read",
-            Self::Symlink => "an output holds a symlink",
-            Self::UnsupportedEntry => "an output holds an entry that is not a file or a directory",
             Self::Violation(_) => "an output name breaks a wire rule",
             Self::TooManyBytes => "the transfer is past its byte cap",
             Self::TooManyEntries => "the transfer is past its entry cap",
@@ -209,12 +202,23 @@ fn read_outputs(
             // The guest replaced the named output directory with a file: the bare declared name.
             Ok(file) => match &output.name {
                 Some(name) => walk.file(name, "", file)?,
-                None => return Err(SendError::UnsupportedEntry),
+                // A catch-all root is always a directory; a file there has no wire name.
+                None => tracing::warn!(
+                    index = walk.index,
+                    "skipping a catch-all output whose staged root is a file"
+                ),
             },
             Err(_) => match Beneath::open_dir(&output.root) {
                 Ok(dir) => walk.tree(output.name.as_deref(), "", &dir)?,
                 // Declared and never written: local collection collects nothing for it.
                 Err(FsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+                // A symlink or a special file where the output should be: local collection skips it.
+                Err(FsError::Unsafe { .. }) => {
+                    tracing::warn!(
+                        index = walk.index,
+                        "skipping a staged output root that is a symlink or a special file"
+                    );
+                }
                 Err(e) => return Err(e.into()),
             },
         }
@@ -223,13 +227,18 @@ fn read_outputs(
 }
 
 impl Walk<'_> {
-    /// Send every file below `dir`. An empty subdirectory has no wire form and is skipped, as local collection
-    /// creates it but a file-only transfer cannot say so (#756). `wire` is the declared name prefix (none for a
-    /// catch-all) and `rel` the path below the root, which is what the receiver counts directories by.
+    /// Send every file below `dir`. An empty subdirectory has no wire form and is skipped, as are a symlink, a
+    /// special file and a name that is not UTF-8 (#756); local collection delivers the rest the same way. `wire` is the
+    /// declared name prefix (none for a catch-all) and `rel` the path below the root, which is what the receiver counts
+    /// directories by.
     fn tree(&mut self, wire: Option<&str>, rel: &str, dir: &Beneath) -> Result<(), SendError> {
         for entry in dir.entries()? {
             let (name, kind) = entry?;
-            let name = name.to_str().ok_or(SendError::UnsupportedEntry)?;
+            // A name that is not UTF-8 has no wire form: skipped, like the entries below.
+            let Some(name) = name.to_str() else {
+                tracing::warn!(index = self.index, "skipping a staged entry whose name is not UTF-8");
+                continue;
+            };
             let rel_path = if rel.is_empty() {
                 name.to_owned()
             } else {
@@ -242,8 +251,13 @@ impl Walk<'_> {
                     let sub = dir.open_subdir(OsStr::new(name))?;
                     self.tree(wire, &rel_path, &sub)?;
                 }
-                EntryKind::Symlink => return Err(SendError::Symlink),
-                EntryKind::Other => return Err(SendError::UnsupportedEntry),
+                // Never opened, so never followed. Local collection skips both and delivers the rest.
+                EntryKind::Symlink | EntryKind::Other => {
+                    tracing::warn!(
+                        index = self.index,
+                        "skipping a symlink or special file in a staged output"
+                    );
+                }
             }
         }
         Ok(())
@@ -268,7 +282,11 @@ impl Walk<'_> {
         let mut buf = vec![0u8; MAX_CHUNK_BYTES];
         let mut first = true;
         loop {
-            let n = file.read(&mut buf).map_err(SendError::Read)?;
+            let n = match file.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(SendError::Read(e)),
+            };
             if n == 0 && !first {
                 break;
             }
