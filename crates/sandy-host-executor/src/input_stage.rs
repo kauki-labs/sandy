@@ -129,19 +129,20 @@ where
         .map_err(StageError::Root)?;
     let names: Vec<String> = inputs.iter().map(|input| input.name.clone()).collect();
 
-    // `root` drops, and removes the directory, on every early return below.
-    tokio::select! {
+    // A pull error drops `root`, and removes the directory, on the way out.
+    let stopped = tokio::select! {
         biased;
         pulled = pull_inputs(&mut link, &names, root.path(), limits) => {
             pulled?;
+            None
         }
-        ended = control_ended(control) => return Err(ended),
-        () = tokio::time::sleep(total_cap) => return Err(StageError::TotalCapExceeded),
-    }
-
+        ended = control_ended(control) => Some(ended),
+        () = tokio::time::sleep(total_cap) => Some(StageError::TotalCapExceeded),
+    };
     // The pull can win the race in the same instant a cancel or the deadline lands: look once more before the run.
-    if let Some(ended) = control_ended_now(control) {
-        return Err(ended);
+    if let Some(stopped) = stopped.or_else(|| control_ended_now(control)) {
+        discard_root(root).await;
+        return Err(stopped);
     }
 
     let inputs = inputs
@@ -157,6 +158,22 @@ where
         _root: root,
         _link: Box::new(link),
     })
+}
+
+/// Remove the staging root after a stopped pull. The pull future is dropped mid-await, but a `tokio::fs` call it
+/// started keeps running on a blocking thread and can create a file after the first removal, so remove until the
+/// root is gone.
+async fn discard_root(root: tempfile::TempDir) {
+    let path = root.path().to_owned();
+    drop(root);
+    for _ in 0..50 {
+        if !path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = tokio::fs::remove_dir_all(&path).await;
+    }
+    tracing::warn!(path = %path.display(), "could not remove the input staging root after a stopped pull");
 }
 
 /// Why `control` has ended the run, if it has: cancelled, or past a live deadline. A suspended deadline never ends it.
