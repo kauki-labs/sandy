@@ -11,7 +11,12 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use sandy_executor_proto::{DataLinkViolation, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES};
+use sandy_control_proto::{read_frame, write_frame};
+use sandy_executor_proto::{
+    DataLinkMessage, DataLinkViolation, InputChunk, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, TransferError,
+    data_link_message::Op,
+};
+use tokio::io::AsyncWriteExt;
 
 /// The caps one pull enforces. The default is the §22 pair; a test lowers them.
 #[derive(Debug, Clone, Copy)]
@@ -92,12 +97,175 @@ pub enum PullError {
 /// # Errors
 /// See [`PullError`].
 pub async fn pull_inputs(
-    _link: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
-    _declared: &[String],
-    _root: &Path,
-    _limits: PullLimits,
+    link: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    declared: &[String],
+    root: &Path,
+    limits: PullLimits,
 ) -> Result<PulledInputs, PullError> {
-    Err(PullError::Truncated)
+    let error = match pull(link, declared, root, limits).await {
+        Ok(pulled) => return Ok(pulled),
+        Err(error) => error,
+    };
+    // Tell the peer why, unless the failure is the peer's own report or a dead link. The reason is the error's fixed
+    // text: it never carries a peer-chosen name.
+    if !matches!(
+        error,
+        PullError::PeerError { .. } | PullError::Truncated | PullError::Frame(_)
+    ) {
+        let reason = DataLinkMessage {
+            op: Some(Op::TransferError(TransferError {
+                reason: error.to_string(),
+            })),
+        };
+        let _ = tokio::time::timeout(REPORT_TIMEOUT, write_frame(link, &reason)).await;
+    }
+    Err(error)
+}
+
+/// How long the receiver waits to hand the peer a `TransferError` before it gives up and returns its own error.
+const REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn pull(
+    link: &mut (impl tokio::io::AsyncRead + Unpin),
+    declared: &[String],
+    root: &Path,
+    limits: PullLimits,
+) -> Result<PulledInputs, PullError> {
+    let mut pull = Pull {
+        root,
+        declared,
+        limits,
+        files: 0,
+        bytes: 0,
+        names: BTreeSet::new(),
+        current: None,
+    };
+    loop {
+        let message: DataLinkMessage = read_frame(link).await?.ok_or(PullError::Truncated)?;
+        message.validate()?;
+        match message.op {
+            Some(Op::InputChunk(chunk)) => pull.chunk(chunk).await?,
+            Some(Op::InputEnd(_)) => {
+                pull.finish_file().await?;
+                return Ok(PulledInputs {
+                    files: pull.files,
+                    bytes: pull.bytes,
+                    names: pull.names,
+                });
+            }
+            Some(Op::TransferError(error)) => {
+                return Err(PullError::PeerError {
+                    reason: escape(&error.reason),
+                });
+            }
+            _ => return Err(PullError::Unexpected),
+        }
+    }
+}
+
+/// The file being written: chunks of one file arrive in order, so one handle is open at a time.
+struct OpenFile {
+    name: String,
+    file: tokio::fs::File,
+    written: u64,
+}
+
+struct Pull<'a> {
+    root: &'a Path,
+    declared: &'a [String],
+    limits: PullLimits,
+    files: usize,
+    bytes: u64,
+    names: BTreeSet<String>,
+    current: Option<OpenFile>,
+}
+
+impl Pull<'_> {
+    async fn chunk(&mut self, chunk: InputChunk) -> Result<(), PullError> {
+        let first = chunk.name.split('/').next().unwrap_or_default();
+        if !self.declared.iter().any(|name| name == first) {
+            return Err(PullError::Undeclared);
+        }
+        let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > self.limits.max_bytes {
+            return Err(PullError::TooManyBytes);
+        }
+        if self.current.as_ref().is_none_or(|open| open.name != chunk.name) {
+            self.finish_file().await?;
+            if chunk.offset != 0 {
+                return Err(PullError::OffsetMismatch);
+            }
+            if self.files >= self.limits.max_entries {
+                return Err(PullError::TooManyEntries);
+            }
+            let file = self.create(&chunk.name).await?;
+            self.files += 1;
+            self.names.insert(first.to_owned());
+            self.current = Some(OpenFile {
+                name: chunk.name.clone(),
+                file,
+                written: 0,
+            });
+        }
+        let open = self.current.as_mut().ok_or(PullError::Unexpected)?;
+        if chunk.offset != open.written {
+            return Err(PullError::OffsetMismatch);
+        }
+        open.file.write_all(&chunk.bytes).await.map_err(PullError::Write)?;
+        open.written += len;
+        Ok(())
+    }
+
+    async fn finish_file(&mut self) -> Result<(), PullError> {
+        if let Some(mut open) = self.current.take() {
+            open.file.flush().await.map_err(PullError::Write)?;
+        }
+        Ok(())
+    }
+
+    /// Create the file for `name` under the root. The root is private and only this function writes it, so a
+    /// directory component that exists is checked to be a real directory (a symlink or a file is refused), and the
+    /// file itself is `create_new`, which fails on any existing entry and never follows a symlink.
+    async fn create(&self, name: &str) -> Result<tokio::fs::File, PullError> {
+        let mut path = self.root.to_path_buf();
+        let mut parts = name.split('/').peekable();
+        while let Some(part) = parts.next() {
+            path.push(part);
+            if parts.peek().is_some() {
+                ensure_dir(&path).await?;
+            }
+        }
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => PullError::Clash,
+                _ => PullError::Write(e),
+            })
+    }
+}
+
+async fn ensure_dir(path: &Path) -> Result<(), PullError> {
+    match tokio::fs::create_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = tokio::fs::symlink_metadata(path).await.map_err(PullError::Write)?;
+            if metadata.is_dir() {
+                Ok(())
+            } else {
+                Err(PullError::Clash)
+            }
+        }
+        Err(e) => Err(PullError::Write(e)),
+    }
+}
+
+/// A peer-chosen reason, with control characters (and anything non-ASCII) escaped, before it is logged or shown.
+fn escape(reason: &str) -> String {
+    reason.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(test)]
