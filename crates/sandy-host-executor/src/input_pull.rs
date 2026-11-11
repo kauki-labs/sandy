@@ -9,7 +9,10 @@
 //! What this does NOT do: dial the link, create the staging root, build the `Input` list for `stage_inputs`, or
 //! remove the root on teardown. The caller (`handle_dispatch`, a later slice) owns all four.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
@@ -72,6 +75,10 @@ pub enum PullError {
     /// A message that is not an input message arrived.
     #[error("an unexpected message arrived during the input pull")]
     Unexpected,
+    /// An empty chunk arrived for the file already open: it writes nothing and moves no counter, so an endless stream
+    /// of them would keep the pull busy without reaching any cap.
+    #[error("an empty chunk arrived for a file that is already open")]
+    NoProgress,
     /// A chunk's first name component is no declared `Input.name`.
     #[error("a chunk names an input that was not declared")]
     Undeclared,
@@ -135,9 +142,11 @@ async fn pull(
     root: &Path,
     limits: PullLimits,
 ) -> Result<PulledInputs, PullError> {
+    // A set, not the slice: every chunk checks its name, and the declared list can be long.
+    let declared_set: HashSet<&str> = declared.iter().map(String::as_str).collect();
     let mut pull = Pull {
         root,
-        declared,
+        declared: &declared_set,
         limits,
         files: 0,
         bytes: 0,
@@ -179,7 +188,7 @@ struct OpenFile {
 
 struct Pull<'a> {
     root: &'a Path,
-    declared: &'a [String],
+    declared: &'a HashSet<&'a str>,
     limits: PullLimits,
     files: usize,
     bytes: u64,
@@ -190,8 +199,13 @@ struct Pull<'a> {
 impl Pull<'_> {
     async fn chunk(&mut self, chunk: InputChunk) -> Result<(), PullError> {
         let first = chunk.name.split('/').next().unwrap_or_default();
-        if !self.declared.iter().any(|name| name == first) {
+        if !self.declared.contains(first) {
             return Err(PullError::Undeclared);
+        }
+        // An empty chunk is a zero-byte file's one chunk, which opens the file. For the file already open it moves
+        // no counter, so nothing would ever stop a stream of them.
+        if chunk.bytes.is_empty() && self.current.as_ref().is_some_and(|open| open.name == chunk.name) {
+            return Err(PullError::NoProgress);
         }
         let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
         self.bytes = self.bytes.saturating_add(len);
@@ -565,6 +579,34 @@ mod tests {
         let pulled = pulled.context("the pull")?;
         assert_eq!((pulled.files, pulled.bytes), (1, 0));
         assert_eq!(read(root.path().join("empty"))?, b"");
+        Ok(())
+    }
+
+    /// An empty chunk is the zero-byte file's one chunk. A second one for the open file, at any offset, is refused:
+    /// it makes no progress and no cap would ever stop a stream of them.
+    #[tokio::test]
+    async fn repeated_empty_chunks_for_one_file_are_refused() -> anyhow::Result<()> {
+        for messages in [
+            vec![chunk("a", 0, b""), chunk("a", 0, b""), end()],
+            vec![chunk("a", 0, b"xy"), chunk("a", 2, b""), end()],
+        ] {
+            let root = tempfile::tempdir().context("root")?;
+            let (pulled, _peer) = run(&messages, false, &["a"], PullLimits::default(), root.path()).await?;
+            assert!(matches!(pulled, Err(PullError::NoProgress)), "got {pulled:?}");
+        }
+        Ok(())
+    }
+
+    /// Many declared inputs do not change what a pull accepts (the declared-name check is a set lookup).
+    #[tokio::test]
+    async fn a_large_declared_set_still_stages_every_input() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let names: Vec<String> = (0..2000).map(|i| format!("in{i}")).collect();
+        let mut messages: Vec<DataLinkMessage> = names.iter().map(|n| chunk(n, 0, b"x")).collect();
+        messages.push(end());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (pulled, _peer) = run(&messages, false, &refs, PullLimits::default(), root.path()).await?;
+        assert_eq!(pulled.context("the pull")?.files, 2000);
         Ok(())
     }
 
