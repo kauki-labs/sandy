@@ -636,6 +636,25 @@ mod tests {
         Ok(())
     }
 
+    /// A name the peer chose reaches the error when the OS refuses it (a directory component past `NAME_MAX`), and
+    /// an error is logged: it must not print the peer's newline or control characters raw.
+    #[tokio::test]
+    async fn a_write_error_does_not_print_the_peers_name_raw() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let name = format!("{}\nINJECTED\u{1b}[31m/f", "d".repeat(300));
+        let (received, _peer) = run(&[chunk(0, &name, b"x"), end()], &outputs, quick(), false).await?;
+        let Err(error @ ReceiveError::Write(_)) = received else {
+            anyhow::bail!("expected a write error, got {received:?}");
+        };
+        let shown = error.to_string();
+        assert!(
+            !shown.chars().any(char::is_control),
+            "a control character reached the error text: {shown:?}"
+        );
+        Ok(())
+    }
+
     /// An input message on the output transfer is refused.
     #[tokio::test]
     async fn an_input_message_is_unexpected() -> anyhow::Result<()> {
