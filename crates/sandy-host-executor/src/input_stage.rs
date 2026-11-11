@@ -71,6 +71,7 @@ pub async fn dial_data_link(
     job_id: &str,
     data_token: &[u8; REMOTE_LINK_TOKEN_LEN],
     mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
+    _control: &RunControl,
 ) -> Result<Box<dyn sandy_conn::Conn>, StageError> {
     // The prefix is the claim: the orchestrator's accept loop tells the data link from the agent link by the token.
     // Neither an error nor a log line below carries it.
@@ -124,6 +125,7 @@ where
 
     // `root` drops, and removes the directory, on every early return below.
     tokio::select! {
+        biased;
         pulled = pull_inputs(&mut link, &names, root.path(), limits) => {
             pulled?;
         }
@@ -436,7 +438,7 @@ mod tests {
             anyhow::Ok((buf, expected))
         });
 
-        let _link = dial_data_link(addr, "job-1", &data_token, &mesh_tls)
+        let _link = dial_data_link(addr, "job-1", &data_token, &mesh_tls, &live())
             .await
             .context("the dial")?;
         let (got, expected) = tokio::time::timeout(Duration::from_secs(5), accepting)
@@ -444,6 +446,53 @@ mod tests {
             .context("the orchestrator side hung")?
             .context("the accept task")??;
         assert_eq!(got, expected, "the prefix must carry the job id and the data token");
+        Ok(())
+    }
+
+    /// A job already cancelled (or past its deadline) does not dial: a closed route would otherwise hold the
+    /// sequential dispatch loop for the whole dial timeout before it reports the cancel.
+    #[tokio::test]
+    async fn a_cancelled_control_stops_the_dial() -> anyhow::Result<()> {
+        use std::sync::Arc;
+
+        let mesh_tls = sandy_fabric_local::mesh_link::MeshTlsIdentity {
+            identity: Arc::new(sandy_conn::TlsIdentity::generate().context("identity")?),
+            orchestrator_fingerprint: sandy_conn::TlsIdentity::generate().context("identity")?.fingerprint(),
+        };
+        // A documentation-range address nothing answers: the dial would wait, or fail, but never connect.
+        let blackhole: SocketAddr = "192.0.2.1:9".parse().context("addr")?;
+        let token = [1u8; REMOTE_LINK_TOKEN_LEN];
+
+        let cancelled = live();
+        cancelled.cancel();
+        let started = std::time::Instant::now();
+        let result = dial_data_link(blackhole, "job-1", &token, &mesh_tls, &cancelled).await;
+        assert!(matches!(result, Err(StageError::Cancelled)), "got {:?}", result.err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a cancelled job must not wait on the dial"
+        );
+
+        let late = RunControl::new(std::time::Instant::now());
+        let result = dial_data_link(blackhole, "job-1", &token, &mesh_tls, &late).await;
+        assert!(
+            matches!(result, Err(StageError::DeadlinePassed)),
+            "got {:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// A cancel that lands as the pull finishes is not lost: the pull wins the race, then the control is
+    /// checked again. Zero inputs make the pull complete without a pending await, so the order is deterministic.
+    #[tokio::test]
+    async fn a_cancel_that_lands_as_the_pull_finishes_is_not_lost() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let control = live();
+        control.cancel();
+        let (staged, _peer) = stage(&[end()], &[], parent.path(), &control, CAP).await?;
+        assert!(matches!(staged, Err(StageError::Cancelled)), "got {:?}", staged.err());
+        assert_eq!(entries(parent.path())?, 0);
         Ok(())
     }
 

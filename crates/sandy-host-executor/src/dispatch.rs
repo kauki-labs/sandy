@@ -528,7 +528,7 @@ fn stage_data_link_inputs(
         return Ok(None);
     };
     let staged = rt.block_on(async {
-        let link = dial_data_link(forward_back, &dispatch.job_id, token, mesh_tls).await?;
+        let link = dial_data_link(forward_back, &dispatch.job_id, token, mesh_tls, control).await?;
         stage_remote_inputs(
             link,
             &dispatch.inputs,
