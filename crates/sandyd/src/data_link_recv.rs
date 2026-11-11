@@ -65,7 +65,8 @@ pub struct Received {
     pub bytes: u64,
 }
 
-/// Why a receive failed. No variant carries a peer-chosen name or byte, and the peer is told a fixed text.
+/// Why a receive failed. No variant carries a peer-chosen byte. A peer-chosen name or reason reaches a variant only
+/// escaped (`Write`, `PeerError`). The peer is told a fixed text, never either.
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveError {
     /// Reading from the link failed.
