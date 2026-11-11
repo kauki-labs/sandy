@@ -145,6 +145,15 @@ impl std::fmt::Debug for RemoteLink {
     }
 }
 
+/// Which of a run's two remote links an authenticated stream claimed (#482).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// The sandbox agent's link, served by `serve_agent_link`.
+    Agent,
+    /// The input/output data link.
+    Data,
+}
+
 /// Why an incoming remote agent-link stream was refused. Every variant is a
 /// named refusal, never a fabricated success — the caller closes the stream
 /// having written zero bytes on any of these (no cap leaks on refusal).
