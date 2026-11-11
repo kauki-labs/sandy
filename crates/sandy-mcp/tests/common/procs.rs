@@ -18,6 +18,15 @@ pub fn parse_stat(stat: &str) -> Option<(u32, u64)> {
     Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
 }
 
+/// True when the `/proc/<pid>/stat` text names a live process. A zombie (`Z`, exited and not yet reaped) and a dead
+/// one (`X`) are not live, and a line that cannot be read is not live either.
+pub fn stat_is_live(stat: &str) -> bool {
+    stat.rfind(')')
+        .and_then(|i| stat.get(i + 1..))
+        .and_then(|rest| rest.split_whitespace().next())
+        .is_some_and(|state| !matches!(state, "Z" | "X"))
+}
+
 /// `(pid, start time)` of every descendant of `root` in `table`, a list of `(pid, ppid, start time)`.
 ///
 /// Take the table before `root` is signalled: a child of a dead parent is re-parented to init and the walk no
