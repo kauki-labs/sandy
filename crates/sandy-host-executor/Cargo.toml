@@ -35,6 +35,7 @@ sandy-control-proto.workspace = true
 sandy-executor-proto.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
+sandy-fsutil.workspace = true
 sandy-guest-template.workspace = true
 sandy-impls-local.workspace = true
 # The remote VM dispatch branch's backend (#332): qemu/x86_64-linux is this

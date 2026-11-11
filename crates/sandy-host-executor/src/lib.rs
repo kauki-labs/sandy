@@ -18,4 +18,5 @@ pub mod client_config;
 pub mod dispatch;
 pub mod input_pull;
 pub mod input_stage;
+pub mod output_send;
 pub mod run;
