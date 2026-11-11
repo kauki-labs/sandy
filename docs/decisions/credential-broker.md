@@ -165,7 +165,7 @@ reads a request only because the guest addressed it as the endpoint.
    the per-run client key. `sandyd` holds a copy of each in memory, and the redactor, the shred and `gc` paths and the
    live byte scan cover both. That touches `cred_bracket.rs`. #745 closes for mode A only after that lands.
 5. Mode A, one client at a time: `git`, then the `gh` wrapper. The live row proves the tool works with no token in the
-   environment or on the share, and scans the share and the console for the capability.
+   environment or on the share, and scans the share and the console for the capability and the per-run client key.
 
 ## Consequences
 
