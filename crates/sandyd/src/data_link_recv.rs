@@ -542,7 +542,14 @@ mod tests {
                     walk(&path, root, into)?;
                 } else {
                     let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
-                    into.insert(rel, std::fs::read(&path)?);
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            into.insert(rel, bytes);
+                        }
+                        // A queued cleanup can remove a temp file between the listing and the read.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
             Ok(())
@@ -885,6 +892,23 @@ mod tests {
         Ok(())
     }
 
+    /// Poll `receive` until a temp file is on disk (the file is in flight), failing if the receive ends first.
+    async fn wait_until_a_file_is_in_flight(
+        receive: &mut (impl std::future::Future<Output = Result<Received, ReceiveError>> + Unpin),
+        dest: &Path,
+    ) -> anyhow::Result<()> {
+        for _ in 0..80 {
+            tokio::select! {
+                ended = &mut *receive => anyhow::bail!("the receive ended with the peer silent: {ended:?}"),
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+            if !tree(dest)?.is_empty() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("no file was ever in flight")
+    }
+
     /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
     fn runtime_with_one_blocking_thread() -> anyhow::Result<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_multi_thread()
@@ -943,12 +967,12 @@ mod tests {
             let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
             write_frame(&mut peer, &chunk(0, "half", b"x")).await.context("write")?;
 
-            let mut receive = Box::pin(receive_outputs(&mut local, &outputs, quick()));
-            tokio::select! {
-                _ = &mut receive => anyhow::bail!("the receive ended with the peer silent"),
-                () = tokio::time::sleep(Duration::from_millis(250)) => {}
-            }
-            assert!(!tree(dest.path())?.is_empty(), "the file must be in flight");
+            let patient = ReceiveLimits {
+                idle: Duration::from_secs(30),
+                ..quick()
+            };
+            let mut receive = Box::pin(receive_outputs(&mut local, &outputs, patient));
+            wait_until_a_file_is_in_flight(&mut receive, dest.path()).await?;
 
             let (release, held) = std::sync::mpsc::channel::<()>();
             let blocker = tokio::task::spawn_blocking(move || {
@@ -978,6 +1002,42 @@ mod tests {
             drop(peer);
             Ok(())
         })
+    }
+
+    /// A receive dropped after its runtime has shut down still removes its temp file. Tokio rejects a `spawn_blocking`
+    /// made on a pool that has shut down, without running it, so a cleanup that only queues the unlink loses it. A task
+    /// the runtime drops late is in this position: its `Drop` runs with the runtime's handle entered and the pool gone.
+    #[test]
+    fn a_receive_dropped_after_the_runtime_shut_down_still_removes_its_temp_file() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = vec![out(None, dest.path())];
+        let (mut peer, local) = tokio::io::duplex(1024 * 1024);
+        let patient = ReceiveLimits {
+            idle: Duration::from_secs(30),
+            ..quick()
+        };
+        let mut receive = Box::pin(async move {
+            let mut local = local;
+            receive_outputs(&mut local, &outputs, patient).await
+        });
+        rt.block_on(async {
+            write_frame(&mut peer, &chunk(0, "half", b"x")).await.context("write")?;
+            wait_until_a_file_is_in_flight(&mut receive, dest.path()).await
+        })?;
+
+        let handle = rt.handle().clone();
+        drop(rt);
+        let _entered = handle.enter();
+        drop(receive);
+
+        let left = tree(dest.path())?;
+        assert!(
+            left.is_empty(),
+            "the unlink was lost with the pool, the temp file stays: {left:?}"
+        );
+        drop(peer);
+        Ok(())
     }
 
     /// The byte cap is counted as bytes arrive: exactly at it passes, one past it stops, and what was written
