@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use crate::{
     credential::{JobCredentials, Redaction},
-    link_auth::{self, LinkAuthError, RemoteLink},
+    link_auth::{self, LinkAuthError, LinkKind, RemoteLink},
     store::JobStore,
 };
 
@@ -85,6 +85,11 @@ pub struct JobChannel {
     /// authenticate — `serve_agent_link` runs directly over a private
     /// socketpair there. Set at dispatch, never mutated after.
     pub remote_link: Option<RemoteLink>,
+    /// This run's SECOND remote link, the input/output data link (#482
+    /// decision 22): same executor, its own token and its own claim slot, so
+    /// claiming one link never spends the other. Set beside `remote_link`,
+    /// `None` exactly when that is.
+    pub data_link: Option<RemoteLink>,
     /// Caps derived from the manifest's `requested_caps`, bounded by the
     /// submitter's own held caps (decision C, #226) — scoped to channels
     /// OTHER than this job's own (e.g. the submitter's orchestrator channel,
@@ -251,6 +256,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         observer_cap,
         archiver_cap,
         remote_link: None,
+        data_link: None,
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,
@@ -563,19 +569,47 @@ impl JobRegistry {
         Ok(job)
     }
 
-    /// Invalidate `job_id`'s remote link, if it has one, so a stream arriving
-    /// after this point can never claim it (#269's token-lifecycle
+    /// Authenticate an incoming remote stream for `job_id` against BOTH of the
+    /// job's links (#482 decision 22) and say which one it claimed. The links
+    /// share the executor's IP and differ in token, so the token is the
+    /// namespace: a token that matches the agent link claims only the agent
+    /// link, one that matches the data link claims only the data link, and
+    /// neither slot is ever spent by a token for the other. `encode_remote_link_prefix`
+    /// has no tag byte (an older executor would break), so the demux is here.
+    ///
+    /// # Errors
+    /// As [`Self::authenticate_remote_link`]; a token that matches neither
+    /// link is [`LinkAuthError::WrongToken`].
+    pub fn authenticate_incoming_link(
+        &self,
+        job_id: &str,
+        peer_ip: std::net::IpAddr,
+        presented_token: &[u8; link_auth::LINK_TOKEN_LEN],
+    ) -> Result<(Arc<JobChannel>, LinkKind), LinkAuthError> {
+        let job = self.get(job_id).ok_or(LinkAuthError::UnknownRun)?;
+        let agent = job.remote_link.as_ref().ok_or(LinkAuthError::NotRemote)?;
+        match link_auth::authenticate(agent, peer_ip, presented_token) {
+            Ok(()) => return Ok((job, LinkKind::Agent)),
+            Err(LinkAuthError::WrongToken) => {}
+            Err(e) => return Err(e),
+        }
+        let data = job.data_link.as_ref().ok_or(LinkAuthError::WrongToken)?;
+        link_auth::authenticate(data, peer_ip, presented_token)?;
+        Ok((job, LinkKind::Data))
+    }
+
+    /// Invalidate `job_id`'s remote links, if it has them, so a stream arriving
+    /// after this point can never claim either (#269's token-lifecycle
     /// requirement: cancel, dispatch timeout, and executor teardown must each
     /// close this off). A no-op if the job has no remote link or is unknown —
     /// the caller has already decided whether the terminal transition itself
-    /// (cancel, timeout, …) succeeded; this only cleans up the link that
+    /// (cancel, timeout, …) succeeded; this only cleans up the links that
     /// transition leaves behind.
     pub fn invalidate_remote_link(&self, job_id: &str) {
         let Some(job) = self.get(job_id) else { return };
-        let Some(link) = job.remote_link.as_ref() else {
-            return;
-        };
-        link.invalidate();
+        for link in [&job.remote_link, &job.data_link].into_iter().flatten() {
+            link.invalidate();
+        }
     }
 }
 
@@ -824,6 +858,113 @@ mod tests {
         match registry.authenticate_remote_link("job-1", executor_ip, &token) {
             Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
             Ok(_) => panic!("a cancelled job's token must never authenticate a late-arriving stream"),
+        }
+        Ok(())
+    }
+
+    /// A job with both links, bound to one executor, and the two tokens.
+    async fn job_with_two_links(
+        registry: &JobRegistry,
+        executor_ip: std::net::IpAddr,
+    ) -> anyhow::Result<([u8; link_auth::LINK_TOKEN_LEN], [u8; link_auth::LINK_TOKEN_LEN])> {
+        let mut job = mint_job_channel("job-1", registry.authority()).await?;
+        let agent = RemoteLink::new(executor_ip)?;
+        let data = RemoteLink::new(executor_ip)?;
+        let tokens = (*agent.token().as_bytes(), *data.token().as_bytes());
+        job.remote_link = Some(agent);
+        job.data_link = Some(data);
+        registry.insert("job-1".to_owned(), job);
+        Ok(tokens)
+    }
+
+    /// #482: each token claims only its own link, and claiming one leaves
+    /// the other claimable.
+    #[tokio::test]
+    async fn each_links_token_claims_only_that_link() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let (agent_token, data_token) = job_with_two_links(&registry, ip).await?;
+
+        let (_, kind) = registry.authenticate_incoming_link("job-1", ip, &data_token)?;
+        assert_eq!(kind, LinkKind::Data);
+        let (_, kind) = registry.authenticate_incoming_link("job-1", ip, &agent_token)?;
+        assert_eq!(
+            kind,
+            LinkKind::Agent,
+            "claiming the data link must not spend the agent link"
+        );
+        Ok(())
+    }
+
+    /// #482: a link claims once; the same token again is `AlreadyClaimed`,
+    /// for the data link as for the agent link.
+    #[tokio::test]
+    async fn the_data_link_claims_once() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let (_, data_token) = job_with_two_links(&registry, ip).await?;
+
+        registry.authenticate_incoming_link("job-1", ip, &data_token)?;
+        match registry.authenticate_incoming_link("job-1", ip, &data_token) {
+            Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!("a second stream on the data token must be refused"),
+        }
+        Ok(())
+    }
+
+    /// #482: a data token is useless from any other peer, and a token that
+    /// matches neither link is refused as a wrong token.
+    #[tokio::test]
+    async fn the_data_link_checks_peer_and_token() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let other: std::net::IpAddr = "100.64.0.9".parse().context("other ip literal")?;
+        let (_, data_token) = job_with_two_links(&registry, ip).await?;
+
+        match registry.authenticate_incoming_link("job-1", other, &data_token) {
+            Err(e) => assert_eq!(e, LinkAuthError::WrongPeer),
+            Ok(_) => panic!("a data token from another peer must be refused"),
+        }
+        match registry.authenticate_incoming_link("job-1", ip, &[0xAA; link_auth::LINK_TOKEN_LEN]) {
+            Err(e) => assert_eq!(e, LinkAuthError::WrongToken),
+            Ok(_) => panic!("a token for neither link must be refused"),
+        }
+        Ok(())
+    }
+
+    /// #482: a job with only an agent link (a Dispatch from before the data
+    /// link) refuses any other token as wrong, never claims a missing link.
+    #[tokio::test]
+    async fn a_job_without_a_data_link_refuses_a_foreign_token() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let mut job = mint_job_channel("job-1", registry.authority()).await?;
+        job.remote_link = Some(RemoteLink::new(ip)?);
+        registry.insert("job-1".to_owned(), job);
+
+        match registry.authenticate_incoming_link("job-1", ip, &[0x55; link_auth::LINK_TOKEN_LEN]) {
+            Err(e) => assert_eq!(e, LinkAuthError::WrongToken),
+            Ok(_) => panic!("no data link exists to claim"),
+        }
+        Ok(())
+    }
+
+    /// #482: cancel closes both links, not only the agent link.
+    #[tokio::test]
+    async fn invalidating_a_job_closes_the_data_link_too() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let registry = JobRegistry::new()?;
+        let ip: std::net::IpAddr = "100.64.0.7".parse().context("executor ip literal")?;
+        let (_, data_token) = job_with_two_links(&registry, ip).await?;
+
+        registry.invalidate_remote_link("job-1");
+        match registry.authenticate_incoming_link("job-1", ip, &data_token) {
+            Err(e) => assert_eq!(e, LinkAuthError::AlreadyClaimed),
+            Ok(_) => panic!("a cancelled job's data token must never authenticate"),
         }
         Ok(())
     }

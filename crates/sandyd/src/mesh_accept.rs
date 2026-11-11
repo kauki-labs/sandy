@@ -20,7 +20,7 @@ use sandy_conn::{Conn, Listener, PeerAddr};
 use sandy_executor_proto::decode_remote_link_prefix;
 use sandy_fabric_local::link::serve_agent_link;
 
-use crate::{dispatch::JobRegistry, spawn_gated_accept};
+use crate::{dispatch::JobRegistry, link_auth::LinkKind, spawn_gated_accept};
 
 /// How long a freshly accepted connection has to deliver its full run-id +
 /// token prefix before it's closed. Without a deadline here, a peer that
@@ -143,16 +143,26 @@ async fn serve_one_remote_link(mut conn: Box<dyn Conn>, peer: PeerAddr, registry
         }
     };
 
-    let job = match registry.authenticate_remote_link(&job_id, peer_ip, &token) {
-        Ok(job) => job,
+    let (job, kind) = match registry.authenticate_incoming_link(&job_id, peer_ip, &token) {
+        Ok(authenticated) => authenticated,
         Err(e) => {
             tracing::warn!(error = %e, job_id, peer = %peer_ip, "mesh accept loop: refusing an unauthenticated agent-link stream");
             return;
         }
     };
 
-    if let Err(e) = serve_agent_link(Arc::clone(&job.channel), &job.agent_cap, conn).await {
-        tracing::warn!(error = %e, job_id, "mesh accept loop: the agent link faulted");
+    match kind {
+        LinkKind::Agent => {
+            if let Err(e) = serve_agent_link(Arc::clone(&job.channel), &job.agent_cap, conn).await {
+                tracing::warn!(error = %e, job_id, "mesh accept loop: the agent link faulted");
+            }
+        }
+        // The transfer handlers arrive with the host-executor's receive path
+        // (#482 slices 5 and 6); until then a claimed data link is closed.
+        LinkKind::Data => tracing::info!(
+            job_id,
+            "mesh accept loop: data link claimed; no transfer handler yet, closing"
+        ),
     }
 }
 
@@ -340,6 +350,66 @@ mod tests {
         .context("read after refusal")?;
         assert_eq!(n, 0, "a wrong peer must close the stream having written zero bytes");
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+        Ok(())
+    }
+
+    /// #482: a stream presenting the DATA link's token is not handed to the
+    /// agent link (no `Join` cap frame, zero bytes), and claiming it leaves
+    /// the agent link claimable by its own token afterwards.
+    #[tokio::test]
+    async fn a_data_link_stream_never_reaches_the_agent_link() -> anyhow::Result<()> {
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        let agent = RemoteLink::new(addr.ip()).context("agent link")?;
+        let data = RemoteLink::new(addr.ip()).context("data link")?;
+        let (agent_token, data_token) = (*agent.token().as_bytes(), *data.token().as_bytes());
+        job.remote_link = Some(agent);
+        job.data_link = Some(data);
+        registry.insert("job-1".to_owned(), job);
+
+        let accept_registry = Arc::clone(&registry);
+        let accepting = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (conn, peer) = listener.accept().await.expect("accept");
+                serve_one_remote_link(conn, peer, &accept_registry).await;
+            }
+        });
+
+        let mut first = connect(&loopback(addr.port())).await.context("connect data")?;
+        let prefix = encode_remote_link_prefix("job-1", &data_token).expect("encode prefix");
+        tokio::io::AsyncWriteExt::write_all(&mut first, &prefix)
+            .await
+            .context("write data prefix")?;
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut first, &mut buf),
+        )
+        .await
+        .context("timed out waiting for the data link close")?
+        .context("read the data link")?;
+        assert_eq!(n, 0, "the data link must not be served the agent link's cap frame");
+
+        let mut second = connect(&loopback(addr.port())).await.context("connect agent")?;
+        let prefix = encode_remote_link_prefix("job-1", &agent_token).expect("encode prefix");
+        tokio::io::AsyncWriteExt::write_all(&mut second, &prefix)
+            .await
+            .context("write agent prefix")?;
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut second, &mut buf),
+        )
+        .await
+        .context("timed out waiting for the agent link's first byte")?
+        .context("read the agent link")?;
+        assert_eq!(n, 1, "the agent link must still be claimable after the data link was");
+
+        drop((first, second));
         tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
         Ok(())
     }

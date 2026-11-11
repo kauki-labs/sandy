@@ -574,10 +574,14 @@ pub async fn handle(
                     required_sandbox_kind.into(),
                     require_local,
                 )?;
-                match RemoteLink::new(candidate.peer_ip) {
-                    Ok(link) => {
+                match RemoteLink::new(candidate.peer_ip)
+                    .and_then(|link| Ok((link, RemoteLink::new(candidate.peer_ip)?)))
+                {
+                    Ok((link, data_link)) => {
                         let link_token = link.token().as_bytes().to_vec();
+                        let data_link_token = data_link.token().as_bytes().to_vec();
                         job_channel.remote_link = Some(link);
+                        job_channel.data_link = Some(data_link);
                         job_channel.host_id = Some(candidate.host_id.clone());
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
@@ -603,8 +607,7 @@ pub async fn handle(
                             inputs: path_inputs.clone(),
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
-                            // No data link yet (#482): nothing mints this token until the link exists.
-                            data_link_token: Vec::new(),
+                            data_link_token,
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -1740,6 +1743,7 @@ mod tests {
                 observer_cap: expired_cap,
                 archiver_cap: job.archiver_cap.clone(),
                 remote_link: None,
+                data_link: None,
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
@@ -1799,6 +1803,7 @@ mod tests {
                 observer_cap: job.observer_cap.clone(),
                 archiver_cap: job.archiver_cap.clone(),
                 remote_link: Some(link),
+                data_link: None,
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
@@ -2610,6 +2615,15 @@ mod tests {
             job.remote_link.is_some(),
             "a placed job must have its remote_link bound"
         );
+
+        // #482: the Dispatch carries the data link's own token, bound on the
+        // job's channel, and it is not the agent link's token.
+        let data_link = job
+            .data_link
+            .as_ref()
+            .context("a placed job must have its data_link bound")?;
+        assert_eq!(dispatch.data_link_token, data_link.token().as_bytes().to_vec());
+        assert_ne!(dispatch.data_link_token, dispatch.link_token);
         Ok(())
     }
 
