@@ -68,6 +68,7 @@ impl std::fmt::Debug for OutputChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputChunk")
             .field("name", &self.name)
+            .field("output_index", &self.output_index)
             .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
             .finish()
     }

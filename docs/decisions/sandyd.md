@@ -2003,6 +2003,15 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - Each frame write has a 30 s timeout. A failure other than a dead link sends a `TransferError` with a fixed reason
   and no path. A dead link ends the send with `Link`, and dropping the channel stops the reader.
 
+### Slice 6 wire: `OutputChunk.output_index`
+
+- Local collection lets a named output and a catch-all both cover `outputs/N/x`, and Submit does not refuse
+  duplicate names, two catch-alls, or that overlap (#771 tracks the duplicate names). A chunk named `N/x` cannot say
+  which declared output it belongs to, so `OutputChunk` carries `output_index`, the position in `Dispatch.outputs`.
+- The host sends a file once per output that covers it, as local collection writes it to each destination. The
+  receiver refuses an index past the end of `Dispatch.outputs`, and checks that the name's first component is the
+  named output's name. A sender that predates the field sends 0.
+
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
 **Status:** accepted. **Upholds:** INV-1.
