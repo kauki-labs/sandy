@@ -2567,8 +2567,10 @@ option (C, #707); nothing here waits for it.
 
 - **The host writes, the guest reads.** The host driver already renews in place (the renewal bullet above) and needs
   no second writer. The owner's words "the guest rewrites the file" name the visible effect: a file in the guest
-  that changes about hourly. The guest cannot write the share. Its virtiofsd runs with `--readonly`
-  (`virtiofsd_args`, INV-1), so a guest-side writer could not reach the host or the provider.
+  that changes about hourly. On `vm-qemu` the guest cannot write the share: its virtiofsd runs with `--readonly`
+  (`virtiofsd_args`, INV-1). On `vm-vfkit` read-only is only the guest's `ro` mount, because vfkit's virtio-fs
+  device has no read-only option (`impls/vm/src/share.rs`, `guest-shares.md` section 2), and a guest root can remount
+  it read-write. In neither case does a guest-side writer reach the provider.
 - **The write is atomic.** `write_secret` writes a temporary file and renames it over `GITHUB_TOKEN` (`renameat`),
   so a reader sees the old token or the new one, never a torn one. The directory is the live virtiofs share
   (`RunSpec.secret_dir`, decision 2 of `secret-channel.md`), so the guest sees the new file without a remount.
@@ -2581,6 +2583,9 @@ option (C, #707); nothing here waits for it.
   one. A process that read the old token just before the swap fails its next request and must read again: a retry
   in the caller, not a gap in the credential. How fast the guest sees a rename depends on the virtiofsd cache mode,
   which sandy does not set. This is unverified on a live guest.
+- **Known gap on vfkit (#745).** A vfkit guest can overwrite its own staged `GITHUB_TOKEN`. The host's console and
+  archive masking (`TokenRedactor`) reads that same file, so a guest that replaces it makes the host mask the
+  guest's value and not the real token. Qemu is not affected.
 - **Not covered.** A service that holds the token in memory (an SDK that read it once) fails after the first expiry;
   the remedy is the injector (C), where the guest never holds a token. The process backend has no secret channel and
   no refresh. A job loses forge access at expiry, by decision (A).
