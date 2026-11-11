@@ -2559,6 +2559,39 @@ and revokes one staged token; an environment lives for hours, so it also needs r
 **Set aside.** Persisting the token or a revoke handle for restart revoke. A `cred-*` directory name. Renewal on a
 separate task with its own lock.
 
+**Mid-run refresh: environments only (#706, owner decision of 2026-11-11, recorded on #481 and #587).** A GitHub
+token lives about an hour and an environment lives longer, so the token minted at boot must be replaced while the
+guest runs. The owner chose one path per consumer. A job gets no refresh (option A, decision 37). An environment gets
+the refresh described here (option B). A separate host-side injector with its own credential capabilities is a later
+option (C, #707); nothing here waits for it.
+
+- **The host writes, the guest reads.** The host driver already renews in place (the renewal bullet above) and needs
+  no second writer. The owner's words "the guest rewrites the file" name the visible effect: a file in the guest
+  that changes about hourly. The guest cannot write the share. Its virtiofsd runs with `--readonly`
+  (`virtiofsd_args`, INV-1), so a guest-side writer could not reach the host or the provider.
+- **The write is atomic.** `write_secret` writes a temporary file and renames it over `GITHUB_TOKEN` (`renameat`),
+  so a reader sees the old token or the new one, never a torn one. The directory is the live virtiofs share
+  (`RunSpec.secret_dir`, decision 2 of `secret-channel.md`), so the guest sees the new file without a remount.
+- **The guest reads at use time.** `nix/guest/flake.nix` ships `git-credential-sandy-gh`, which reads
+  `/run/sandy/secrets/GITHUB_TOKEN` on every `get`, and a `gh` wrapper that reads it on every call. The first call
+  after a renewal therefore uses the new token. A token copied into a process environment at start goes stale, as
+  the consumption rule above says. The refresh adds no code to sandy or to the guest: it is a contract, and the live
+  row tests it.
+- **The window.** The driver renews when five minutes remain and revokes the old token right after it stages the new
+  one. A process that read the old token just before the swap fails its next request and must read again: a retry
+  in the caller, not a gap in the credential. How fast the guest sees a rename depends on the virtiofsd cache mode,
+  which sandy does not set. This is unverified on a live guest.
+- **Not covered.** A service that holds the token in memory (an SDK that read it once) fails after the first expiry;
+  the remedy is the injector (C), where the guest never holds a token. The process backend has no secret channel and
+  no refresh. A job loses forge access at expiry, by decision (A).
+
+**Set aside** (refresh). A guest-side writer. A signal into the guest after a renewal. A second copy of the token
+outside the staged file.
+
+**Check still owed.** The slice 2 live row (VM backend, real guest) must show that the token the guest reads changes
+across a renewal and that the provider rejects the old one. It needs a short renewal margin or a long run, and the
+stub trust root (#733) cannot show the provider side.
+
 **A stub trust root for the live gate (#733).** Every vm environment needs a registered trust root, and the only
 provider is the real GitHub adapter, so a host with no App key cannot run a live scenario with a credential. A test
 daemon can name a stub instead. It has two locks, so a production binary cannot select it. The provider exists only
