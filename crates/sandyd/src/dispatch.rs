@@ -90,6 +90,9 @@ pub struct JobChannel {
     /// claiming one link never spends the other. Set beside `remote_link`,
     /// `None` exactly when that is.
     pub data_link: Option<RemoteLink>,
+    /// The path inputs the data link sends to the executor (#482 slice 5c). Empty exactly when `data_link` is
+    /// `None` or the job has outputs only.
+    pub data_inputs: Vec<sandy_executor_proto::Input>,
     /// Caps derived from the manifest's `requested_caps`, bounded by the
     /// submitter's own held caps (decision C, #226) — scoped to channels
     /// OTHER than this job's own (e.g. the submitter's orchestrator channel,
@@ -257,6 +260,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         archiver_cap,
         remote_link: None,
         data_link: None,
+        data_inputs: Vec::new(),
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,

@@ -475,6 +475,57 @@ mod tests {
         Ok(())
     }
 
+    /// #482 slice 5c: a claimed data link carries the job's declared inputs, then `InputEnd`, through the real
+    /// accept path.
+    #[tokio::test]
+    async fn a_claimed_data_link_sends_the_jobs_inputs() -> anyhow::Result<()> {
+        use sandy_control_proto::read_frame;
+        use sandy_executor_proto::{DataLinkMessage, Input, data_link_message::Op};
+
+        let source = tempfile::tempdir().context("source")?;
+        std::fs::write(source.path().join("in.txt"), b"hello").context("write input")?;
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let (agent, data) = (marker_token("send-agent"), marker_token("send-data"));
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.remote_link = Some(RemoteLink::with_token(addr.ip(), agent));
+        job.data_link = Some(RemoteLink::with_token(addr.ip(), data));
+        job.data_inputs = vec![Input {
+            host: source.path().join("in.txt").to_string_lossy().into_owned(),
+            name: "in.txt".to_owned(),
+            guest_path: None,
+        }];
+        registry.insert("job-1".to_owned(), job);
+        let accepting = accept_n(listener, &registry, 1);
+
+        let mut conn = connect(&loopback(addr.port())).await.context("connect data")?;
+        let prefix = encode_remote_link_prefix("job-1", &data).expect("encode prefix");
+        tokio::io::AsyncWriteExt::write_all(&mut conn, &prefix)
+            .await
+            .context("write data prefix")?;
+        let mut ops = Vec::new();
+        while let Some(message) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<DataLinkMessage>(&mut conn),
+        )
+        .await
+        .context("timed out waiting for a data frame")?
+        .context("read a data frame")?
+        {
+            ops.push(message.op);
+        }
+        assert!(
+            matches!(ops.first(), Some(Some(Op::InputChunk(c))) if c.name == "in.txt" && c.bytes == b"hello"),
+            "got {ops:?}"
+        );
+        assert!(matches!(ops.last(), Some(Some(Op::InputEnd(_)))), "got {ops:?}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+        Ok(())
+    }
+
     /// #482 (INV-1): no tracing event carries a raw DATA link token across a
     /// claim, a repeat claim and a wrong-peer refusal. The positive control
     /// checks the events this test expects were actually captured.

@@ -594,6 +594,11 @@ pub async fn handle(
                             .map(|l| l.token().as_bytes().to_vec())
                             .unwrap_or_default();
                         job_channel.remote_link = Some(link);
+                        job_channel.data_inputs = if data_link.is_some() {
+                            path_inputs.clone()
+                        } else {
+                            Vec::new()
+                        };
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
                         let dispatch = Dispatch {
@@ -1757,6 +1762,7 @@ mod tests {
                 archiver_cap: job.archiver_cap.clone(),
                 remote_link: None,
                 data_link: None,
+                data_inputs: Vec::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
@@ -1817,6 +1823,7 @@ mod tests {
                 archiver_cap: job.archiver_cap.clone(),
                 remote_link: Some(link),
                 data_link: None,
+                data_inputs: Vec::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
                 host_id: job.host_id.clone(),
