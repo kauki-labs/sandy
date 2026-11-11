@@ -564,7 +564,7 @@ mod tests {
     /// variables that must not reach the service, then the job with its arguments untouched.
     #[test]
     fn the_job_runs_as_the_service_user_with_no_new_privs_and_a_clean_env() {
-        let job = vec!["t3".into(), "serve".into(), "--port".into(), "3773".into()];
+        let job = vec!["service".into(), "serve".into(), "--port".into(), "3773".into()];
         let wrapped: Vec<String> = as_user("dev", job)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -584,7 +584,7 @@ mod tests {
                 "SANDY_SERVICE",
                 "-u",
                 "TMUX",
-                "t3",
+                "service",
                 "serve",
                 "--port",
                 "3773"
@@ -596,10 +596,13 @@ mod tests {
     /// program cannot make the root agent run it); with no user it runs as given.
     #[test]
     fn a_command_probe_runs_as_the_service_user_when_there_is_one() {
-        let argv = vec!["sandy-t3-ready".to_owned(), "3773".to_owned()];
+        let argv = vec!["sandy-http-ready".to_owned(), "3773".to_owned()];
         assert_eq!(probe_argv(None, &argv), argv);
-        let wrapped = probe_argv(Some("t3"), &argv);
-        assert_eq!(wrapped[..6], ["setpriv", "--no-new-privs", "--", "runuser", "-u", "t3"]);
+        let wrapped = probe_argv(Some("service"), &argv);
+        assert_eq!(
+            wrapped[..6],
+            ["setpriv", "--no-new-privs", "--", "runuser", "-u", "service"]
+        );
         assert_eq!(wrapped[wrapped.len() - 2..], argv);
     }
 

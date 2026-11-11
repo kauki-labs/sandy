@@ -685,7 +685,7 @@ mod tests {
 
     fn config() -> DriverConfig {
         DriverConfig {
-            template: "t3".to_owned(),
+            template: "service".to_owned(),
             service_port: Some(3773),
             provision_timeout: Duration::from_secs(600),
             idle_timeout: None,
@@ -794,7 +794,7 @@ mod tests {
         let launched = r.backend.launched();
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].environment_id, id);
-        assert_eq!(launched[0].template, "t3");
+        assert_eq!(launched[0].template, "service");
         assert_eq!(launched[0].size.as_deref(), Some("small"));
         assert_eq!(launched[0].service_port, Some(3773));
         Ok(())
@@ -881,7 +881,7 @@ mod tests {
         // The row was never written (or was lost) but a box runs under its id.
         r.backend.launch(&EnvironmentSpec {
             environment_id: "env-orphan".to_owned(),
-            template: "t3".to_owned(),
+            template: "service".to_owned(),
             size: None,
             env: Vec::new(),
             service_port: None,

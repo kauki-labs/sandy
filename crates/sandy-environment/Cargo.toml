@@ -1,6 +1,6 @@
 [package]
 name = "sandy-environment"
-description = "EnvironmentBackend implementations for sandyd: today the opt-in, trusted-only process backend that runs a service such as `t3 serve` as a host process with no VM isolation (#587)"
+description = "EnvironmentBackend implementations for sandyd: today the opt-in, trusted-only process backend that runs a service such as `service serve` as a host process with no VM isolation (#587)"
 version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
@@ -28,9 +28,9 @@ anyhow.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
-# A stand-in for `t3 serve` and `t3 pair`, so the tests drive real processes.
+# A stand-in for `service serve` and `service pair`, so the tests drive real processes.
 [[bin]]
-name = "fake-t3"
-path = "src/bin/fake_t3.rs"
+name = "fake-service"
+path = "src/bin/fake_service.rs"
 test = false
 doc = false

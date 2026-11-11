@@ -909,7 +909,7 @@ mod tests {
             flake: ".".to_owned(),
             kind: None,
             attr: None,
-            command: vec!["t3".to_owned(), "serve".to_owned()],
+            command: vec!["service".to_owned(), "serve".to_owned()],
             history_lines: 5_000,
             env: Vec::new(),
             cpu: None,
@@ -975,7 +975,7 @@ mod tests {
             flake: ".".to_owned(),
             kind: None,
             attr: None,
-            command: vec!["t3".to_owned(), "serve".to_owned()],
+            command: vec!["service".to_owned(), "serve".to_owned()],
             history_lines: 5_000,
             env,
             cpu: None,
@@ -985,7 +985,7 @@ mod tests {
         }
     }
 
-    fn t3_spec() -> sandy_guest_template::manifest::ServiceSpec {
+    fn example_spec() -> sandy_guest_template::manifest::ServiceSpec {
         use sandy_guest_template::manifest::{HealthProbe, ProbeCheck, RestartPolicy, ServiceSpec};
         ServiceSpec {
             user: "dev".to_owned(),
@@ -1021,7 +1021,7 @@ mod tests {
             "a plain job carries no SANDY_SERVICE and the executor's history bound"
         );
 
-        let service = flake_run_env(&flake_manifest(env, Some(t3_spec())))?;
+        let service = flake_run_env(&flake_manifest(env, Some(example_spec())))?;
         let services: Vec<_> = service.iter().filter(|(key, _)| key == "SANDY_SERVICE").collect();
         assert_eq!(services.len(), 1, "exactly the executor's entry: {service:?}");
         assert_ne!(services[0].1, forged);
@@ -1035,7 +1035,7 @@ mod tests {
             sandy_guest_template::manifest::RestartPolicy::OnFailure,
             sandy_guest_template::manifest::RestartPolicy::Always,
         ] {
-            let mut spec = t3_spec();
+            let mut spec = example_spec();
             spec.restart = policy;
             let err = flake_run_env(&flake_manifest(Vec::new(), Some(spec))).expect_err("must be refused");
             assert!(
@@ -1043,13 +1043,13 @@ mod tests {
                 "{err:?}"
             );
         }
-        assert!(flake_run_env(&flake_manifest(Vec::new(), Some(t3_spec()))).is_ok());
+        assert!(flake_run_env(&flake_manifest(Vec::new(), Some(example_spec()))).is_ok());
     }
 
     /// A spec too large for one console line is refused, not sent to be cut mid-argument.
     #[test]
     fn an_oversized_service_spec_is_refused() {
-        let mut spec = t3_spec();
+        let mut spec = example_spec();
         spec.probe.check = sandy_guest_template::manifest::ProbeCheck::Command {
             argv: vec!["x".repeat(MAX_SERVICE_ENV_BYTES)],
         };

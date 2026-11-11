@@ -189,7 +189,7 @@ async fn a_malformed_or_credential_shaped_request_is_invalid() -> Result<()> {
 }
 
 #[tokio::test]
-async fn link_stays_unsupported_until_t3_offers_an_interface() -> Result<()> {
+async fn link_stays_unsupported_until_a_service_offers_an_interface() -> Result<()> {
     let f = fixture().await?;
     let id = spawn_id(&f, TOKEN_A, spawn_body("l")).await?;
     let (status, body) = f

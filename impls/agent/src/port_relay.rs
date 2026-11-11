@@ -1,7 +1,7 @@
 //! `sandy-agent port-relay --vsock-port <P> --to <127.0.0.1:T>` (#590): the guest half of the host-side
 //! bridge to a guest service port.
 //!
-//! The service (for example `t3 serve`) listens on guest loopback, which the host cannot reach. The relay listens
+//! The service (for example `service serve`) listens on guest loopback, which the host cannot reach. The relay listens
 //! on vsock port `P` and, for each connection from the host, dials `127.0.0.1:T` and copies bytes both ways. It
 //! parses nothing: the host bridge owns TLS and auth. It admits only the host (CID 2), so a guest-local process on
 //! vsock loopback, or another guest, cannot use it. This is the egress relay run in the other direction
@@ -418,7 +418,7 @@ mod tests {
         Ok(())
     }
 
-    /// A long-lived connection (t3 holds a websocket) must not block a second one.
+    /// A long-lived connection (a service holds a websocket) must not block a second one.
     #[tokio::test]
     async fn connections_are_served_concurrently() -> anyhow::Result<()> {
         let (target, _) = echo_target().await?;

@@ -899,7 +899,7 @@ mod tests {
         Ok(())
     }
 
-    /// A process job reads a staged input via `SANDY_INPUTS_DIR` (the T3 input
+    /// A process job reads a staged input via `SANDY_INPUTS_DIR` (the earlier input
     /// fail-closed is lifted — the share is now staged and presented).
     #[test]
     fn a_process_job_reads_an_input_via_sandy_inputs_dir() -> anyhow::Result<()> {

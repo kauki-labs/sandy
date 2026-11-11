@@ -74,8 +74,8 @@ pub(crate) fn http_status(addr: SocketAddr) -> Option<u16> {
 /// that decides Ready.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HostCheck {
-    /// One `GET /`; an `HTTP/1.x NNN` answer below 500 is Ready. The default: t3 answers 503 while it starts and
-    /// 401 once auth is on, so Ready proves an HTTP listener.
+    /// One `GET /`; an `HTTP/1.x NNN` answer below 500 is Ready. The default: a service may answer 503 while it starts
+    /// and 401 once auth is on, so Ready proves an HTTP listener.
     #[default]
     Http,
     /// The service port accepted a connection through the bridge, whatever the service then says. For a generic
@@ -141,9 +141,9 @@ type Entry = (u64, SocketAddr, Option<Arc<AtomicU64>>);
 
 /// Reads readiness from an HTTP service behind a registered loopback address.
 ///
-/// A status below 500 is Ready: t3 answers 503 while it starts and 401 once auth is on, so Ready proves an HTTP
-/// listener, not that t3's API is up (as `sandy-t3-ready` in the guest image). Any HTTP answer counts, a 404 too,
-/// so an address must only stay registered while the bridge that owns it lives: see [`Registration`].
+/// A status below 500 is Ready: a service may answer 503 while it starts and 401 once auth is on, so Ready proves an
+/// HTTP listener, not that the service's API is up (as `sandy-http-ready` in the guest image). Any HTTP answer counts,
+/// a 404 too, so an address must only stay registered while the bridge that owns it lives: see [`Registration`].
 #[derive(Debug, Default)]
 pub struct HttpServiceProbe {
     addrs: Registry,
