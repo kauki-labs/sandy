@@ -334,6 +334,49 @@ mod tests {
         Ok(())
     }
 
+    /// The dial is mutual TLS to the orchestrator and writes the prefix for the DATA token: `job_id`, then that token,
+    /// before any other byte. A real `listen_tls` listener reads it back.
+    #[tokio::test]
+    async fn the_dial_claims_the_data_link_with_the_data_token() -> anyhow::Result<()> {
+        use std::{collections::HashSet, sync::Arc};
+
+        let orchestrator = sandy_conn::TlsIdentity::generate().context("orchestrator identity")?;
+        let agent = sandy_conn::TlsIdentity::generate().context("agent identity")?;
+        let mesh_tls = sandy_fabric_local::mesh_link::MeshTlsIdentity {
+            orchestrator_fingerprint: orchestrator.fingerprint(),
+            identity: Arc::new(agent),
+        };
+        let listener = sandy_conn::listen_tls(
+            "127.0.0.1:0".parse().context("bind addr")?,
+            orchestrator,
+            HashSet::from([mesh_tls.identity.fingerprint()]),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .context("listen_tls")?;
+        let addr = listener.local_addr().context("local_addr")?;
+
+        let data_token = [0x42u8; REMOTE_LINK_TOKEN_LEN];
+        let expected = sandy_executor_proto::encode_remote_link_prefix("job-1", &data_token).context("encode")?;
+        let accepting = tokio::spawn(async move {
+            let (mut conn, _peer) = listener.accept().await.context("accept")?;
+            let mut buf = vec![0u8; expected.len()];
+            conn.read_exact(&mut buf).await.context("read the prefix")?;
+            anyhow::Ok((buf, expected))
+        });
+
+        let _link = dial_data_link(addr, "job-1", &data_token, &mesh_tls)
+            .await
+            .context("the dial")?;
+        let (got, expected) = tokio::time::timeout(Duration::from_secs(5), accepting)
+            .await
+            .context("the orchestrator side hung")?
+            .context("the accept task")??;
+        assert_eq!(got, expected, "the prefix must carry the job id and the data token");
+        Ok(())
+    }
+
     /// An input with an empty name is refused before any root is made: the sender cannot name its chunks.
     #[tokio::test]
     async fn an_unnamed_input_is_refused_before_a_root_exists() -> anyhow::Result<()> {
