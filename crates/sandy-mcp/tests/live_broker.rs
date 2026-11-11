@@ -54,7 +54,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use common::{
     mcp_client::{BIN, Mcp, SCRIPT, credential_file, run_script},
-    procs::{descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries},
+    procs::{
+        descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries,
+        stat_is_live,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -66,6 +69,10 @@ const PROVISION_SECS: u64 = 240;
 /// service port accepted a connection through the bridge.
 const SERVICE_COMMAND: &str = "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr PIPE";
 /// The stub trust root's name (#733): the profiles' `credential` and `SANDYD_STUB_TRUST_ROOT`.
+/// The longest daemon `TMPDIR` the run's sockets still fit under. The longest socket name found in `impls/vm` is
+/// virtiofsd's `vfsd-sandy-secrets.sock` (23 bytes), so `/sandy/<36-char run id>/vfsd-sandy-secrets.sock` adds 67, and
+/// `sun_path` holds 107 plus the NUL. 38 leaves 2 bytes of margin.
+const MAX_TMP_BYTES: usize = 38;
 const STUB_ROOT: &str = "live";
 const SERVICE_PORT: &str = "9000";
 const SERVICE_USER: &str = "nobody";
@@ -134,6 +141,11 @@ fn signal(name: &str, pid: u32) {
         .status();
 }
 
+/// True while `pid` is a live process, from `/proc/<pid>/stat`.
+fn process_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_is_live(&stat))
+}
+
 /// `(parent pid, start time)` of a process, from `/proc/<pid>/stat`.
 fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
     parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
@@ -189,6 +201,28 @@ fn vm_parts(root: u32) -> Vec<(u32, u64)> {
     descendants(root)
         .into_iter()
         .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
+        .collect()
+}
+
+/// `(pid, start time)` of every VM part whose command line names `base`: the test daemon's own `TMPDIR`, unique to
+/// this run, so another session's VMs never match. For a daemon that is already dead, whose children the walk from
+/// its pid cannot reach.
+/// Best effort: a part whose argv does not name the base (the egress proxy, if it is not launched with a path under it)
+/// is not found here.
+fn vm_parts_using(base: &Path) -> Vec<(u32, u64)> {
+    let needle = base.to_string_lossy().into_owned();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    proc.flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+            let cmdline = std::fs::read(e.path().join("cmdline")).ok()?;
+            let named = String::from_utf8_lossy(&cmdline).contains(&needle);
+            (is_vm_part(&comm) && named).then_some(())?;
+            parent_and_start(pid).map(|(_, start)| (pid, start))
+        })
         .collect()
 }
 
@@ -266,9 +300,19 @@ impl Stack {
             "nix build of the base guest runner",
         )?;
         let host_before = sandy_entries(&std::env::temp_dir());
-        let dir = tempfile::tempdir().context("temp dir")?;
-        // A short name: the run's socket paths live under it, and a unix socket path holds about 100 bytes.
+        // Under `/tmp`, not `$TMPDIR`: a nix shell's `TMPDIR` is long, and a run's socket paths live under this dir.
+        let dir = tempfile::Builder::new()
+            .prefix("s")
+            .tempdir_in("/tmp")
+            .context("temp dir under /tmp")?;
         let tmp = dir.path().join("t");
+        ensure!(
+            tmp.as_os_str().len() <= MAX_TMP_BYTES,
+            "the daemon's TMPDIR {} is {} bytes, over {MAX_TMP_BYTES}: a run's socket under it could pass the \
+             108-byte `sun_path` limit",
+            tmp.display(),
+            tmp.as_os_str().len()
+        );
         std::fs::create_dir(&tmp)?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
         let token = canary_token()?;
@@ -537,10 +581,24 @@ impl Stack {
             let _ = broker.kill();
             let _ = broker.wait();
         }
-        let owned = descendants(self.sandyd.id());
-        signal("TERM", self.sandyd.id());
+        let mut owned = descendants(self.sandyd.id());
+        // A daemon that already exited died during the run: its children were re-parented, and every "no VM left"
+        // answer since was blind. The status is reaped here, so it is reported once, and the pid is never signalled
+        // (it may belong to another process now). The walk finds nothing, so the VM parts are found by the staging
+        // base in their command lines instead.
+        let already_exited = match self.sandyd.try_wait() {
+            Ok(Some(status)) => {
+                findings.push(format!("sandyd had already exited during the run: {status}"));
+                owned = vm_parts_using(&self.tmp);
+                true
+            }
+            _ => false,
+        };
+        if !already_exited {
+            signal("TERM", self.sandyd.id());
+        }
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !matches!(self.sandyd.try_wait(), Ok(Some(_))) {
+        while !already_exited && !matches!(self.sandyd.try_wait(), Ok(Some(_))) {
             if Instant::now() > deadline {
                 findings.push("sandyd ignored SIGTERM for 15 s and was SIGKILLed".to_owned());
                 let _ = self.sandyd.kill();
@@ -634,9 +692,20 @@ impl Stack {
     }
 
     /// Fails unless no VM of this stack runs within `secs`.
+    ///
+    /// A dead `sandyd` is an error: its VM parts are re-parented, so the walk finds none and the wait would pass
+    /// with the VMs still running.
     fn wait_no_vm(&self, secs: u64) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(secs);
-        while !vm_parts(self.sandyd.id()).is_empty() {
+        loop {
+            ensure!(
+                process_alive(self.sandyd.id()),
+                "sandyd (pid {}) is not running, so \"no VM left\" proves nothing",
+                self.sandyd.id()
+            );
+            if vm_parts(self.sandyd.id()).is_empty() {
+                return Ok(());
+            }
             ensure!(
                 Instant::now() < deadline,
                 "VM parts {:?} still run {secs} s later",
@@ -644,7 +713,6 @@ impl Stack {
             );
             std::thread::sleep(Duration::from_millis(250));
         }
-        Ok(())
     }
 }
 
@@ -677,8 +745,6 @@ fn spawn_args(request_id: &str, task: &str) -> Value {
            "lifetime": {"kind": "ephemeral", "ttl_secs": 3600}, "task_ref": task})
 }
 
-/// The canary never reaches the host process table: `ps` shows every argv on the box. `timeout` bounds it, and a
-/// `ps` that fails or times out is an error, not a clean sample.
 /// The stub tokens staged under `<tmp>/sandy/env-cred-<id>/GITHUB_TOKEN` now, added to `seen`, which keeps a token
 /// after its file is gone so a revoked token is still looked for. Returns every token seen, with its staged file.
 fn staged_stub_tokens(tmp: &Path, seen: &Mutex<BTreeMap<String, PathBuf>>) -> Vec<(String, PathBuf)> {
@@ -700,6 +766,8 @@ fn staged_stub_tokens(tmp: &Path, seen: &Mutex<BTreeMap<String, PathBuf>>) -> Ve
     seen.iter().map(|(t, p)| (t.clone(), p.clone())).collect()
 }
 
+/// The canary never reaches the host process table: `ps` shows every argv on the box. `timeout` bounds it, and a
+/// `ps` that fails or times out is an error, not a clean sample.
 fn ps_holds(needle: &str) -> Result<bool> {
     let out = Command::new("timeout")
         .args(["10", "ps", "-eww", "-o", "args="])
@@ -738,32 +806,30 @@ fn scenario(stack: &Stack) -> Result<()> {
     let spawned_at = Instant::now();
     let id = first["environment_id"].as_str().context("environment_id")?.to_owned();
     let (_, again) = mcp.call("spawn_environment", &spawn)?;
-    assert_eq!(
-        again["environment_id"],
-        json!(id),
-        "AT-1: a retry returns the same environment"
+    ensure!(
+        again["environment_id"] == json!(id),
+        "AT-1: a retry returns the same environment: {again}"
     );
     let early = get_environment(&mut mcp, &id)?;
-    assert_eq!(
-        early["state"],
-        json!("provisioning"),
+    ensure!(
+        early["state"] == json!("provisioning"),
         "AT-2: not Ready straight after spawn: {early}"
     );
-    assert!(
+    ensure!(
         early.get("connection").is_none(),
         "AT-2: no connection before Ready: {early}"
     );
     let (ready, _) = wait_state(&mut mcp, &id, "ready", PROVISION_SECS + 60)?;
     let boot = spawned_at.elapsed();
     eprintln!("KPI boot-to-Ready (spawn call to Ready, base guest, MCP polling every 100 ms): {boot:?}");
-    assert!(
+    ensure!(
         ready["connection"]["url"].is_string(),
         "AT-2: Ready carries the connection: {ready}"
     );
-    assert_eq!(
-        stack.vms().len(),
-        1,
-        "AT-1: two spawns of one request id run exactly one VM"
+    ensure!(
+        stack.vms().len() == 1,
+        "AT-1: two spawns of one request id run exactly one VM: {:?}",
+        stack.vms()
     );
 
     // The forge credential bracket (#706), through the stub (#733): minted before the boot and staged once, at the
@@ -792,10 +858,13 @@ fn scenario(stack: &Stack) -> Result<()> {
     let mut bad = spawn_args("live-secret", "secret");
     bad["token"] = json!("x");
     let (refused, why) = mcp.call("spawn_environment", &bad)?;
-    assert!(refused, "AT-10: a `token` field must be refused: {why}");
+    ensure!(refused, "AT-10: a `token` field must be refused: {why}");
     let (_, listed) = mcp.call("list_environments", &json!({}))?;
     let count = listed["environments"].as_array().map(Vec::len);
-    assert_eq!(count, Some(1), "AT-10: the refused call made no environment: {listed}");
+    ensure!(
+        count == Some(1),
+        "AT-10: the refused call made no environment: {listed}"
+    );
 
     let (is_err, deleted) = mcp.call("delete_environment", &json!({"environment_id": id}))?;
     ensure!(!is_err, "delete failed: {deleted}");
@@ -811,14 +880,13 @@ fn scenario(stack: &Stack) -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     let now = get_environment(&mut mcp, &cid)?;
-    assert_eq!(
-        now["state"],
-        json!("provisioning"),
+    ensure!(
+        now["state"] == json!("provisioning"),
         "AT-4: cancelled too late to test, state is {now}"
     );
     let (is_err, cancelled) = mcp.call("cancel_environment", &json!({"environment_id": cid}))?;
     ensure!(!is_err, "cancel failed: {cancelled}");
-    assert_eq!(cancelled["state"], json!("deleted"), "AT-4: {cancelled}");
+    ensure!(cancelled["state"] == json!("deleted"), "AT-4: {cancelled}");
     stack.wait_no_vm(120)?;
     // AT-6: delete after cancel is the same terminal result, not an error.
     let (is_err, again) = mcp.call("delete_environment", &json!({"environment_id": cid}))?;
@@ -828,6 +896,10 @@ fn scenario(stack: &Stack) -> Result<()> {
 
     // The shared script (AT-6, AT-9 and the rest) over a fresh MCP, with the Ready wait sized for a boot.
     let mut script: Value = serde_json::from_str(SCRIPT)?;
+    ensure!(
+        script["fixtures"].get("skip_tools").is_none(),
+        "the shipped script must not carry `skip_tools`: the live tier adds it, so tier-2 runs every tool"
+    );
     script["fixtures"]["ready_timeout_ms"] = json!((PROVISION_SECS + 60) * 1000);
     script["fixtures"]["ready_poll_ms"] = json!(250);
     // The live stack has only the vm environment backend and no job host, so a job submit is refused by design.
@@ -849,7 +921,7 @@ fn scenario(stack: &Stack) -> Result<()> {
         .iter()
         .filter(|e| !matches!(e["state"].as_str(), Some("deleted" | "failed")))
         .collect();
-    assert!(live.is_empty(), "non-terminal environments after the run: {live:?}");
+    ensure!(live.is_empty(), "non-terminal environments after the run: {live:?}");
     let (_, jobs) = mcp.call("list", &json!({}))?;
     let running: Vec<_> = jobs["jobs"]
         .as_array()
@@ -862,7 +934,7 @@ fn scenario(stack: &Stack) -> Result<()> {
             )
         })
         .collect();
-    assert!(running.is_empty(), "non-terminal jobs after the run: {running:?}");
+    ensure!(running.is_empty(), "non-terminal jobs after the run: {running:?}");
     stack.check_session(mcp, "final session")?;
     stack.canary_leaks("after the final listing")?;
     stack.wait_stub_bracket_balanced("after the final listing", 60)
