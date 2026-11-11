@@ -149,6 +149,7 @@ async fn pull(
         declared: &declared_set,
         limits,
         files: 0,
+        entries: 0,
         bytes: 0,
         names: BTreeSet::new(),
         current: None,
@@ -191,6 +192,8 @@ struct Pull<'a> {
     declared: &'a HashSet<&'a str>,
     limits: PullLimits,
     files: usize,
+    /// Files plus the directories this pull created: what `max_entries` caps.
+    entries: usize,
     bytes: u64,
     names: BTreeSet<String>,
     current: Option<OpenFile>,
@@ -217,11 +220,16 @@ impl Pull<'_> {
             if chunk.offset != 0 {
                 return Err(PullError::OffsetMismatch);
             }
-            if self.files >= self.limits.max_entries {
+            if self.entries >= self.limits.max_entries {
                 return Err(PullError::TooManyEntries);
             }
             let file = self.create(&chunk.name).await?;
             self.files += 1;
+            self.entries += 1;
+            // The directories created above may already have used the last slots.
+            if self.entries > self.limits.max_entries {
+                return Err(PullError::TooManyEntries);
+            }
             self.names.insert(first.to_owned());
             self.current = Some(OpenFile {
                 name: chunk.name.clone(),
@@ -248,13 +256,18 @@ impl Pull<'_> {
     /// Create the file for `name` under the root. The root is private and only this function writes it, so a
     /// directory component that exists is checked to be a real directory (a symlink or a file is refused), and the
     /// file itself is `create_new`, which fails on any existing entry and never follows a symlink.
-    async fn create(&self, name: &str) -> Result<tokio::fs::File, PullError> {
+    async fn create(&mut self, name: &str) -> Result<tokio::fs::File, PullError> {
         let mut path = self.root.to_path_buf();
         let mut parts = name.split('/').peekable();
         while let Some(part) = parts.next() {
             path.push(part);
-            if parts.peek().is_some() {
-                ensure_dir(&path).await?;
+            if parts.peek().is_some() && ensure_dir(&path).await? {
+                // Charged after the fact: a refusal leaves at most one directory past the cap, and the caller
+                // removes the whole root on every failure path.
+                self.entries += 1;
+                if self.entries > self.limits.max_entries {
+                    return Err(PullError::TooManyEntries);
+                }
             }
         }
         tokio::fs::OpenOptions::new()
@@ -269,13 +282,14 @@ impl Pull<'_> {
     }
 }
 
-async fn ensure_dir(path: &Path) -> Result<(), PullError> {
+/// Make sure `path` is a real directory. `true` when this call created it.
+async fn ensure_dir(path: &Path) -> Result<bool, PullError> {
     match tokio::fs::create_dir(path).await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = tokio::fs::symlink_metadata(path).await.map_err(PullError::Write)?;
             if metadata.is_dir() {
-                Ok(())
+                Ok(false)
             } else {
                 Err(PullError::Clash)
             }
@@ -579,6 +593,43 @@ mod tests {
         let pulled = pulled.context("the pull")?;
         assert_eq!((pulled.files, pulled.bytes), (1, 0));
         assert_eq!(read(root.path().join("empty"))?, b"");
+        Ok(())
+    }
+
+    /// A directory the pull creates counts as an entry: a 4 KiB name of one-character components would otherwise
+    /// make about 2000 directories for one file, and the file cap alone never stops a peer that sends many of them.
+    #[tokio::test]
+    async fn directories_count_against_the_entry_cap() -> anyhow::Result<()> {
+        let at = |max_entries| PullLimits {
+            max_bytes: 100,
+            max_entries,
+        };
+        let messages = [chunk("a/b/c/d", 0, b"x"), end()];
+
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, _peer) = run(&messages, false, &["a"], at(3), root.path()).await?;
+        assert!(
+            matches!(pulled, Err(PullError::TooManyEntries)),
+            "3 dirs and a file are 4 entries: {pulled:?}"
+        );
+
+        let root = tempfile::tempdir().context("root")?;
+        let (pulled, _peer) = run(&messages, false, &["a"], at(4), root.path()).await?;
+        assert_eq!(pulled.context("exactly at the cap")?.files, 1);
+        Ok(())
+    }
+
+    /// A directory that already exists is not charged again.
+    #[tokio::test]
+    async fn a_shared_directory_is_charged_once() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+        let limits = PullLimits {
+            max_bytes: 100,
+            max_entries: 3,
+        };
+        let messages = [chunk("a/x", 0, b"1"), chunk("a/y", 0, b"2"), end()];
+        let (pulled, _peer) = run(&messages, false, &["a"], limits, root.path()).await?;
+        assert_eq!(pulled.context("one dir and two files fit in 3")?.files, 2);
         Ok(())
     }
 
