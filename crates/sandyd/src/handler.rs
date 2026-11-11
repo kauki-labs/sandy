@@ -2616,14 +2616,122 @@ mod tests {
             "a placed job must have its remote_link bound"
         );
 
-        // #482: the Dispatch carries the data link's own token, bound on the
-        // job's channel, and it is not the agent link's token.
-        let data_link = job
-            .data_link
-            .as_ref()
-            .context("a placed job must have its data_link bound")?;
-        assert_eq!(dispatch.data_link_token, data_link.token().as_bytes().to_vec());
+        Ok(())
+    }
+
+    fn submit_req_with_input(id: u64) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                manifest: b"m".to_vec(),
+                manifest_encoding: "test/v1".to_owned(),
+                submitter_caps: Vec::new(),
+                required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                inputs: vec![sandy_control_proto::Input {
+                    host: "/src".to_owned(),
+                    name: "src".to_owned(),
+                    guest_path: Some("/work/src".to_owned()),
+                }],
+                outputs: Vec::new(),
+                secrets: Vec::new(),
+                credential: None,
+                cred_capabilities: Vec::new(),
+            }),
+        )
+    }
+
+    /// Place `request` on one registered host and return its `Dispatch` and
+    /// the job, for the #482 data-link gating tests.
+    async fn place_and_read(
+        request: ControlRequest,
+        capabilities: sandy_executor_proto::Capabilities,
+        peer_ip: std::net::IpAddr,
+    ) -> anyhow::Result<(Dispatch, Arc<crate::dispatch::JobChannel>, Arc<JobRegistry>)> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, capabilities);
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("the host's dispatch channel closed before receiving anything")?;
+        let job = registry.get(&job_id).context("the job must be registered")?;
+        Ok((dispatch, job, registry))
+    }
+
+    /// #482: a job naming no inputs or outputs gets no data link, even on a
+    /// host that declared `transfer`. A host-executor that dials on a
+    /// non-empty token would otherwise connect and wait for a transfer that
+    /// never comes.
+    #[tokio::test]
+    async fn a_job_without_inputs_or_outputs_gets_no_data_link() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (dispatch, job, _registry) = place_and_read(submit_req(1), capabilities, peer_ip).await?;
+        assert!(dispatch.data_link_token.is_empty(), "no inputs or outputs: no token");
+        assert!(job.data_link.is_none(), "no inputs or outputs: no data link bound");
+        Ok(())
+    }
+
+    /// #482: a job with inputs on a host that did not declare `transfer`
+    /// gets no data link: the host cannot take one.
+    #[tokio::test]
+    async fn a_host_without_transfer_gets_no_data_link() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: false,
+            ..trusted_host_capabilities()
+        };
+        let (dispatch, job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        assert!(dispatch.data_link_token.is_empty(), "no transfer capability: no token");
+        assert!(job.data_link.is_none(), "no transfer capability: no data link bound");
+        Ok(())
+    }
+
+    /// #482: the handler-minted data link is bound to the placed host's IP,
+    /// carries the token the Dispatch sent, and differs from the agent
+    /// link's token; a stream from any other peer is refused.
+    #[tokio::test]
+    async fn a_transfer_job_gets_a_data_link_bound_to_the_placed_host() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let other_ip: std::net::IpAddr = "100.64.0.9".parse().context("other ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (dispatch, job, registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        let token: [u8; crate::link_auth::LINK_TOKEN_LEN] = dispatch
+            .data_link_token
+            .as_slice()
+            .try_into()
+            .context("the data link token must be LINK_TOKEN_LEN bytes")?;
         assert_ne!(dispatch.data_link_token, dispatch.link_token);
+
+        let job_id = &dispatch.job_id;
+        match registry.authenticate_incoming_link(job_id, other_ip, &token) {
+            Err(e) => assert_eq!(e, crate::link_auth::LinkAuthError::WrongPeer),
+            Ok(_) => anyhow::bail!("a data token from a peer other than the placed host must be refused"),
+        }
+        let (_, kind) = registry.authenticate_incoming_link(job_id, peer_ip, &token)?;
+        assert_eq!(kind, crate::link_auth::LinkKind::Data);
+        assert!(job.data_link.is_some());
         Ok(())
     }
 

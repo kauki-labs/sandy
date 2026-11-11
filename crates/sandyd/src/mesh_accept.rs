@@ -414,6 +414,123 @@ mod tests {
         Ok(())
     }
 
+    /// A registry with one job holding both links under caller-chosen tokens.
+    async fn registry_with_marker_links(
+        executor_ip: IpAddr,
+        agent: [u8; 32],
+        data: [u8; 32],
+    ) -> anyhow::Result<Arc<JobRegistry>> {
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.remote_link = Some(RemoteLink::with_token(executor_ip, agent));
+        job.data_link = Some(RemoteLink::with_token(executor_ip, data));
+        registry.insert("job-1".to_owned(), job);
+        Ok(registry)
+    }
+
+    /// Accept `streams` connections on `listener` through the real path.
+    fn accept_n(
+        listener: sandy_conn::Listener,
+        registry: &Arc<JobRegistry>,
+        streams: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            for _ in 0..streams {
+                let (conn, peer) = listener.accept().await.expect("accept");
+                serve_one_remote_link(conn, peer, &registry).await;
+            }
+        })
+    }
+
+    /// #482: the agent link claimed FIRST does not block the data link, and
+    /// the data stream spends the data slot (a repeat is `AlreadyClaimed`).
+    #[tokio::test]
+    async fn the_data_link_is_claimable_after_the_agent_link() -> anyhow::Result<()> {
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let (agent, data) = (marker_token("order-agent"), marker_token("order-data"));
+        let registry = registry_with_marker_links(addr.ip(), agent, data).await?;
+        let accepting = accept_n(listener, &registry, 2);
+
+        assert_eq!(
+            stream_prefix(addr, "job-1", &agent).await?,
+            1,
+            "the agent link is served"
+        );
+        assert_eq!(
+            stream_prefix(addr, "job-1", &data).await?,
+            0,
+            "the data link is closed, not served"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+
+        let peer = addr.ip();
+        match registry.authenticate_incoming_link("job-1", peer, &data) {
+            Err(e) => assert_eq!(e, crate::link_auth::LinkAuthError::AlreadyClaimed),
+            Ok(_) => anyhow::bail!("the data stream must have claimed the data slot"),
+        }
+        Ok(())
+    }
+
+    /// #482 (INV-1): no tracing event carries a raw DATA link token across a
+    /// claim, a repeat claim and a wrong-peer refusal. The positive control
+    /// checks the events this test expects were actually captured.
+    #[tokio::test]
+    async fn no_tracing_event_carries_the_raw_data_link_token() -> anyhow::Result<()> {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (agent, data) = (marker_token("leak-agent"), marker_token("leak-data"));
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let registry = registry_with_marker_links(addr.ip(), agent, data).await?;
+        let accepting = accept_n(listener, &registry, 2);
+        assert_eq!(stream_prefix(addr, "job-1", &data).await?, 0);
+        assert_eq!(stream_prefix(addr, "job-1", &data).await?, 0, "a repeat is refused");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+
+        let listener = listen(&loopback(0)).await.context("listen 2")?;
+        let addr = listener.local_addr().context("local_addr 2")?;
+        let registry = registry_with_marker_links(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 9)), agent, data).await?;
+        let accepting = accept_n(listener, &registry, 1);
+        assert_eq!(stream_prefix(addr, "job-1", &data).await?, 0, "a wrong peer is refused");
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepting).await??;
+
+        let logged = buf.contents()?;
+        assert!(
+            logged.contains("data link claimed"),
+            "positive control: the claim must have logged: {logged}"
+        );
+        assert_eq!(
+            logged
+                .matches("mesh accept loop: refusing an unauthenticated agent-link stream")
+                .count(),
+            2,
+            "positive control: the repeat and the wrong peer must have logged: {logged}"
+        );
+        let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+        for leaked in [
+            String::from_utf8_lossy(&data).into_owned(),
+            hex,
+            format!("{data:?}"),
+            format!("{data:x?}"),
+        ] {
+            assert!(
+                !logged.contains(&leaked),
+                "the data token leaked into tracing output: {logged}"
+            );
+        }
+        Ok(())
+    }
+
     /// Adversarial: a stream that sends bytes that don't decode as a valid
     /// run-id+token prefix (not merely one that times out mid-send) is
     /// refused with zero bytes — a malformed prefix is a distinct failure
