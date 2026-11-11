@@ -21,6 +21,6 @@ mod vm;
 
 pub use console::{ConsoleSink, ConsoleTaps, TAIL_BYTES, TAIL_LINES};
 pub use lifecycle::{GuardedBackend, RunGuard, RunGuards, guarded};
-pub use probe::{HttpServiceProbe, Registration};
+pub use probe::{HostCheck, HttpServiceProbe, Registration};
 pub use process::{ProcessConfig, ProcessConfigError, ProcessEnvironmentBackend};
 pub use vm::{BackendFactory, HeldBackend, ServiceProbe, StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};

@@ -27,6 +27,7 @@
 //! | `SANDY_ENV_VM_SERVICE_PORT` | the guest loopback port the service listens on |
 //! | `SANDY_ENV_VM_SERVICE_USER` | the guest account the service runs as; default `t3`, never root |
 //! | `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` | sizes the hypervisor's connect budgets (not a deadline); default 600 |
+//! | `SANDY_ENV_VM_HOST_CHECK` | how the host decides the service is Ready: `http` (default: `GET /` answers below 500, as t3 does) or `connect` (the service port accepted a connection through the bridge, for a service that does not speak HTTP); any other value is refused |
 
 use std::{path::PathBuf, time::Duration};
 
@@ -83,6 +84,8 @@ pub struct VmSettings {
     pub service_env: String,
     /// Seconds that size the hypervisor backend's connect budgets.
     pub boot_timeout_secs: u32,
+    /// How the host decides the service is Ready (`SANDY_ENV_VM_HOST_CHECK`, #732).
+    pub host_check: sandy_environment::HostCheck,
 }
 
 /// Why the backend settings are unusable.
@@ -130,6 +133,12 @@ pub enum EnvironmentBackendConfigError {
         /// The variable.
         name: &'static str,
         /// What it held.
+        raw: String,
+    },
+    /// The host readiness check is neither `http` nor `connect`.
+    #[error("SANDY_ENV_VM_HOST_CHECK={raw:?} is not a host check: use `http` (the default) or `connect`")]
+    InvalidHostCheck {
+        /// What the variable held.
         raw: String,
     },
     /// A passed-through variable name is not `[A-Z0-9_]+`.
@@ -343,6 +352,10 @@ fn vm_settings(
             }
         })?,
     };
+    let host_check = match get("SANDY_ENV_VM_HOST_CHECK").filter(|v| !v.trim().is_empty()) {
+        None => sandy_environment::HostCheck::default(),
+        Some(raw) => raw.parse().map_err(|_| E::InvalidHostCheck { raw })?,
+    };
     let spec = ServiceSpec {
         user: get("SANDY_ENV_VM_SERVICE_USER")
             .map(|v| v.trim().to_owned())
@@ -371,6 +384,7 @@ fn vm_settings(
             command,
             service_env,
             boot_timeout_secs,
+            host_check,
         },
         template,
         port,
@@ -744,6 +758,59 @@ mod tests {
             assert!(
                 matches!(out, Err(EnvironmentBackendConfigError::InvalidNumber { name: n, .. }) if n == name),
                 "{name}={raw}: {out:?}"
+            );
+        }
+    }
+
+    fn host_check_of(extra: Option<(&'static str, &'static str)>) -> anyhow::Result<sandy_environment::HostCheck> {
+        use anyhow::Context;
+        let mut pairs = vm_base();
+        pairs.extend(extra);
+        let cfg = parse_on("linux", &pairs)?.context("expected a backend")?;
+        let BackendSettings::VmQemu(vm) = &cfg.backend else {
+            anyhow::bail!("expected the vm backend");
+        };
+        Ok(vm.host_check)
+    }
+
+    /// The default keeps t3's semantics (503 while starting, 401 with auth, below 500 is Ready) (#732).
+    #[test]
+    fn the_vm_host_check_defaults_to_http_when_unset_or_blank() -> anyhow::Result<()> {
+        use sandy_environment::HostCheck;
+        assert_eq!(host_check_of(None)?, HostCheck::Http);
+        assert_eq!(host_check_of(Some(("SANDY_ENV_VM_HOST_CHECK", "")))?, HostCheck::Http);
+        assert_eq!(host_check_of(Some(("SANDY_ENV_VM_HOST_CHECK", "  ")))?, HostCheck::Http);
+        Ok(())
+    }
+
+    #[test]
+    fn the_vm_host_check_can_be_http_or_connect() -> anyhow::Result<()> {
+        use sandy_environment::HostCheck;
+        assert_eq!(
+            host_check_of(Some(("SANDY_ENV_VM_HOST_CHECK", "http")))?,
+            HostCheck::Http
+        );
+        assert_eq!(
+            host_check_of(Some(("SANDY_ENV_VM_HOST_CHECK", "connect")))?,
+            HostCheck::Connect
+        );
+        Ok(())
+    }
+
+    /// Fail closed: a typo must not silently pick a mode, since either one changes what Ready means.
+    #[test]
+    fn an_unknown_vm_host_check_is_refused_and_names_the_choices() {
+        for raw in ["tcp", "Connect", "HTTP", "connect,http", "1", "none"] {
+            let mut pairs = vm_base();
+            pairs.push(("SANDY_ENV_VM_HOST_CHECK", raw));
+            let out = parse_on("linux", &pairs);
+            let Err(e @ EnvironmentBackendConfigError::InvalidHostCheck { .. }) = out else {
+                panic!("{raw}: expected InvalidHostCheck, got {out:?}");
+            };
+            let text = e.to_string();
+            assert!(
+                text.contains("SANDY_ENV_VM_HOST_CHECK") && text.contains("http") && text.contains("connect"),
+                "{raw}: {text}"
             );
         }
     }
