@@ -2379,7 +2379,8 @@ auditing in the broker (it would miss a client that talks to sandyd directly).
 **Decision.**
 
 - `SANDY_ENV_BACKEND=vm-qemu` selects `VmEnvironmentBackend` over `QemuBackend`. It is Linux only: elsewhere `from_env` returns `UnsupportedPlatform` naming the platform, so the daemon stops at startup rather than launching nothing. An unknown value is still an error.
-- Settings are `SANDY_ENV_VM_TEMPLATE` (the guest topology: a flake attr such as `<flake>#topologies.x86_64-linux.qemu-t3`, or a prebuilt topology JSON), `SANDY_ENV_VM_COMMAND` (guest argv, must contain `{port}`), `SANDY_ENV_VM_SERVICE_PORT`, `SANDY_ENV_VM_SERVICE_USER` (default `t3`, never root) and `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` (default 600, a connect budget, not a deadline). `SANDY_ENV_IDLE_TIMEOUT_SECS` is refused (below). `SANDY_ENV_PROVISION_TIMEOUT_SECS` defaults to the boot budget plus 300 s (900 s) for `vm-qemu`, not the process backend's 120 s, because a cold first boot builds and starts a multi-GB guest; an explicit value below the boot budget is a startup error, since the driver would fail the environment before the boot can finish.
+- Settings are `SANDY_ENV_VM_TEMPLATE` (the guest topology: a flake attr such as `<flake>#topologies.x86_64-linux.qemu-t3`, or a prebuilt topology JSON), `SANDY_ENV_VM_COMMAND` (guest argv, must contain `{port}`), `SANDY_ENV_VM_SERVICE_PORT`, `SANDY_ENV_VM_SERVICE_USER` (default `t3`, never root) and `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` (default 600, a connect budget, not a deadline) and `SANDY_ENV_VM_HOST_CHECK` (`http`, the default, or `connect`; see the host check bullet below). `SANDY_ENV_IDLE_TIMEOUT_SECS` is refused (below). `SANDY_ENV_PROVISION_TIMEOUT_SECS` defaults to the boot budget plus 300 s (900 s) for `vm-qemu`, not the process backend's 120 s, because a cold first boot builds and starts a multi-GB guest; an explicit value below the boot budget is a startup error, since the driver would fail the environment before the boot can finish.
+- **The host check (#732).** The host decides Ready, whatever the guest's declared probe says. `http` (the default) is the check above, so t3 keeps its semantics: 503 while it starts, 401 with auth, below 500 is Ready. `connect` is for a generic service that speaks no HTTP: Ready means the service port accepted a connection through the bridge. A plain connect to the bridge proves nothing, since the bridge listens at once and dials the guest only after a first byte. The proof is the bridge's count of ready dials (`Bridge::ready_dials`: dials that got the relay's ready byte, which the relay sends only after it connected to the service port). A count above zero reads Ready and the probe then touches nothing: the driver probes every Ready environment each pass, and a repeat byte would reach the service for its whole life. With no ready dial yet, the probe sends one newline, which makes the bridge dial, and waits for the count to rise within the 1.5 s budget. A dial that succeeds after the budget is counted by the next probe, which sends nothing then. A service that is down gets one newline per failed probe, and each leaves a bridge dial task running for its window. Any other value of the variable stops the daemon at start-up. The mode is logged when a bridge is registered. The guest's `ProbeCheck` is unchanged (`tcp` or `command`): an owner decision of 2026-11-11 chose a host-side setting over a new check type, so the wire contract and t3's declaration do not move. The newline reaches the service, so a service that treats a stray byte as input sees one or a few at boot.
 - The service spec is built once from those settings, validated with `validate_service_spec` and sent as `SANDY_SERVICE` in the run's env. A bad user or port stops the daemon at startup, not at the first boot. The guest probe is a TCP connect; the host probe (`HttpServiceProbe`) decides Ready. `vm-qemu` refuses `SANDY_ENV_IDLE_TIMEOUT_SECS` and the process-only settings (`SANDY_ENV_PROCESS_COMMAND`, `SANDY_ENV_PAIR_COMMAND`, `SANDY_ENV_STATE_DIR`, `SANDY_ENV_PASS_ENV`, `SANDY_ENV_PATH`) with a typed error at start-up, so none is dropped silently.
 - The factory builds one `QemuBackend` per environment with the agent launch and the CID hook, wrapped in `guarded` so the hook's work ends with the run.
 - `on_link` serves the host end of the agent link with `serve_agent_link` on the daemon's runtime, over a per-environment `InMem` channel and a `LocalCapAuthority` whose cap outlives any run. Its verdict goes through `AgentReport`, so a link that closes without an exit frame is an agent failure (INV-11).
@@ -2563,6 +2564,45 @@ and revokes one staged token; an environment lives for hours, so it also needs r
 
 **Set aside.** Persisting the token or a revoke handle for restart revoke. A `cred-*` directory name. Renewal on a
 separate task with its own lock.
+
+**Mid-run refresh: environments only (#706, owner decision of 2026-11-11, recorded on #481 and #587).** A GitHub
+token lives about an hour and an environment lives longer, so the token minted at boot must be replaced while the
+guest runs. The owner chose one path per consumer. A job gets no refresh (option A, decision 37). An environment gets
+the refresh described here (option B). A separate host-side injector with its own credential capabilities is a later
+option (C, #707); nothing here waits for it.
+
+- **The host writes, the guest reads.** The host driver already renews in place (the renewal bullet above) and needs
+  no second writer. The owner's words "the guest rewrites the file" name the visible effect: a file in the guest
+  that changes about hourly. On `vm-qemu` the guest cannot write the share: its virtiofsd runs with `--readonly`
+  (`virtiofsd_args`, INV-1). On `vm-vfkit` read-only is only the guest's `ro` mount, because vfkit's virtio-fs
+  device has no read-only option (`impls/vm/src/share.rs`, `guest-shares.md` section 2), and a guest root can remount
+  it read-write. In neither case does a guest-side writer reach the provider.
+- **The write is atomic.** `write_secret` writes a temporary file and renames it over `GITHUB_TOKEN` (`renameat`),
+  so a reader sees the old token or the new one, never a torn one. The directory is the live virtiofs share
+  (`RunSpec.secret_dir`, decision 2 of `secret-channel.md`), so the guest sees the new file without a remount.
+- **The guest reads at use time.** `nix/guest/flake.nix` ships `git-credential-sandy-gh`, which reads
+  `/run/sandy/secrets/GITHUB_TOKEN` on every `get`, and a `gh` wrapper that reads it on every call. The first call
+  after a renewal therefore uses the new token. A token copied into a process environment at start goes stale, as
+  the consumption rule above says. The refresh adds no code to sandy or to the guest: it is a contract, and the live
+  row tests it.
+- **The window.** The driver renews when five minutes remain and revokes the old token right after it stages the new
+  one. A process that read the old token just before the swap fails its next request and must read again: a retry
+  in the caller, not a gap in the credential. How fast the guest sees a rename depends on the virtiofsd cache mode,
+  which sandy does not set. This is unverified on a live guest.
+- **Known gap on vfkit (#745).** A vfkit guest can overwrite its own staged `GITHUB_TOKEN`. The host's console and
+  archive masking (`TokenRedactor`) reads that same file, so a guest that replaces it makes the host mask the
+  guest's value and not the real token. Qemu is not affected.
+- **Not covered.** A service that holds the token in memory (an SDK that read it once) fails after the first expiry;
+  the remedy is the injector (C), where the guest never holds a token. The process backend has no secret channel and
+  no refresh. A job loses forge access at expiry, by decision (A).
+
+**Set aside** (refresh). A guest-side writer. A signal into the guest after a renewal. A second copy of the token
+outside the staged file.
+
+**Check still owed.** The slice 2 live row (VM backend, real guest) must show that the token the guest reads changes
+across a renewal, how long the guest takes to see the atomic rename (the virtiofsd cache mode), and that the
+provider rejects the old token. It needs a short renewal margin or a long run, and the
+stub trust root (#733) cannot show the provider side.
 
 **A stub trust root for the live gate (#733).** Every vm environment needs a registered trust root, and the only
 provider is the real GitHub adapter, so a host with no App key cannot run a live scenario with a credential. A test

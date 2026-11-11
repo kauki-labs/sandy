@@ -9,11 +9,11 @@
 //! reason.
 //!
 //! The guest is the generic base guest (`topologies.x86_64-linux.qemu`) running `socat` as `nobody`: sandy core
-//! names no service. The host decides Ready with an HTTP probe (#732), so the service answers a bare HTTP status
-//! line. Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and
-//! `/dev/vhost-vsock` only. Build the sibling binaries first, so no cargo build runs mid-test. `sandyd` needs the
-//! `stub-trust-root` feature: every vm environment mints from a registered trust root, and no real one exists on a
-//! test host. Without the feature the daemon refuses to start and says so.
+//! names no service. The service is a plain TCP echo, and the daemon runs with the connect host check (#732), so Ready
+//! means the service port accepted a connection. Tier-3, behind the `live` feature like the other live suites (INV-S9).
+//! Linux with KVM and `/dev/vhost-vsock` only. Build the sibling binaries first, so no cargo build runs mid-test.
+//! `sandyd` needs the `stub-trust-root` feature: every vm environment mints from a registered trust root, and no real
+//! one exists on a test host. Without the feature the daemon refuses to start and says so.
 //!
 //! ```text
 //! cargo build -p sandyd -p sandy-broker -p sandy-mcp --features sandyd/stub-trust-root
@@ -64,12 +64,10 @@ use sha2::{Digest, Sha256};
 
 /// A cold boot plus the service probe; the daemon's provision timeout and the script's Ready timeout.
 const PROVISION_SECS: u64 = 240;
-/// The generic service: a TCP listener from the base guest's own `socat`, as a non-root account the guest has. It
-/// answers every connection with a bare HTTP status line, because the host's readiness probe is HTTP-only (#732): an
-/// echo service (`PIPE`) answers the request with itself and can never read Ready. The command is split on spaces,
-/// so the status line is spelled with `${IFS}`, which the shell `socat` runs expands.
-const SERVICE_COMMAND: &str =
-    "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr SYSTEM:echo${IFS}HTTP/1.0${IFS}200${IFS}OK";
+/// The generic service: a TCP echo from the base guest's own `socat`, as a non-root account the guest has. It speaks no
+/// HTTP, so the daemon runs with the connect host check (`SANDY_ENV_VM_HOST_CHECK=connect`, #732): Ready means the
+/// service port accepted a connection through the bridge.
+const SERVICE_COMMAND: &str = "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr PIPE";
 /// The stub trust root's name (#733): the profiles' `credential` and `SANDYD_STUB_TRUST_ROOT`.
 /// The longest daemon `TMPDIR` the run's sockets still fit under. The longest socket name found in `impls/vm` is
 /// virtiofsd's `vfsd-sandy-secrets.sock` (23 bytes), so `/sandy/<36-char run id>/vfsd-sandy-secrets.sock` adds 67, and
@@ -354,6 +352,7 @@ impl Stack {
             )
             .env("SANDY_ENV_VM_COMMAND", SERVICE_COMMAND)
             .env("SANDY_ENV_VM_SERVICE_PORT", SERVICE_PORT)
+            .env("SANDY_ENV_VM_HOST_CHECK", "connect")
             .env("SANDY_ENV_VM_SERVICE_USER", SERVICE_USER)
             .env("SANDYD_STUB_TRUST_ROOT", STUB_ROOT)
             .env("SANDYD_STUB_CALL_LOG", &stub_log)

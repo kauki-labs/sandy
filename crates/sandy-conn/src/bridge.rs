@@ -93,6 +93,7 @@ impl Default for BridgeConfig {
 #[derive(Debug)]
 pub struct Bridge {
     addr: SocketAddr,
+    ready_dials: Arc<AtomicU64>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -129,9 +130,17 @@ impl Bridge {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let addr = listener.local_addr()?;
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(accept_loop(listener, Arc::new(dialer), config, stopped));
+        let ready_dials = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(accept_loop(
+            listener,
+            Arc::new(dialer),
+            config,
+            Arc::clone(&ready_dials),
+            stopped,
+        ));
         Ok(Self {
             addr,
+            ready_dials,
             stop: Some(stop),
             task: Some(task),
         })
@@ -142,6 +151,15 @@ impl Bridge {
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// How many dials to the guest relay have received [`PORT_RELAY_READY`] since the bridge started. The relay
+    /// writes that byte only after it connected to the guest service, so a count that grows after a client's first
+    /// byte proves the service port accepted a connection. The bridge dials only after a client's first byte, so a
+    /// client that connects and sends nothing never moves it.
+    #[must_use]
+    pub fn ready_dials(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.ready_dials)
     }
 
     /// Stop listening and close every live connection, including a client still waiting in its dial window.
@@ -172,6 +190,7 @@ async fn accept_loop<D: Dialer>(
     listener: TcpListener,
     dialer: Arc<D>,
     config: BridgeConfig,
+    ready_dials: Arc<AtomicU64>,
     mut stopped: oneshot::Receiver<()>,
 ) {
     let slots = Arc::new(Semaphore::new(config.max_connections));
@@ -202,8 +221,9 @@ async fn accept_loop<D: Dialer>(
         // Small interactive frames (a websocket) must not wait on Nagle.
         let _ = client.set_nodelay(true);
         let dialer = Arc::clone(&dialer);
+        let ready_dials = Arc::clone(&ready_dials);
         live.spawn(async move {
-            relay_one(client, &*dialer, config).await;
+            relay_one(client, &*dialer, config, &ready_dials).await;
             drop(slot);
         });
     }
@@ -213,7 +233,7 @@ async fn accept_loop<D: Dialer>(
 
 /// Relay one client: dial the guest relay inside the window, then copy both ways until either side closes. A dial
 /// that never succeeds closes this client only.
-async fn relay_one<D: Dialer>(client: TcpStream, dialer: &D, config: BridgeConfig) {
+async fn relay_one<D: Dialer>(client: TcpStream, dialer: &D, config: BridgeConfig, ready_dials: &AtomicU64) {
     // Dial only after the client's first byte: a connection that sends nothing then costs no guest connection and no
     // dial. `peek` leaves the byte in the socket for the copy to forward.
     let mut first = [0u8; 1];
@@ -228,6 +248,7 @@ async fn relay_one<D: Dialer>(client: TcpStream, dialer: &D, config: BridgeConfi
         tracing::debug!("the bridge gave up dialing the guest relay");
         return;
     };
+    ready_dials.fetch_add(1, Ordering::SeqCst);
     let _ = copy_until_idle(client, guest, config.idle_timeout).await;
 }
 
@@ -480,6 +501,45 @@ mod tests {
             echoes(&mut client, b"ping").await,
             "the echo must come back through the bridge"
         );
+        Ok(())
+    }
+
+    /// The count of ready dials is the proof that the guest service accepted a connection (#732): it moves only
+    /// after a client's first byte and a dial that got the ready byte.
+    #[tokio::test]
+    async fn the_ready_dial_count_moves_only_on_a_dial_that_got_the_ready_byte() -> anyhow::Result<()> {
+        let (dialer, _) = TcpDialer::new(echo_guest().await?);
+        let bridge = Bridge::start(dialer, config(8, 0)).await?;
+        let dials = bridge.ready_dials();
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "nothing dialed yet");
+
+        // A client that connects and sends nothing makes no dial.
+        let silent = TcpStream::connect(bridge.addr()).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "a silent client costs no dial");
+        drop(silent);
+
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        assert!(echoes(&mut client, b"a").await);
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "one dial got the ready byte");
+        let mut again = TcpStream::connect(bridge.addr()).await?;
+        assert!(echoes(&mut again, b"b").await);
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// A dial that never gets the ready byte is not counted, so a guest whose service is down never reads as up.
+    #[tokio::test]
+    async fn a_dial_that_never_gets_the_ready_byte_is_not_counted() -> anyhow::Result<()> {
+        let (dialer, _) = TcpDialer::failing(echo_guest().await?, u32::MAX);
+        let bridge = Bridge::start(dialer, config(8, 0)).await?;
+        let dials = bridge.ready_dials();
+        let mut client = TcpStream::connect(bridge.addr()).await?;
+        assert!(
+            closed_unanswered(&mut client).await?,
+            "the failed dial closes the client"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 0);
         Ok(())
     }
 

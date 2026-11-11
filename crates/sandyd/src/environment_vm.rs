@@ -123,7 +123,7 @@ fn spawn_bridge<D: Dialer>(
                 // Registered under the slot's lock, so a run that already ended registers nothing, and the
                 // bridge drops here instead.
                 guards.hold_if_open(|| {
-                    let registration = probe.register(&environment_id, bridge.addr());
+                    let registration = probe.register_bridge(&environment_id, bridge.addr(), bridge.ready_dials());
                     Box::new((registration, bridge))
                 })
             }
@@ -231,7 +231,7 @@ pub fn backend(settings: &crate::environment_backend::VmSettings, rt: tokio::run
     use sandy_conn::dial::VsockDialer;
     use sandy_environment::{ConsoleTaps, guarded};
 
-    let probe = Arc::new(HttpServiceProbe::new());
+    let probe = Arc::new(HttpServiceProbe::with_check(settings.host_check));
     // The console copy a failed provision reports (#727); vfkit has no console sink yet.
     let taps = Arc::new(ConsoleTaps::new());
     let per_env = {
@@ -426,7 +426,7 @@ pub fn vfkit_backend(
     let base = sandy_fsutil::ensure_sandy_staging_base().map_err(|e| format!("the staging base: {e}"))?;
     let setup = check_vfkit_setup(std::env::var_os("SANDY_VFKIT_BIN"), std::env::var_os("PATH"), base)
         .map_err(|e| e.to_string())?;
-    let probe = Arc::new(HttpServiceProbe::new());
+    let probe = Arc::new(HttpServiceProbe::with_check(settings.host_check));
     let sweep_base = setup.base.clone();
     let per_env = {
         let probe = Arc::clone(&probe);
@@ -496,6 +496,120 @@ mod tests {
             });
             Ok(host)
         }
+    }
+
+    /// A guest whose service speaks no HTTP: the ready byte (the relay connected to the service port), then it echoes.
+    struct EchoRelay;
+
+    impl Dialer for EchoRelay {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            let (host, mut guest) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let _ = guest.write_all(&[PORT_RELAY_READY]).await;
+                let mut buf = [0u8; 64];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(&mut guest, &mut buf).await {
+                    if n == 0 || guest.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(host)
+        }
+    }
+
+    /// A guest whose relay cannot reach the service: it closes without the ready byte, every time.
+    struct DownRelay;
+
+    impl Dialer for DownRelay {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            let (host, guest) = tokio::io::duplex(64);
+            drop(guest);
+            Ok(host)
+        }
+    }
+
+    /// Runs the real hook (a real bridge) over `dialer` for `id`, waits until the bridge is registered, and returns
+    /// one probe of it. Registered but not Ready is the answer a connect or HTTP check gives for a service it cannot
+    /// confirm.
+    async fn probe_once_registered<D: Dialer>(
+        check: sandy_environment::HostCheck,
+        id: &'static str,
+        dialer: D,
+    ) -> anyhow::Result<(Arc<HttpServiceProbe>, RunGuards, Probe)> {
+        let probe = Arc::new(HttpServiceProbe::with_check(check));
+        let guards = RunGuards::new();
+        let dialer = std::sync::Mutex::new(Some(dialer));
+        let hook = cid_hook(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&probe),
+            guards.clone(),
+            id.to_owned(),
+            move |_| {
+                dialer
+                    .lock()
+                    .map_err(|_| io::Error::other("poisoned"))?
+                    .take()
+                    .ok_or_else(|| io::Error::other("one dial"))
+            },
+        );
+        hook(id, 7);
+        let start = Instant::now();
+        loop {
+            let got = probe_off_runtime(&probe, id).await?;
+            if !matches!(&got, Probe::Starting { step } if step.contains("guest link")) {
+                return Ok((probe, guards, got));
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(5),
+                "the bridge was never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #732: a generic service that speaks no HTTP reaches Ready under the connect check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tcp_echo_service_is_ready_under_the_connect_check() -> anyhow::Result<()> {
+        let (_probe, _guards, got) =
+            probe_once_registered(sandy_environment::HostCheck::Connect, "env-1", EchoRelay).await?;
+        assert!(matches!(got, Probe::Ready { .. }), "{got:?}");
+        Ok(())
+    }
+
+    /// The same echo under the HTTP check (the default) never reads Ready: it answers no `HTTP/1.x NNN` line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tcp_echo_service_is_not_ready_under_the_http_check() -> anyhow::Result<()> {
+        let (_probe, _guards, got) =
+            probe_once_registered(sandy_environment::HostCheck::Http, "env-1", EchoRelay).await?;
+        assert!(matches!(got, Probe::Starting { ref step } if step == "boot"), "{got:?}");
+        Ok(())
+    }
+
+    /// The bridge listens and accepts at once, so a connect that succeeds proves nothing: with the service port
+    /// down (the relay never sends its ready byte) the connect check stays Starting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_service_the_relay_cannot_reach_is_not_ready_under_the_connect_check() -> anyhow::Result<()> {
+        let (_probe, _guards, got) =
+            probe_once_registered(sandy_environment::HostCheck::Connect, "env-1", DownRelay).await?;
+        assert!(matches!(got, Probe::Starting { ref step } if step == "boot"), "{got:?}");
+        Ok(())
+    }
+
+    /// An HTTP service is Ready under both checks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_http_service_is_ready_under_both_checks() -> anyhow::Result<()> {
+        for check in [
+            sandy_environment::HostCheck::Http,
+            sandy_environment::HostCheck::Connect,
+        ] {
+            let (_probe, _guards, got) = probe_once_registered(check, "env-1", FakeRelay).await?;
+            assert!(matches!(got, Probe::Ready { .. }), "{check:?}: {got:?}");
+        }
+        Ok(())
     }
 
     async fn probe_off_runtime(probe: &Arc<HttpServiceProbe>, id: &'static str) -> anyhow::Result<Probe> {
@@ -712,6 +826,7 @@ mod tests {
             command: vec!["t3".to_owned()],
             service_env: "{}".to_owned(),
             boot_timeout_secs: 5,
+            host_check: sandy_environment::HostCheck::default(),
         }
     }
 

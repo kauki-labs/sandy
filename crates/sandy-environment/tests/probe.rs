@@ -3,13 +3,17 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use sandy_api::environment::Probe;
-use sandy_environment::{HttpServiceProbe, ServiceProbe};
+use sandy_environment::{HostCheck, HttpServiceProbe, ServiceProbe};
 
 /// Answers one request with `reply` (split into two writes when `split`), then exits.
 fn serve_once(reply: &'static str, split: bool) -> Result<(SocketAddr, JoinHandle<()>)> {
@@ -223,5 +227,175 @@ fn the_probe_is_usable_as_a_vm_backends_service_probe() -> Result<()> {
         matches!(out, Probe::Starting { .. }),
         "an unregistered id is Starting: {out:?}"
     );
+    Ok(())
+}
+
+// ---- the host check mode (#732) ----------------------------------------------------------------------------------
+
+/// A stand-in for the host bridge in front of a guest service: it accepts, reads the client's first byte, and (when
+/// `dials`) counts one ready dial, as the real bridge does once the guest relay answers. It then sends `reply` and
+/// keeps the connection open for `hold`, so the probe sees the same silence a real bridge shows after a good dial.
+fn fake_bridge(
+    dials: bool,
+    reply: &'static [u8],
+    hold: Duration,
+) -> Result<(SocketAddr, Arc<AtomicU64>, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let counter = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&counter);
+    let t = std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut first = [0u8; 1];
+            if s.read(&mut first).is_ok_and(|n| n == 1) && dials {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = s.write_all(reply);
+            std::thread::sleep(hold);
+        }
+    });
+    Ok((addr, counter, t))
+}
+
+fn connect_probe(addr: SocketAddr, dials: &Arc<AtomicU64>) -> Result<Probe> {
+    let p = HttpServiceProbe::with_check(HostCheck::Connect);
+    let _registered = p.register_bridge("env-a", addr, Arc::clone(dials));
+    Ok(p.probe("env-a")?)
+}
+
+#[test]
+fn the_default_host_check_is_http() {
+    assert_eq!(HostCheck::default(), HostCheck::Http);
+}
+
+#[test]
+fn a_host_check_name_is_http_or_connect_and_anything_else_is_refused() {
+    assert_eq!("http".parse::<HostCheck>(), Ok(HostCheck::Http));
+    assert_eq!("connect".parse::<HostCheck>(), Ok(HostCheck::Connect));
+    for bad in ["", "tcp", "HTTP", "Connect", " connect", "http,connect", "0"] {
+        let err = bad.parse::<HostCheck>().expect_err(bad);
+        assert!(err.contains("http") && err.contains("connect"), "{bad:?}: {err}");
+    }
+}
+
+/// An echo service speaks no HTTP. Connect mode needs no answer, only a dial that got through.
+#[test]
+fn connect_mode_is_ready_on_a_tcp_echo_that_never_speaks_http() -> Result<()> {
+    let (addr, dials, t) = fake_bridge(true, b"x", Duration::from_millis(300))?;
+    let out = connect_probe(addr, &dials)?;
+    let Probe::Ready { endpoint } = out else {
+        anyhow::bail!("expected Ready, got {out:?}")
+    };
+    assert_eq!((endpoint.host.as_str(), endpoint.port), ("127.0.0.1", addr.port()));
+    t.join().map_err(|_| anyhow::anyhow!("server panicked"))?;
+    Ok(())
+}
+
+/// The same echo, HTTP mode: no `HTTP/1.x NNN` line, so not Ready.
+#[test]
+fn http_mode_on_the_same_echo_is_not_ready() -> Result<()> {
+    let (addr, _dials, t) = fake_bridge(true, b"x", Duration::from_millis(100))?;
+    let p = HttpServiceProbe::with_check(HostCheck::Http);
+    let _registered = p.register("env-a", addr);
+    assert!(matches!(p.probe("env-a")?, Probe::Starting { step } if step == "boot"));
+    t.join().map_err(|_| anyhow::anyhow!("server panicked"))?;
+    Ok(())
+}
+
+/// The bridge listens at once but dials only after a first byte, so an accepted connection proves nothing. No ready
+/// dial in the budget means Starting, and the probe does not outlast its budget.
+#[test]
+fn connect_mode_is_starting_while_the_bridge_has_not_got_a_dial_through() -> Result<()> {
+    let (addr, dials, t) = fake_bridge(false, b"", Duration::from_secs(3))?;
+    let start = Instant::now();
+    let out = connect_probe(addr, &dials)?;
+    assert!(matches!(out, Probe::Starting { ref step } if step == "boot"), "{out:?}");
+    assert!(
+        start.elapsed() < Duration::from_millis(2500),
+        "the probe kept to its budget"
+    );
+    t.join().map_err(|_| anyhow::anyhow!("server panicked"))?;
+    Ok(())
+}
+
+/// A dial that already got through is proof that the service port accepted, and the probe does not touch the
+/// service again: the driver probes every Ready environment each pass, so a repeat byte would reach the service for
+/// the environment's whole life (#748 review). Here nothing listens at the address at all.
+#[test]
+fn connect_mode_stays_ready_on_an_earlier_dial_without_touching_the_service() -> Result<()> {
+    let dials = Arc::new(AtomicU64::new(1));
+    let out = connect_probe("127.0.0.1:1".parse()?, &dials)?;
+    assert!(matches!(out, Probe::Ready { .. }), "{out:?}");
+    Ok(())
+}
+
+/// A dial that finished between two probes (a late success of the previous probe's byte) reads Ready at the next
+/// probe at once, without a new byte.
+#[test]
+fn connect_mode_sends_one_byte_only_while_no_dial_has_got_through() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let dials = Arc::new(AtomicU64::new(0));
+    // First probe: no dial gets through, so it connects and sends one byte, and reads Starting.
+    assert!(matches!(connect_probe(addr, &dials)?, Probe::Starting { .. }));
+    let (mut first, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return Err(e.into()),
+        }
+    };
+    first.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut byte = [0u8; 1];
+    assert_eq!(first.read(&mut byte)?, 1, "the first probe sent its one byte");
+    // The dial then succeeds late. The next probe reads Ready and opens no new connection.
+    dials.store(1, Ordering::SeqCst);
+    assert!(matches!(connect_probe(addr, &dials)?, Probe::Ready { .. }));
+    assert!(
+        matches!(listener.accept(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no second connection"
+    );
+    Ok(())
+}
+
+#[test]
+fn connect_mode_with_nothing_listening_is_starting() -> Result<()> {
+    let dials = Arc::new(AtomicU64::new(0));
+    assert!(matches!(connect_probe("127.0.0.1:1".parse()?, &dials)?, Probe::Starting { step } if step == "boot"));
+    Ok(())
+}
+
+#[test]
+fn connect_mode_without_a_registered_bridge_is_starting_for_the_guest_link() -> Result<()> {
+    let p = HttpServiceProbe::with_check(HostCheck::Connect);
+    assert!(matches!(p.probe("env-a")?, Probe::Starting { step } if step.contains("guest link")));
+    Ok(())
+}
+
+/// Connect mode must see the bridge's dial count. A plain address registration has none, so the probe cannot
+/// prove anything: that is an error, not a Ready.
+#[test]
+fn connect_mode_on_a_registration_without_a_dial_count_is_an_error() -> Result<()> {
+    let (addr, _dials, t) = fake_bridge(true, b"", Duration::from_millis(100))?;
+    let p = HttpServiceProbe::with_check(HostCheck::Connect);
+    let _registered = p.register("env-a", addr);
+    let err = p.probe("env-a").expect_err("must not read Ready without a dial count");
+    assert!(err.to_string().contains("dial"), "{err}");
+    drop(t);
+    Ok(())
+}
+
+/// An HTTP service answers fine in connect mode too: the mode asks only whether the service port accepted.
+#[test]
+fn connect_mode_is_also_ready_on_an_http_service() -> Result<()> {
+    let (addr, dials, t) = fake_bridge(
+        true,
+        b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
+        Duration::from_millis(300),
+    )?;
+    assert!(matches!(connect_probe(addr, &dials)?, Probe::Ready { .. }));
+    t.join().map_err(|_| anyhow::anyhow!("server panicked"))?;
     Ok(())
 }
