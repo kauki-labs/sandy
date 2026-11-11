@@ -19,7 +19,7 @@
 //! ```
 
 mod data_link;
-pub use data_link::{DataLinkViolation, MAX_TRANSFER_REASON_BYTES};
+pub use data_link::{DataLinkViolation, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, MAX_TRANSFER_REASON_BYTES};
 
 /// Generated protobuf types for `package sandy.executor.v1`.
 pub mod v1 {

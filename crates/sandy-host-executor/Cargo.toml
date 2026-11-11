@@ -49,6 +49,7 @@ tokio = { workspace = true, features = [
   "rt",
   "rt-multi-thread",
   "io-util",
+  "fs",
   "net",
   "signal",
 ] }
@@ -57,6 +58,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 sandy-test-support.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "macros",

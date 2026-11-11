@@ -54,6 +54,14 @@ pub enum DataLinkViolation {
 /// receiver logs or shows, so it is bounded, and the receiver still escapes control characters before printing it.
 pub const MAX_TRANSFER_REASON_BYTES: usize = 4096;
 
+/// The most file bytes one transfer may carry, in either direction (§22: the owner-decided local collect cap, applied
+/// to remote inputs as well). A receiver counts as bytes arrive: a file can grow between the Submit-time `stat` and
+/// the send.
+pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The most files one transfer may carry, in either direction.
+pub const MAX_TRANSFER_ENTRIES: usize = 100_000;
+
 impl DataLinkMessage {
     /// Checks the message against the limits §22 sets, before anything acts on it.
     ///
