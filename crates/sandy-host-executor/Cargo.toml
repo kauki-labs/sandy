@@ -44,6 +44,7 @@ sandy-impls-local.workspace = true
 sandy-impls-vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
   "rt",
@@ -59,7 +60,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 sandy-test-support.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "macros",

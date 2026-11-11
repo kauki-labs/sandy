@@ -1970,6 +1970,26 @@ demux. `encode_remote_link_prefix` has no version or tag byte, so a tag byte
 would break host-executors that already dial the agent link. Use a second
 token namespace for the data link instead.
 
+**Implementation, slices 3 to 5b.** `Dispatch.data_link_token` and
+`JobResult.outputs_follow` are on the wire (3). Submit mints a second
+`RemoteLink` on `JobChannel.data_link`, only for a host that declared `transfer` and a job that names inputs or
+outputs, and `mesh_accept` claims it by token, not by a tag (4). The host-executor's `input_pull` writes a validated
+transfer under a private root (5a, with the idle timeout, the entry budget that counts directories, and `Missing`).
+`handle_dispatch` wires it in (5b):
+
+- A non-empty `data_link_token` always means the host dials and pulls before the run, even for a job with outputs
+  only. The sender always sends `InputEnd`, with no input chunk when the job names no inputs; `Missing` passes with
+  an empty declared set. The host then never reads `Input.host`: the run's `Input` list points into the staging
+  root, with the declared name and guest path. An empty token is the decision 21 path-input behaviour.
+- The pull is bounded three ways: `PullLimits::idle` between frames, the job's cancel and deadline (a cancel ends the
+  pull as a cancel, before boot), and a total cap `INPUT_PULL_TOTAL_SECS` (30 minutes), because the deadline is
+  suspended while a client is attached and the idle gap alone lets a slow peer hold the sequential dispatch loop.
+- The staging root is a private directory under `std::env::temp_dir()`. It and the data link live in one value that
+  `handle_dispatch` holds across the run and drops after it, on every path. The link stays open because a data link
+  claims once: slice 6 sends the outputs back over it.
+- The host-executor still declares no `transfer` capability, so nothing reaches this path in production until the
+  sender (5c) and the Submit-side rule (7) exist.
+
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
 **Status:** accepted. **Upholds:** INV-1.

@@ -47,6 +47,11 @@ use sandy_impls_local::ProcessBackend;
 use sandy_impls_vm::QemuBackend;
 use serde::Deserialize;
 
+use crate::{
+    input_pull::PullLimits,
+    input_stage::{INPUT_PULL_TOTAL_SECS, StagedInputs, dial_data_link, stage_remote_inputs},
+};
+
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
 /// `SandboxKind::Process` dispatch: the manifest is a JSON array of strings,
 /// `argv[0]` first (the command and its arguments, nothing else).
@@ -499,6 +504,42 @@ pub enum HandleDispatchError {
     /// Launching or running the sandbox failed.
     #[error("running the sandbox: {0}")]
     Backend(#[from] BackendError),
+    /// `Dispatch.data_link_token` was neither empty nor exactly `REMOTE_LINK_TOKEN_LEN` bytes.
+    #[error("data_link_token is {0} bytes, expected {REMOTE_LINK_TOKEN_LEN} or none")]
+    InvalidDataLinkTokenLength(usize),
+    /// The inputs could not be pulled over the data link (#482). The job never booted: this is a transfer failure,
+    /// a cancel or a deadline during the pull, never a guest failure.
+    #[error("staging the inputs from the data link: {0}")]
+    DataLink(#[from] crate::input_stage::StageError),
+}
+
+/// Pull the dispatch's inputs over the data link, if it has one (#482, sandyd.md decision 22). `None` when the token
+/// is absent. Blocks on `rt`, so it runs on the blocking thread that runs the dispatch. The returned value owns the
+/// staging root and the link: keep it alive across the run and drop it after, on every path.
+fn stage_data_link_inputs(
+    dispatch: &Dispatch,
+    data_link_token: Option<&[u8; REMOTE_LINK_TOKEN_LEN]>,
+    forward_back: SocketAddr,
+    rt: &tokio::runtime::Handle,
+    mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
+    control: &RunControl,
+) -> Result<Option<StagedInputs>, HandleDispatchError> {
+    let Some(token) = data_link_token else {
+        return Ok(None);
+    };
+    let staged = rt.block_on(async {
+        let link = dial_data_link(forward_back, &dispatch.job_id, token, mesh_tls, control).await?;
+        stage_remote_inputs(
+            link,
+            &dispatch.inputs,
+            &std::env::temp_dir(),
+            control,
+            std::time::Duration::from_secs(INPUT_PULL_TOTAL_SECS),
+            PullLimits::default(),
+        )
+        .await
+    })?;
+    Ok(Some(staged))
 }
 
 /// Handle one [`Dispatch`]: decode its manifest, independently re-check the
@@ -570,6 +611,22 @@ pub fn handle_dispatch(
         .try_into()
         .map_err(|token: Vec<u8>| HandleDispatchError::InvalidLinkTokenLength(token.len()))?;
     let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
+    // Empty means no data link: the inputs, if any, are local paths (decision 21). Otherwise the host pulls them over
+    // the data link before the run (decision 22), and never reads `Input.host`.
+    let data_link_token: Option<[u8; REMOTE_LINK_TOKEN_LEN]> = if dispatch.data_link_token.is_empty() {
+        None
+    } else {
+        Some(
+            dispatch
+                .data_link_token
+                .clone()
+                .try_into()
+                .map_err(|token: Vec<u8>| HandleDispatchError::InvalidDataLinkTokenLength(token.len()))?,
+        )
+    };
+    // `rt` and `mesh_tls` move into `on_link` below; the data link dial needs its own.
+    let data_link_rt = rt.clone();
+    let data_link_tls = mesh_tls.clone();
 
     // A clone kept for the closure below: `control` itself is still needed
     // by reference for both `RunSpec` literals further down.
@@ -607,6 +664,15 @@ pub fn handle_dispatch(
             let decoded = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
             set_deadline_from_timeout_secs(&control, timeout_secs);
+            let staged = stage_data_link_inputs(
+                dispatch,
+                data_link_token.as_ref(),
+                forward_back,
+                &data_link_rt,
+                &data_link_tls,
+                &control,
+            )?;
+            let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -616,7 +682,7 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &dispatch.job_id,
                 command: &decoded.command,
-                inputs: &path_inputs,
+                inputs: run_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
                 env: &process_run_env(&decoded.env),
@@ -687,6 +753,17 @@ pub fn handle_dispatch(
                 sandy_guest_template::ResolvedTemplate::Prebuilt { path, _kept } => (path, Some(_kept)),
             };
 
+            // After flake resolution, so the pull starts when the run is about to: the sender's first frame is due
+            // within `PullLimits::idle` of the dial.
+            let staged = stage_data_link_inputs(
+                dispatch,
+                data_link_token.as_ref(),
+                forward_back,
+                &data_link_rt,
+                &data_link_tls,
+                &control,
+            )?;
+            let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let backend = QemuBackend::new().with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -696,7 +773,7 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &template,
                 command: &decoded.command,
-                inputs: &path_inputs,
+                inputs: run_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
                 env: &env,
@@ -1280,6 +1357,97 @@ mod tests {
             matches!(err, HandleDispatchError::UnsupportedBackend(backend)
                 if backend == i32::from(sandy_executor_proto::SandboxKind::Vm)),
             "expected UnsupportedBackend, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A `Process` dispatch whose manifest names a command that cannot start, so a run that is wrongly reached fails
+    /// at spawn at once and touches nothing. `data_token` is the dispatch's data link token.
+    fn process_dispatch_with_data_token(data_token: Vec<u8>, forward_back: &str) -> anyhow::Result<Dispatch> {
+        Ok(Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: serde_json::to_vec(&["/nonexistent/sandy-test-command"]).context("encoding the test manifest")?,
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Process.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: forward_back.to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: vec![sandy_executor_proto::Input {
+                host: "/submitter/path".to_string(),
+                name: "data".to_string(),
+                guest_path: None,
+            }],
+            outputs: Vec::new(),
+            secrets: Vec::new(),
+            data_link_token: data_token,
+        })
+    }
+
+    /// `handle_dispatch` blocks (it is called from `spawn_blocking` in production), so a test that reaches the data
+    /// link's `block_on` must run it on a blocking thread too.
+    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Outcome, HandleDispatchError>> {
+        let rt = tokio::runtime::Handle::current();
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        tokio::task::spawn_blocking(move || {
+            handle_dispatch(
+                &dispatch,
+                containment,
+                PathBuf::from("/nonexistent/sandy-agent"),
+                rt,
+                false,
+                sandy_api::backend::RunControl::with_timeout_secs(60),
+                test_mesh_tls_config(),
+            )
+        })
+        .await
+        .context("the blocking dispatch task")
+    }
+
+    /// A data link token that is not 32 bytes is refused up front, like a bad agent link token.
+    #[tokio::test]
+    async fn handle_dispatch_refuses_a_data_link_token_of_the_wrong_length() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(vec![7u8; 5], "127.0.0.1:9000")?;
+        let err = run_blocking(dispatch)
+            .await?
+            .expect_err("a short data link token must be refused");
+        assert!(
+            matches!(err, HandleDispatchError::InvalidDataLinkTokenLength(5)),
+            "expected InvalidDataLinkTokenLength(5), got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A non-empty data link token makes the host dial the data link BEFORE it runs anything: with nothing
+    /// listening, the dispatch fails as a data link error, not as a sandbox failure. The job never boots.
+    #[tokio::test]
+    async fn handle_dispatch_dials_the_data_link_before_it_runs() -> anyhow::Result<()> {
+        // A port that was just free and is now closed, so the dial is refused at once.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").context("bind")?;
+        let addr = closed.local_addr().context("local_addr")?;
+        drop(closed);
+
+        let dispatch = process_dispatch_with_data_token(vec![7u8; REMOTE_LINK_TOKEN_LEN], &addr.to_string())?;
+        let err = run_blocking(dispatch).await?.expect_err("the dial must fail");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::DataLink(crate::input_stage::StageError::Dial(_))
+            ),
+            "expected a data link dial error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// An empty data link token means no dial and today's behaviour: the dispatch goes straight to the run.
+    #[tokio::test]
+    async fn handle_dispatch_without_a_data_link_token_runs_as_before() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?;
+        let err = run_blocking(dispatch)
+            .await?
+            .expect_err("the nonexistent command cannot run");
+        assert!(
+            matches!(err, HandleDispatchError::Backend(_)),
+            "expected a backend error, got {err:?}"
         );
         Ok(())
     }
