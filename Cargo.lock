@@ -2636,6 +2636,7 @@ dependencies = [
  "sandy-executor-proto",
  "sandy-fabric",
  "sandy-fabric-local",
+ "sandy-fsutil",
  "sandy-guest-template",
  "sandy-impls-local",
  "sandy-impls-vm",
