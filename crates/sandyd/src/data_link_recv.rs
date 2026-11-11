@@ -65,7 +65,8 @@ pub struct Received {
     pub bytes: u64,
 }
 
-/// Why a receive failed. No variant carries a peer-chosen name or byte, and the peer is told a fixed text.
+/// Why a receive failed. No variant carries a peer-chosen byte. A peer-chosen name or reason reaches a variant only
+/// escaped (`Write`, `PeerError`). The peer is told a fixed text, never either.
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveError {
     /// Reading from the link failed.
@@ -104,12 +105,19 @@ pub enum ReceiveError {
     /// The transfer is past its entry cap.
     #[error("the transfer is past its entry cap")]
     TooManyEntries,
-    /// A destination could not be written without following a link, or a write failed.
+    /// A destination could not be written without following a link, or a write failed. The text is escaped: the
+    /// path in the underlying error can hold a name the peer chose, and an error is logged.
     #[error("writing an output: {0}")]
-    Write(#[from] sandy_fsutil::FsError),
+    Write(String),
     /// A file write failed.
     #[error("writing an output file: {0}")]
     Io(#[source] std::io::Error),
+}
+
+impl From<sandy_fsutil::FsError> for ReceiveError {
+    fn from(error: sandy_fsutil::FsError) -> Self {
+        Self::Write(error.to_string().chars().flat_map(char::escape_default).collect())
+    }
 }
 
 impl ReceiveError {
@@ -339,10 +347,11 @@ impl<'a> Receive<'a> {
             Some(declared) if key.1 == *declared => {
                 // The guest replaced the output directory with a file: it is the destination itself.
                 let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
-                    return Err(ReceiveError::Write(sandy_fsutil::FsError::Unsafe {
+                    return Err(sandy_fsutil::FsError::Unsafe {
                         path: dest.to_owned(),
                         reason: "a file output needs a destination with a file name".to_owned(),
-                    }));
+                    }
+                    .into());
                 };
                 Ok((parent.to_owned(), Vec::new(), name.to_string_lossy().into_owned()))
             }
@@ -633,6 +642,25 @@ mod tests {
         let (received, _peer) = run(&[chunk(0, "../escape", b"X"), end()], &outputs, quick(), false).await?;
         assert!(matches!(received, Err(ReceiveError::Violation(_))), "got {received:?}");
         assert!(!dest.path().parent().context("parent")?.join("escape").exists());
+        Ok(())
+    }
+
+    /// A name the peer chose reaches the error when the OS refuses it (a directory component past `NAME_MAX`), and
+    /// an error is logged: it must not print the peer's newline or control characters raw.
+    #[tokio::test]
+    async fn a_write_error_does_not_print_the_peers_name_raw() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let name = format!("{}\nINJECTED\u{1b}[31m/f", "d".repeat(300));
+        let (received, _peer) = run(&[chunk(0, &name, b"x"), end()], &outputs, quick(), false).await?;
+        let Err(error @ ReceiveError::Write(_)) = received else {
+            anyhow::bail!("expected a write error, got {received:?}");
+        };
+        let shown = error.to_string();
+        assert!(
+            !shown.chars().any(char::is_control),
+            "a control character reached the error text: {shown:?}"
+        );
         Ok(())
     }
 
