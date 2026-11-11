@@ -16,4 +16,5 @@ pub mod build_rev;
 pub mod capability;
 pub mod client_config;
 pub mod dispatch;
+pub mod input_pull;
 pub mod run;
