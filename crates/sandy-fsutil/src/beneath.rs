@@ -214,6 +214,32 @@ impl Beneath {
         Ok(file)
     }
 
+    /// Rename the entry `from` to `to` within this directory, replacing whatever is at `to` (a file, or a symlink,
+    /// which is replaced and never followed).
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`] (`to` is a directory, or
+    /// `from` is missing).
+    pub fn rename(&self, _from: &OsStr, _to: &OsStr) -> Result<(), FsError> {
+        Err(FsError::Unsafe {
+            path: self.path.clone(),
+            reason: "rename is not implemented".to_owned(),
+        })
+    }
+
+    /// Remove the file or symlink `name`. A symlink is removed, not followed. A directory is refused.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`].
+    pub fn remove_file(&self, _name: &OsStr) -> Result<(), FsError> {
+        Err(FsError::Unsafe {
+            path: self.path.clone(),
+            reason: "remove_file is not implemented".to_owned(),
+        })
+    }
+
     /// The target text of the symlink `name`. The host never follows it.
     ///
     /// # Errors
@@ -674,6 +700,75 @@ mod tests {
             Err(FsError::Unsafe { .. })
         ));
         assert_eq!(fs::read(victim)?, b"x");
+        Ok(())
+    }
+
+    /// A rename over a symlink replaces the link and never writes through it: the link's target is untouched.
+    #[test]
+    fn a_rename_replaces_a_symlink_without_following_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        let tree = dir.path().join("tree");
+        fs::create_dir(&tree)?;
+        symlink(&victim, tree.join("final"))?;
+        fs::write(tree.join("tmp"), b"new")?;
+        let held = Beneath::open_dir(&tree)?;
+
+        held.rename(name("tmp"), name("final")).context("rename")?;
+
+        assert_eq!(fs::read(tree.join("final"))?, b"new");
+        assert!(!fs::symlink_metadata(tree.join("final"))?.file_type().is_symlink());
+        assert_eq!(fs::read(&victim)?, b"HOST-SECRET");
+        assert!(!tree.join("tmp").exists(), "the source name is gone");
+        Ok(())
+    }
+
+    /// A rename over a directory fails and leaves both entries, and a name with a separator is refused.
+    #[test]
+    fn a_rename_refuses_a_directory_target_and_a_path_name() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir(dir.path().join("final"))?;
+        fs::write(dir.path().join("tmp"), b"x")?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        assert!(matches!(
+            held.rename(name("tmp"), name("final")),
+            Err(FsError::Io { .. })
+        ));
+        assert!(dir.path().join("final").is_dir());
+        assert!(dir.path().join("tmp").is_file());
+        assert!(matches!(
+            held.rename(name("tmp"), name("sub/x")),
+            Err(FsError::Unsafe { .. })
+        ));
+        assert!(matches!(
+            held.rename(name("../tmp"), name("x")),
+            Err(FsError::Unsafe { .. })
+        ));
+        Ok(())
+    }
+
+    /// Removing a symlink removes the link and leaves its target; a directory is refused.
+    #[test]
+    fn remove_file_removes_a_link_not_its_target_and_refuses_a_directory() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"HOST-SECRET")?;
+        symlink(&victim, dir.path().join("link"))?;
+        fs::write(dir.path().join("plain"), b"x")?;
+        fs::create_dir(dir.path().join("sub"))?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        held.remove_file(name("link")).context("remove the link")?;
+        held.remove_file(name("plain")).context("remove the file")?;
+
+        assert!(fs::symlink_metadata(dir.path().join("link")).is_err());
+        assert!(!dir.path().join("plain").exists());
+        assert_eq!(fs::read(&victim)?, b"HOST-SECRET");
+        assert!(matches!(held.remove_file(name("sub")), Err(FsError::Io { .. })));
+        assert!(dir.path().join("sub").is_dir());
+        assert!(matches!(held.remove_file(name("a/b")), Err(FsError::Unsafe { .. })));
         Ok(())
     }
 }
