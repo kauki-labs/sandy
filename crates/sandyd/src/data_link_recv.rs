@@ -17,14 +17,20 @@
 //!
 //! What this does NOT do: hold the job non-terminal until `OutputEnd` (6c), or send anything from the host (6b).
 
-use std::time::Duration;
-
-use sandy_control_proto::FrameError;
-#[allow(unused_imports, reason = "the stub receives nothing; the real receiver uses them")]
-use sandy_executor_proto::{
-    DataLinkMessage, DataLinkViolation, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, TransferError, data_link_message::Op,
+use std::{
+    collections::HashSet,
+    ffi::{OsStr, OsString},
+    path::Path,
+    time::Duration,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+
+use sandy_control_proto::{FrameError, read_frame, write_frame};
+use sandy_executor_proto::{
+    DataLinkMessage, DataLinkViolation, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, OutputChunk, TransferError,
+    data_link_message::Op,
+};
+use sandy_fsutil::beneath::Beneath;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
 /// The default longest gap between frames.
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(30);
@@ -122,17 +128,239 @@ impl ReceiveError {
     }
 }
 
+/// How long the best-effort `TransferError` back to the peer may take.
+const TELL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Receive the outputs of one job from `link` until `OutputEnd`, writing each file to its destination in `outputs`
 /// (the job's `Dispatch.outputs`, in order). On a failure other than a dead link, the peer gets a `TransferError`.
+///
+/// The file in flight is removed on every exit, including the future being dropped (a cancelled job).
 ///
 /// # Errors
 /// See [`ReceiveError`].
 pub async fn receive_outputs(
-    _link: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    _outputs: &[sandy_executor_proto::Output],
-    _limits: ReceiveLimits,
+    link: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    outputs: &[sandy_executor_proto::Output],
+    limits: ReceiveLimits,
 ) -> Result<Received, ReceiveError> {
-    Err(ReceiveError::Unexpected)
+    let mut receive = Receive::new(outputs, limits);
+    let result = pump(link, &mut receive).await;
+    let Err(error) = result else {
+        return result;
+    };
+    // The partial file goes first, so the peer's view and the disk agree when it hears of the failure.
+    drop(receive.current.take());
+    if !matches!(
+        error,
+        ReceiveError::Frame(_) | ReceiveError::Truncated | ReceiveError::Idle | ReceiveError::PeerError(_)
+    ) {
+        let reason = DataLinkMessage {
+            op: Some(Op::TransferError(TransferError {
+                reason: error.peer_reason().to_owned(),
+            })),
+        };
+        // Best effort: the peer may already be gone, and the original failure is what the caller needs.
+        let _ = tokio::time::timeout(TELL_TIMEOUT, write_frame(link, &reason)).await;
+    }
+    Err(error)
+}
+
+async fn pump(
+    link: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    receive: &mut Receive<'_>,
+) -> Result<Received, ReceiveError> {
+    loop {
+        let frame = tokio::time::timeout(receive.limits.idle, read_frame::<DataLinkMessage>(link))
+            .await
+            .map_err(|_| ReceiveError::Idle)??;
+        let message = frame.ok_or(ReceiveError::Truncated)?;
+        message.validate()?;
+        match message.op {
+            Some(Op::OutputChunk(chunk)) => receive.chunk(chunk).await?,
+            Some(Op::OutputEnd(_)) => {
+                receive.finish_file().await?;
+                return Ok(receive.received);
+            }
+            Some(Op::TransferError(error)) => {
+                return Err(ReceiveError::PeerError(
+                    error.reason.chars().flat_map(char::escape_default).collect(),
+                ));
+            }
+            _ => return Err(ReceiveError::Unexpected),
+        }
+    }
+}
+
+/// What one receive has done so far.
+struct Receive<'a> {
+    outputs: &'a [sandy_executor_proto::Output],
+    limits: ReceiveLimits,
+    received: Received,
+    /// Files plus the distinct directories created below a destination: what `max_entries` caps.
+    entries: usize,
+    dirs: HashSet<(u32, String)>,
+    /// Files already completed, by output index and wire name.
+    done: HashSet<(u32, String)>,
+    current: Option<InFlight>,
+    temp_seq: u64,
+}
+
+/// The file being received: written under a temp name in its final directory, renamed into place on completion,
+/// and removed on drop if it never completed.
+struct InFlight {
+    key: (u32, String),
+    dir: Beneath,
+    temp: OsString,
+    name: OsString,
+    file: tokio::fs::File,
+    committed: bool,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Through the held directory handle, so nothing is resolved again. The write that may still be in
+            // flight on a blocking thread goes to the now unlinked file.
+            let _ = self.dir.remove_file(&self.temp);
+        }
+    }
+}
+
+impl<'a> Receive<'a> {
+    fn new(outputs: &'a [sandy_executor_proto::Output], limits: ReceiveLimits) -> Self {
+        Self {
+            outputs,
+            limits,
+            received: Received { files: 0, bytes: 0 },
+            entries: 0,
+            dirs: HashSet::new(),
+            done: HashSet::new(),
+            current: None,
+            temp_seq: 0,
+        }
+    }
+
+    async fn chunk(&mut self, chunk: OutputChunk) -> Result<(), ReceiveError> {
+        let key = (chunk.output_index, chunk.name);
+        if self.current.as_ref().is_some_and(|c| c.key == key) {
+            if chunk.bytes.is_empty() {
+                return Err(ReceiveError::NoProgress);
+            }
+        } else {
+            self.finish_file().await?;
+            if self.done.contains(&key) {
+                return Err(ReceiveError::Reopened);
+            }
+            self.start_file(key).await?;
+        }
+        let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
+        let bytes = self.received.bytes.saturating_add(len);
+        if bytes > self.limits.max_bytes {
+            return Err(ReceiveError::TooManyBytes);
+        }
+        self.received.bytes = bytes;
+        let current = self.current.as_mut().ok_or(ReceiveError::Unexpected)?;
+        current.file.write_all(&chunk.bytes).await.map_err(ReceiveError::Io)?;
+        Ok(())
+    }
+
+    /// Complete the file in flight, if any: flush it and rename it into place.
+    async fn finish_file(&mut self) -> Result<(), ReceiveError> {
+        let Some(mut current) = self.current.take() else {
+            return Ok(());
+        };
+        current.file.flush().await.map_err(ReceiveError::Io)?;
+        current.dir.rename(&current.temp, &current.name)?;
+        current.committed = true;
+        self.done.insert(current.key.clone());
+        self.received.files += 1;
+        Ok(())
+    }
+
+    /// Open the destination directory beneath its root, creating what is missing, and a temp file in it.
+    async fn start_file(&mut self, key: (u32, String)) -> Result<(), ReceiveError> {
+        let (root, parts, name) = self.target(&key)?;
+        let mut dir = Beneath::create_dir_at(&root)?;
+        let mut prefix = String::new();
+        for part in &parts {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if self.dirs.insert((key.0, prefix.clone())) {
+                self.count_entry()?;
+            }
+            dir = dir.create_dir(OsStr::new(part))?;
+        }
+        self.count_entry()?;
+        let (temp, file) = loop {
+            self.temp_seq += 1;
+            let temp = OsString::from(format!(".sandy-recv-{}-{}", std::process::id(), self.temp_seq));
+            match dir.create_new_file(&temp) {
+                Ok(file) => break (temp, file),
+                // A stale name from a crashed receive: try the next one.
+                Err(sandy_fsutil::FsError::Unsafe { .. }) if self.temp_seq < 1000 => {}
+                Err(e) => return Err(e.into()),
+            }
+        };
+        self.current = Some(InFlight {
+            key,
+            dir,
+            temp,
+            name: OsString::from(name),
+            file: tokio::fs::File::from_std(file),
+            committed: false,
+        });
+        Ok(())
+    }
+
+    fn count_entry(&mut self) -> Result<(), ReceiveError> {
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            return Err(ReceiveError::TooManyEntries);
+        }
+        Ok(())
+    }
+
+    /// Where a chunk goes, pinned to local `collect_outputs`: the directory to open, the directories below it, and
+    /// the file name.
+    fn target(&self, key: &(u32, String)) -> Result<(std::path::PathBuf, Vec<String>, String), ReceiveError> {
+        let output = usize::try_from(key.0)
+            .ok()
+            .and_then(|i| self.outputs.get(i))
+            .ok_or(ReceiveError::BadIndex)?;
+        let dest = Path::new(&output.dest);
+        let split = |rel: &str| -> (Vec<String>, String) {
+            let mut parts: Vec<String> = rel.split('/').map(str::to_owned).collect();
+            let name = parts.pop().unwrap_or_default();
+            (parts, name)
+        };
+        match &output.name {
+            Some(declared) if key.1 == *declared => {
+                // The guest replaced the output directory with a file: it is the destination itself.
+                let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+                    return Err(ReceiveError::Write(sandy_fsutil::FsError::Unsafe {
+                        path: dest.to_owned(),
+                        reason: "a file output needs a destination with a file name".to_owned(),
+                    }));
+                };
+                Ok((parent.to_owned(), Vec::new(), name.to_string_lossy().into_owned()))
+            }
+            Some(declared) => {
+                let rel = key
+                    .1
+                    .strip_prefix(declared.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .ok_or(ReceiveError::NameMismatch)?;
+                let (parts, name) = split(rel);
+                Ok((dest.to_owned(), parts, name))
+            }
+            None => {
+                let (parts, name) = split(&key.1);
+                Ok((dest.to_owned(), parts, name))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

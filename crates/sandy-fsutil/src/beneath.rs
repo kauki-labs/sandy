@@ -219,8 +219,8 @@ impl Beneath {
     ///
     /// # Errors
     ///
-    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`] (`to` is a directory, or
-    /// `from` is missing).
+    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`] (`to` is a directory and
+    /// `from` is not, `to` is a non-empty directory, or `from` is missing).
     pub fn rename(&self, from: &OsStr, to: &OsStr) -> Result<(), FsError> {
         let from = component(from, &self.path)?;
         let to = component(to, &self.path)?;

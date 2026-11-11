@@ -2012,6 +2012,21 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   receiver refuses an index past the end of `Dispatch.outputs`, and checks that the name's first component is the
   named output's name. A sender that predates the field sends 0.
 
+### Slice 6a: the sandyd output receiver
+
+- `data_link_recv::receive_outputs` reads `OutputChunk`s until `OutputEnd` and writes them where local
+  `collect_outputs` would: a named output `N` with destination `D` writes `N/rel` to `D/rel` and a bare `N` to the
+  file `D`; a catch-all writes `rel` to `D/rel`. A test collects one tree locally and receives it, with a named
+  output and two catch-alls overlapping, and compares the destination trees.
+- Every write goes through `sandy_fsutil::Beneath`. A symlinked destination root, a symlinked directory below it,
+  and a symlink at the final name are never followed: the first two are refused, the last is replaced.
+- Each file is written under a temp name in its final directory and renamed into place, so a reader never sees a
+  partial file. A failure, or the future being dropped, removes only the file in flight; completed files stay, as
+  local collection is best-effort per file. Files are `0600`, not the umask default local collection gives.
+- The receiver refuses an index past `Dispatch.outputs`, a name outside its named output, a file that arrives twice
+  (outputs carry no offset), an empty chunk after data or repeated, a message that is not an output message, and a
+  transfer past the byte, entry or idle limit. The peer is told a fixed text.
+
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
 **Status:** accepted. **Upholds:** INV-1.
