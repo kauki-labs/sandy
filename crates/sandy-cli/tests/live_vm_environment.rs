@@ -93,7 +93,15 @@ fn sandyd_bin() -> anyhow::Result<PathBuf> {
     }
     let sandy = PathBuf::from(env!("CARGO_BIN_EXE_sandy"));
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "sandyd", "--bin", "sandyd"])
+        .args([
+            "build",
+            "-p",
+            "sandyd",
+            "--bin",
+            "sandyd",
+            "--features",
+            "stub-trust-root",
+        ])
         .arg("--manifest-path")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
         .status()
@@ -197,7 +205,8 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
     std::fs::create_dir(&tmp)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
     let sock = dir.path().join("sandyd.sock");
-    // A create needs a registry naming the profile (#704); the service guest never mints, so the entry is a stand-in.
+    // A create needs a registry naming the profile (#704); the stub trust root named by `SANDYD_STUB_TRUST_ROOT` backs
+    // its credential (a feature-gated build of sandyd).
     let profiles = dir.path().join("profiles.json");
     std::fs::write(
         &profiles,
@@ -210,6 +219,7 @@ async fn a_vm_environment_becomes_ready_answers_http_and_leaves_nothing_after_de
             .env("TMPDIR", &tmp)
             .env("SANDY_DB", dir.path().join("sandyd.db"))
             .env("SANDY_PROFILES", &profiles)
+            .env("SANDYD_STUB_TRUST_ROOT", "live")
             .env("SANDY_ENV_BACKEND", "vm-qemu")
             .env(
                 "SANDY_ENV_VM_TEMPLATE",
