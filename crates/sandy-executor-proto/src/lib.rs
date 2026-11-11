@@ -592,7 +592,8 @@ mod tests {
 
     /// The data-link token is a second bearer secret (INV-1, #482): `Debug` prints its length only.
     #[test]
-    fn dispatch_debug_redacts_the_data_link_token() {
+    fn dispatch_debug_redacts_the_data_link_token() -> anyhow::Result<()> {
+        use anyhow::Context;
         let marker = b"sandy-data-link-token-leak-marker";
         let dispatch = Dispatch {
             job_id: "job-1".to_owned(),
@@ -600,12 +601,14 @@ mod tests {
             ..Dispatch::default()
         };
         let rendered = format!("{dispatch:?}");
-        assert!(!rendered.contains(std::str::from_utf8(marker).unwrap()), "{rendered}");
+        let text = std::str::from_utf8(marker).context("the marker is UTF-8")?;
+        assert!(!rendered.contains(text), "{rendered}");
         assert!(
             !rendered.contains(&format!("{:?}", marker.to_vec())),
             "the numeric byte array leaked: {rendered}"
         );
         assert!(rendered.contains("data_link_token"), "{rendered}");
+        Ok(())
     }
 
     /// A Dispatch or JobResult from a sender that predates the data link decodes as "no data link, no outputs
