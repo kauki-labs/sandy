@@ -16,6 +16,7 @@ pub mod attach_relay;
 pub mod audit;
 pub mod build_rev;
 pub mod credential;
+pub mod data_link_send;
 pub mod dispatch;
 pub mod environment;
 pub mod environment_backend;
