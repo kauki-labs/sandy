@@ -11,15 +11,21 @@
 use std::{io, net::SocketAddr, path::Path, time::Duration};
 
 use sandy_api::backend::{Input, RunControl};
-use sandy_executor_proto::REMOTE_LINK_TOKEN_LEN;
-use tokio::io::{AsyncRead, AsyncWrite};
+use sandy_executor_proto::{REMOTE_LINK_TOKEN_LEN, encode_remote_link_prefix};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::input_pull::{PullError, PullLimits};
+use crate::input_pull::{PullError, PullLimits, pull_inputs};
 
 /// The most time the whole input pull may take. `PullLimits::idle` bounds the gap between frames, and the job's
 /// deadline can be suspended while a client is attached, so neither bounds the pull as a whole: a peer that sends a
 /// frame every 29 s would otherwise hold this host's sequential dispatch loop for as long as it likes.
 pub const INPUT_PULL_TOTAL_SECS: u64 = 1800;
+
+/// How long the dial of the data link may take.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the pull re-checks the job's control: a cancel or a deadline has no way to wake an await.
+const CONTROL_POLL: Duration = Duration::from_millis(100);
 
 /// Why the inputs could not be staged. Every variant means the job never booted.
 #[derive(Debug, thiserror::Error)]
@@ -61,12 +67,33 @@ pub struct StagedInputs {
 /// # Errors
 /// [`StageError::Dial`] if the dial, the handshake or the prefix write fails or times out.
 pub async fn dial_data_link(
-    _forward_back: SocketAddr,
-    _job_id: &str,
-    _data_token: &[u8; REMOTE_LINK_TOKEN_LEN],
-    _mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
+    forward_back: SocketAddr,
+    job_id: &str,
+    data_token: &[u8; REMOTE_LINK_TOKEN_LEN],
+    mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
 ) -> Result<Box<dyn sandy_conn::Conn>, StageError> {
-    Err(StageError::Dial("not implemented".to_owned()))
+    // The prefix is the claim: the orchestrator's accept loop tells the data link from the agent link by the token.
+    // Neither an error nor a log line below carries it.
+    let prefix = encode_remote_link_prefix(job_id, data_token).map_err(|e| StageError::Dial(e.to_string()))?;
+    let mut link = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        sandy_conn::connect_tls(
+            forward_back,
+            &mesh_tls.identity,
+            mesh_tls.orchestrator_fingerprint,
+            Some(sandy_conn::TcpKeepalive::HALF_OPEN_DETECTION),
+        ),
+    )
+    .await
+    .map_err(|_| StageError::Dial(format!("dialing {forward_back} timed out after {DIAL_TIMEOUT:?}")))?
+    .map_err(|e| StageError::Dial(e.to_string()))?;
+    link.write_all(&prefix)
+        .await
+        .map_err(|e| StageError::Dial(format!("writing the link prefix: {e}")))?;
+    link.flush()
+        .await
+        .map_err(|e| StageError::Dial(format!("writing the link prefix: {e}")))?;
+    Ok(link)
 }
 
 /// Pull the declared `inputs` from `link` into a fresh private root under `parent`.
@@ -76,17 +103,60 @@ pub async fn dial_data_link(
 /// # Errors
 /// See [`StageError`]. The root is gone on every error.
 pub async fn stage_remote_inputs<C>(
-    _link: C,
-    _inputs: &[sandy_executor_proto::Input],
-    _parent: &Path,
-    _control: &RunControl,
-    _total_cap: Duration,
-    _limits: PullLimits,
+    mut link: C,
+    inputs: &[sandy_executor_proto::Input],
+    parent: &Path,
+    control: &RunControl,
+    total_cap: Duration,
+    limits: PullLimits,
 ) -> Result<StagedInputs, StageError>
 where
     C: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    Err(StageError::Pull(PullError::Truncated))
+    if inputs.iter().any(|input| input.name.is_empty()) {
+        return Err(StageError::UnnamedInput);
+    }
+    let root = tempfile::Builder::new()
+        .prefix("sandy-inputs-")
+        .tempdir_in(parent)
+        .map_err(StageError::Root)?;
+    let names: Vec<String> = inputs.iter().map(|input| input.name.clone()).collect();
+
+    // `root` drops, and removes the directory, on every early return below.
+    tokio::select! {
+        pulled = pull_inputs(&mut link, &names, root.path(), limits) => {
+            pulled?;
+        }
+        ended = control_ended(control) => return Err(ended),
+        () = tokio::time::sleep(total_cap) => return Err(StageError::TotalCapExceeded),
+    }
+
+    let inputs = inputs
+        .iter()
+        .map(|input| Input {
+            host: root.path().join(&input.name),
+            name: input.name.clone(),
+            guest_path: input.guest_path.as_deref().map(std::path::PathBuf::from),
+        })
+        .collect();
+    Ok(StagedInputs {
+        inputs,
+        _root: root,
+        _link: Box::new(link),
+    })
+}
+
+/// Resolves once `control` is cancelled or its live deadline has passed. A suspended deadline never ends it.
+async fn control_ended(control: &RunControl) -> StageError {
+    loop {
+        if control.is_cancelled() {
+            return StageError::Cancelled;
+        }
+        if control.timed_out() {
+            return StageError::DeadlinePassed;
+        }
+        tokio::time::sleep(CONTROL_POLL).await;
+    }
 }
 
 #[cfg(test)]
