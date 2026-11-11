@@ -47,6 +47,11 @@ use sandy_impls_local::ProcessBackend;
 use sandy_impls_vm::QemuBackend;
 use serde::Deserialize;
 
+use crate::{
+    input_pull::PullLimits,
+    input_stage::{INPUT_PULL_TOTAL_SECS, StagedInputs, dial_data_link, stage_remote_inputs},
+};
+
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
 /// `SandboxKind::Process` dispatch: the manifest is a JSON array of strings,
 /// `argv[0]` first (the command and its arguments, nothing else).
@@ -508,6 +513,35 @@ pub enum HandleDispatchError {
     DataLink(#[from] crate::input_stage::StageError),
 }
 
+/// Pull the dispatch's inputs over the data link, if it has one (#482, sandyd.md decision 22). `None` when the token
+/// is absent. Blocks on `rt`, so it runs on the blocking thread that runs the dispatch. The returned value owns the
+/// staging root and the link: keep it alive across the run and drop it after, on every path.
+fn stage_data_link_inputs(
+    dispatch: &Dispatch,
+    data_link_token: Option<&[u8; REMOTE_LINK_TOKEN_LEN]>,
+    forward_back: SocketAddr,
+    rt: &tokio::runtime::Handle,
+    mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
+    control: &RunControl,
+) -> Result<Option<StagedInputs>, HandleDispatchError> {
+    let Some(token) = data_link_token else {
+        return Ok(None);
+    };
+    let staged = rt.block_on(async {
+        let link = dial_data_link(forward_back, &dispatch.job_id, token, mesh_tls).await?;
+        stage_remote_inputs(
+            link,
+            &dispatch.inputs,
+            &std::env::temp_dir(),
+            control,
+            std::time::Duration::from_secs(INPUT_PULL_TOTAL_SECS),
+            PullLimits::default(),
+        )
+        .await
+    })?;
+    Ok(Some(staged))
+}
+
 /// Handle one [`Dispatch`]: decode its manifest, independently re-check the
 /// isolation class (defense in depth, #269 — never trust the orchestrator's
 /// placement decision alone), launch the sandbox (a trusted process, or
@@ -577,6 +611,22 @@ pub fn handle_dispatch(
         .try_into()
         .map_err(|token: Vec<u8>| HandleDispatchError::InvalidLinkTokenLength(token.len()))?;
     let prefix = sandy_executor_proto::encode_remote_link_prefix(&dispatch.job_id, &link_token)?;
+    // Empty means no data link: the inputs, if any, are local paths (decision 21). Otherwise the host pulls them over
+    // the data link before the run (decision 22), and never reads `Input.host`.
+    let data_link_token: Option<[u8; REMOTE_LINK_TOKEN_LEN]> = if dispatch.data_link_token.is_empty() {
+        None
+    } else {
+        Some(
+            dispatch
+                .data_link_token
+                .clone()
+                .try_into()
+                .map_err(|token: Vec<u8>| HandleDispatchError::InvalidDataLinkTokenLength(token.len()))?,
+        )
+    };
+    // `rt` and `mesh_tls` move into `on_link` below; the data link dial needs its own.
+    let data_link_rt = rt.clone();
+    let data_link_tls = mesh_tls.clone();
 
     // A clone kept for the closure below: `control` itself is still needed
     // by reference for both `RunSpec` literals further down.
@@ -614,6 +664,15 @@ pub fn handle_dispatch(
             let decoded = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
             set_deadline_from_timeout_secs(&control, timeout_secs);
+            let staged = stage_data_link_inputs(
+                dispatch,
+                data_link_token.as_ref(),
+                forward_back,
+                &data_link_rt,
+                &data_link_tls,
+                &control,
+            )?;
+            let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -623,7 +682,7 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &dispatch.job_id,
                 command: &decoded.command,
-                inputs: &path_inputs,
+                inputs: run_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
                 env: &process_run_env(&decoded.env),
@@ -694,6 +753,17 @@ pub fn handle_dispatch(
                 sandy_guest_template::ResolvedTemplate::Prebuilt { path, _kept } => (path, Some(_kept)),
             };
 
+            // After flake resolution, so the pull starts when the run is about to: the sender's first frame is due
+            // within `PullLimits::idle` of the dial.
+            let staged = stage_data_link_inputs(
+                dispatch,
+                data_link_token.as_ref(),
+                forward_back,
+                &data_link_rt,
+                &data_link_tls,
+                &control,
+            )?;
+            let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let backend = QemuBackend::new().with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -703,7 +773,7 @@ pub fn handle_dispatch(
                 egress: None,
                 template: &template,
                 command: &decoded.command,
-                inputs: &path_inputs,
+                inputs: run_inputs,
                 outputs: &path_outputs,
                 secrets: &path_secrets,
                 env: &env,
