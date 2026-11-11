@@ -1988,7 +1988,20 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   `handle_dispatch` holds across the run and drops after it, on every path. The link stays open because a data link
   claims once: slice 6 sends the outputs back over it.
 - The host-executor still declares no `transfer` capability, so nothing reaches this path in production until the
-  sender (5c) and the Submit-side rule (7) exist.
+  Submit-side rule (7) exists.
+
+### Slice 5c: the sandyd sender
+
+- `JobChannel.data_inputs` holds the dispatched path inputs when the data link is minted. `mesh_accept` runs
+  `data_link_send::send_inputs` on a claimed data link, writes the result to the log, and closes. Slice 6 keeps the
+  link open for the outputs.
+- The send reads through `sandy_fsutil::beneath` (`O_NOFOLLOW` per directory), on a blocking thread behind a bounded
+  channel. A symlink inside an input is refused (`Symlink`), not followed. A socket, fifo or device is
+  `UnsupportedEntry`. An input with no file is `EmptyInput`, because the receiver would end with `Missing`.
+- Chunks are at most `MAX_CHUNK_BYTES`, in order from offset 0, and never empty after data. A zero-byte file is one
+  empty chunk. Entries count files plus the distinct directories their names imply, as the receiver counts them.
+- Each frame write has a 30 s timeout. A failure other than a dead link sends a `TransferError` with a fixed reason
+  and no path. A dead link ends the send with `Link`, and dropping the channel stops the reader.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 

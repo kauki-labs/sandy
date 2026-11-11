@@ -76,6 +76,7 @@ anyhow.workspace = true
 # The handler tests tamper with caps through `Cap::proof_mut`/`scope_mut`, which exist only
 # with this feature (#385). A dev-dependency feature is not enabled in a normal build.
 sandy-fabric = { workspace = true, features = ["contract-tests"] }
+sandy-host-executor.workspace = true
 sandy-test-support.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
