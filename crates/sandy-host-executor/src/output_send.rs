@@ -482,43 +482,55 @@ mod tests {
         Ok(())
     }
 
-    /// A symlink inside a staged tree is refused, not followed, and the peer is told a fixed text with no path.
+    /// Local collection skips a symlink and a special file and delivers the rest, so one in a guest's output must not
+    /// abort the transfer: the entry is skipped, never opened (so never followed), and every other file arrives.
     #[tokio::test]
-    async fn a_symlink_in_a_staged_tree_is_refused_and_not_followed() -> anyhow::Result<()> {
+    async fn a_symlink_or_a_socket_in_a_staged_tree_is_skipped_and_the_rest_arrives() -> anyhow::Result<()> {
         let base = tempfile::tempdir().context("base")?;
         let victim = base.path().join("victim");
         write(&victim, b"HOST-SECRET")?;
+        let victim_dir = base.path().join("victim-dir");
+        write(&victim_dir.join("inside"), b"HOST-SECRET-TOO")?;
         let root = base.path().join("root");
         write(&root.join("ok.txt"), b"ok")?;
-        symlink(&victim, root.join("link")).context("link")?;
+        write(&root.join("sub/also.txt"), b"also")?;
+        symlink(&victim, root.join("file-link")).context("file link")?;
+        symlink(&victim_dir, root.join("dir-link")).context("dir link")?;
+        symlink(&victim, root.join("sub/nested-link")).context("nested link")?;
+        let _listener = UnixListener::bind(root.join("sock")).context("bind")?;
 
         let (sent, messages) = frames(&[src(None, &root)], SendLimits::default()).await?;
-        assert!(matches!(sent, Err(SendError::Symlink)), "got {sent:?}");
-        assert!(
-            chunks(&messages).iter().all(|(_, _, b)| b != b"HOST-SECRET"),
-            "the link's target must not be sent"
+        assert_eq!(sent.context("the send")?, Sent { files: 2, bytes: 6 });
+        assert_eq!(
+            sorted(chunks(&messages)),
+            vec![
+                (0, "ok.txt".to_owned(), b"ok".to_vec()),
+                (0, "sub/also.txt".to_owned(), b"also".to_vec()),
+            ]
         );
-        let Some(Op::TransferError(e)) = messages.last().and_then(|m| m.op.as_ref()) else {
-            anyhow::bail!("expected a TransferError last, got {messages:?}");
-        };
-        assert_eq!(e.reason, "an output holds a symlink");
-
-        // A root that is itself a symlink is refused too.
-        let root_link = base.path().join("root-link");
-        symlink(&root, &root_link).context("root link")?;
-        let (sent, _) = frames(&[src(None, &root_link)], SendLimits::default()).await?;
-        assert!(matches!(sent, Err(SendError::Source(_))), "got {sent:?}");
+        assert!(
+            ends_with_one_output_end(&messages),
+            "a skipped entry must not end the transfer in an error: {messages:?}"
+        );
         Ok(())
     }
 
-    /// A socket in a staged tree has no wire form: refused.
+    /// A staged root that is itself a symlink or a special file is skipped like any other entry: that output sends
+    /// nothing and the other outputs still arrive.
     #[tokio::test]
-    async fn a_socket_in_a_staged_tree_is_unsupported() -> anyhow::Result<()> {
-        let root = tempfile::tempdir().context("root")?;
-        write(&root.path().join("ok.txt"), b"ok")?;
-        let _listener = UnixListener::bind(root.path().join("sock")).context("bind")?;
-        let (sent, _) = frames(&[src(None, root.path())], SendLimits::default()).await?;
-        assert!(matches!(sent, Err(SendError::UnsupportedEntry)), "got {sent:?}");
+    async fn a_symlinked_staged_root_is_skipped_and_the_other_outputs_arrive() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("base")?;
+        let real = base.path().join("real");
+        write(&real.join("x.txt"), b"HOST-SECRET")?;
+        let root_link = base.path().join("root-link");
+        symlink(&real, &root_link).context("root link")?;
+        let good = base.path().join("good");
+        write(&good.join("y.txt"), b"y")?;
+
+        let (sent, messages) = frames(&[src(None, &root_link), src(None, &good)], SendLimits::default()).await?;
+        assert_eq!(sent.context("the send")?.files, 1);
+        assert_eq!(sorted(chunks(&messages)), vec![(1, "y.txt".to_owned(), b"y".to_vec())]);
+        assert!(ends_with_one_output_end(&messages));
         Ok(())
     }
 
