@@ -9,7 +9,10 @@
 //! What this does NOT do: dial the link, create the staging root, build the `Input` list for `stage_inputs`, or
 //! remove the root on teardown. The caller (`handle_dispatch`, a later slice) owns all four.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::Path,
+};
 
 use sandy_control_proto::{read_frame, write_frame};
 use sandy_executor_proto::{
@@ -139,9 +142,11 @@ async fn pull(
     root: &Path,
     limits: PullLimits,
 ) -> Result<PulledInputs, PullError> {
+    // A set, not the slice: every chunk checks its name, and the declared list can be long.
+    let declared_set: HashSet<&str> = declared.iter().map(String::as_str).collect();
     let mut pull = Pull {
         root,
-        declared,
+        declared: &declared_set,
         limits,
         files: 0,
         bytes: 0,
@@ -183,7 +188,7 @@ struct OpenFile {
 
 struct Pull<'a> {
     root: &'a Path,
-    declared: &'a [String],
+    declared: &'a HashSet<&'a str>,
     limits: PullLimits,
     files: usize,
     bytes: u64,
@@ -194,8 +199,13 @@ struct Pull<'a> {
 impl Pull<'_> {
     async fn chunk(&mut self, chunk: InputChunk) -> Result<(), PullError> {
         let first = chunk.name.split('/').next().unwrap_or_default();
-        if !self.declared.iter().any(|name| name == first) {
+        if !self.declared.contains(first) {
             return Err(PullError::Undeclared);
+        }
+        // An empty chunk is a zero-byte file's one chunk, which opens the file. For the file already open it moves
+        // no counter, so nothing would ever stop a stream of them.
+        if chunk.bytes.is_empty() && self.current.as_ref().is_some_and(|open| open.name == chunk.name) {
+            return Err(PullError::NoProgress);
         }
         let len = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
         self.bytes = self.bytes.saturating_add(len);
