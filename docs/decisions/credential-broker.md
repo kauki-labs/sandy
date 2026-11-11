@@ -68,8 +68,9 @@ The broker's mode B for a GitHub installation token fits the existing path and n
 
 - `sandyd` leases the token, stages it as today, and releases the lease at teardown. The broker's ledger and probe
   replace sandy's own best-effort revoke.
-- Renewal for an environment (decision 38) is a lease renewal. The order of decision 38 holds: stage the new token,
-  then release the old lease. A failed renewal keeps the old token and does not release it.
+- Renewal for an environment (decision 38) is a new mint with a new lease id, since a GitHub token cannot be extended.
+  The order of decision 38 holds: stage the new token, then release the old lease, so the renewal carries both lease
+  ids. A failed renewal keeps the old token and does not release it.
 - Cost: the token is in the guest again. A hostile job can still send it out until it expires or the broker revokes it.
   #745 (the vfkit guest can overwrite its staged token, which weakens the redactor) is unchanged for this mode. The
   gain is real but narrow: the App key is out of sandy, the lease is scoped to the run's repositories, and revocation
@@ -82,17 +83,31 @@ This is the mode that closes the exfiltration. It works without any sandy compon
 - **Path.** The guest tool talks to the broker's proxy directly. Traffic leaves through the guest relay and the egress
   proxy as a CONNECT to the broker host on 443, and TLS runs from the guest to the broker. The egress proxy stays a
   CONNECT filter ([`egress-proxy.md`](egress-proxy.md) decision 4 stands). The broker host joins the run's egress
-  allow-list; `github.com` need not be reachable for the actions the broker serves.
-- **Guest tooling.** The guest holds a capability and the broker base URL, not a token. Git is pointed at the broker
-  with `url.<base>.insteadOf` set through `GIT_CONFIG_COUNT` environment variables; the guest `gh` wrapper and
-  `git-credential-sandy-gh` present the capability. Each client is its own slice and its own live row: a client that
-  cannot take a base URL gets no credential. It does not fall back to anything weaker.
+  allow-list. The proxy's address filter refuses private ranges, CGNAT `100.64/10` and loopback unless the allow-list
+  names the IP; a broker on a tailnet or private network therefore needs an `ip:443` entry, and a public hostname does
+  not.
+- **Guest tooling.** The guest holds a capability and the broker base URL, not a token. Each client is its own slice and
+  its own live row: a client that cannot take a base URL gets no credential. It does not fall back to anything weaker.
+  - `git`: pointed at the broker with `url.<base>.insteadOf`, set through `GIT_CONFIG_COUNT` environment variables and
+    scoped to the run's target repositories, not to all of `https://github.com/`. A broad rewrite would send public
+    clones, flake inputs and cargo git dependencies to the broker, which denies by default. `git` can present the
+    client certificate itself (`http.<url>.sslCert` and `sslKey`). So `github.com` stays reachable for other traffic
+    only if the run's allow-list names it.
+  - `gh`: the broker denies GraphQL (broker block 5), and `gh pr create`, `gh pr view` and `gh pr list` use GraphQL.
+    Only REST-based commands (`gh api` and a few others) can pass. As far as I know `gh` has no client-certificate
+    option, so the `gh` wrapper needs a guest-local shim that adds the certificate, which is a new guest component.
+    The `gh` slice must name the commands that survive and fail its live row on the rest. A later broker decision
+    about GraphQL would change this.
 - **Guest identity.** The broker binds a capability to a client certificate. A microVM guest has none of its own. The
   recommended shape is a per-run certificate issued for the run and revoked at its end, which the guest holds. A guest
   can then use its capability and certificate for one action on one target until expiry; it cannot use the broker for
-  anything else, and it holds no repository-wide token. This leaves a credential in the guest, a narrower one. It is the
-  broker's decision whether `sandyd` may request a per-run certificate for a runner id. Needs an answer from the broker
-  repo before this slice.
+  anything else, and it holds no repository-wide token. This leaves a credential in the guest, a narrower one. The broker
+  already treats a sandy microVM as a runner (`mtls-runner-identity`, and its acceptance 2 has the runner hold the mode
+  A capability), so the question for the broker is one: who is the runner identity, and how does a guest get its
+  certificate. Issuance needs a constraint: block 2 maps any subject that matches the allowed pattern to a policy, so a
+  stolen `sandyd` that may issue any subject in the pattern chooses its own policy. Either the broker issues the child
+  certificate after its own policy check, or the pattern is pinned to a `sandyd`-bound prefix. Needs an answer from the
+  broker repo before this slice.
 - **Set aside.** A host relay that takes plain HTTP from the guest over vsock and adds the mTLS to the broker. It reads
   guest plaintext, which the owner ruled out (answer 3). A TLS-intercepting proxy mode, ruled out earlier.
 - This mode depends on broker blocks 2, 4 and 5, none of which exist.
@@ -115,10 +130,13 @@ reads a request only because the guest addressed it as the endpoint.
 - **Broker unreachable or denying at mint:** the run is refused, no partial state (decision 37).
 - **Renewal fails:** as decision 38. The old token stays until it expires; the credential path fails then.
 - **Release fails:** the broker marks the runner revoke-failed and denies it new leases, retries, and alerts (REQ-7).
-  If `sandyd` is one runner, a single failed release stops every run on the host. The runner identity must therefore be
-  per run, or per profile, not per host. This is an open point for the broker, owner decision 3 below.
+  If `sandyd` is one runner, a single failed release stops every run on the host, so the identity must not be per host.
+  A per-run identity is already ending when its release fails, so the lockout protects nothing there; per profile is the
+  useful middle. This is an open point for the broker, owner decision 3 below.
 - **Lease record lost:** the token still expires by its own lifetime; the broker reports an orphan.
-- **`sandyd` crashes:** the leases expire by TTL, and the broker revokes them by runner certificate expiry.
+- **`sandyd` crashes:** a lease ends at its TTL, and the broker's explicit revoke of the runner certificate revokes the
+  runner's leases (broker acceptance 4 and 5). Nothing in the broker spec revokes on certificate expiry. A GitHub
+  installation token lives about an hour in any case, which is the hard bound.
 
 ## Adversarial pass
 
@@ -138,11 +156,14 @@ reads a request only because the guest addressed it as the endpoint.
 ## Work, in order
 
 1. Ask the broker repo for a lease API (mint, renew, release, revoke-all) and typed errors. Sandy cannot start
-   without a contract; the broker has none.
+   without a contract; the broker has none. The contract must also fix the request shape: a sandy profile carries
+   repositories and permission sets, and the broker policy speaks `{identity, action, target}`. State the mapping and
+   who narrows.
 2. `BrokerCredentialProvider` against a fake broker (tier 2), the `broker` trust-root kind, and the registry entry.
 3. A live row against a real broker once one exists.
-4. The redactor: under mode B the staged file is read as today. Under mode A the secret to mask is the capability, and
-   `sandyd` holds a copy in memory, which touches `cred_bracket.rs`. #745 closes for mode A only after that lands.
+4. The redactor: under mode B the staged file is read as today. Under mode A there are two secrets, the capability and
+   the per-run client key. `sandyd` holds a copy of each in memory, and the redactor, the shred and `gc` paths and the
+   live byte scan cover both. That touches `cred_bracket.rs`. #745 closes for mode A only after that lands.
 5. Mode A, one client at a time: `git`, then the `gh` wrapper. The live row proves the tool works with no token in the
    environment or on the share, and scans the share and the console for the capability.
 
@@ -159,8 +180,9 @@ reads a request only because the guest addressed it as the endpoint.
 1. **Record the answers.** The four above reached me by relay. Post them as a recorded comment on #749 (or the pinned
    decisions comment) so the record can cite them.
 2. **First cut.** Recommended: mode B through `BrokerCredentialProvider`, then mode A per client.
-3. **Runner granularity.** Recommended: one broker runner identity per run (or per profile), so a failed release
-   cannot freeze the host. It needs a broker answer.
+3. **Runner granularity and identity.** Recommended: one broker runner identity per profile, so a failed release
+   cannot freeze the host. Together with decision 4 this is one question for the broker: who is the runner identity,
+   and how does a guest get its certificate. It needs a broker answer.
 4. **A per-run client certificate in the guest** for mode A. Recommended, because the capability is bound to a
    certificate. It leaves a narrow credential in the guest. The alternative is a plaintext host relay, which answer 3
    forbids.
