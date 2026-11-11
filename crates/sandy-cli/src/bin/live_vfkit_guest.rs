@@ -32,7 +32,7 @@ fn run() -> Result<(), String> {
     };
     let vfkit_bin = std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string());
     let backend = VfkitBackend::new(vfkit_bin).with_service_socket(socket);
-    let template = format!("{}#topologies.aarch64-linux.vfkit-t3", guest_flake().display());
+    let template = format!("{}#topologies.aarch64-linux.vfkit-service", guest_flake().display());
     let command = ["bash".to_string(), "/run/sandy/inputs/guest.sh".to_string()];
     let inputs = [Input {
         host: script,

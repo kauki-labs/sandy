@@ -1,5 +1,5 @@
-//! Live VM environment on vfkit (#587, C3c, KENV22): `sandyd` with `SANDY_ENV_BACKEND=vm-vfkit` boots the t3 guest as
-//! a vfkit microVM, reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no vfkit
+//! Live VM environment on vfkit (#587, C3c, KENV22): `sandyd` with `SANDY_ENV_BACKEND=vm-vfkit` boots the service guest
+//! as a vfkit microVM, reports the environment Ready at a loopback endpoint that answers HTTP, and leaves no vfkit
 //! process, `env-svc-*.sock` socket or staging entry behind once the environment is deleted.
 //!
 //! Tier-3, behind the `live` feature like the other live suites (INV-S9). macOS on Apple silicon with vfkit on `PATH`
@@ -35,7 +35,7 @@ use tokio::net::UnixStream;
 mod common;
 use common::{guest_flake, require_live};
 
-/// A cold boot of the t3 guest plus its service; generous, and passed to the daemon as the provision timeout.
+/// A cold boot of the service guest plus its service; generous, and passed to the daemon as the provision timeout.
 const PROVISION_SECS: u64 = 900;
 
 /// Process ids of every running vfkit, from `ps`.
@@ -160,12 +160,12 @@ async fn a_vfkit_environment_becomes_ready_answers_http_and_leaves_nothing_after
     let build = Command::new("nix")
         .args(["build", "--no-link"])
         .arg(format!(
-            "{}#packages.aarch64-darwin.guest-runner-vfkit-t3",
+            "{}#packages.aarch64-darwin.guest-runner-vfkit-service",
             flake.display()
         ))
         .status()
-        .context("spawn nix build for the t3 guest")?;
-    ensure!(build.success(), "nix build of the t3 guest runner failed");
+        .context("spawn nix build for the service guest")?;
+    ensure!(build.success(), "nix build of the service guest runner failed");
 
     let vfkit_before = vfkit_pids()?;
     let staging_before = staging_entries();
@@ -179,9 +179,9 @@ async fn a_vfkit_environment_becomes_ready_answers_http_and_leaves_nothing_after
             .env("SANDY_ENV_BACKEND", "vm-vfkit")
             .env(
                 "SANDY_ENV_VM_TEMPLATE",
-                format!("{}#topologies.aarch64-linux.vfkit-t3", flake.display()),
+                format!("{}#topologies.aarch64-linux.vfkit-service", flake.display()),
             )
-            .env("SANDY_ENV_VM_COMMAND", "t3 serve --port {port}")
+            .env("SANDY_ENV_VM_COMMAND", "sandy-example-service --port {port}")
             .env("SANDY_ENV_VM_SERVICE_PORT", "3773")
             .env("SANDY_ENV_PROVISION_TIMEOUT_SECS", PROVISION_SECS.to_string())
             .stdout(Stdio::null())

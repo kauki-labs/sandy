@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Live gate for the guest service bridge (#590, epic #597), tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest (nix/guest, topology qemu-t3) on a Linux KVM host, runs `sandy-agent port-relay` and
-# `t3 serve` inside it, and runs the sandy-conn live test against the guest's vsock CID: a Bridge over a
+# Boots the service guest (nix/guest, topology qemu-service) on a Linux KVM host, runs `sandy-agent port-relay` and
+# `sandy-example-service` inside it, and runs the sandy-conn live test against the guest's vsock CID: a Bridge over a
 # VsockDialer, a GET through the bridge's loopback address polled until the status is below 500, then shutdown.
 # It also checks from inside the guest that a non-root process cannot bind the relay's privileged vsock port.
 #
@@ -52,7 +52,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The job the guest runs: the relay (as root, before anything untrusted), t3 as the service user, and two
+# The job the guest runs: the relay (as root, before anything untrusted), the service as its user, and two
 # privileged-port checks as that user. It holds the guest open for the host test, then exits.
 cat >"$work/guest.sh" <<'GUEST'
 set -u
@@ -60,27 +60,27 @@ agent=$(ls -d /nix/store/*-sandy-agent-*/bin/sandy-agent 2>/dev/null | head -1)
 echo "SK> agent=$agent"
 "$agent" port-relay --vsock-port 1000 --to 127.0.0.1:3773 >/tmp/relay.log 2>&1 &
 sleep 1
-echo "SK> squat-999-as-t3: $(runuser -u t3 -- timeout 3 "$agent" port-relay --vsock-port 999 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
+echo "SK> squat-999-as-service: $(runuser -u service -- timeout 3 "$agent" port-relay --vsock-port 999 --to 127.0.0.1:9 2>&1 | head -2 | tr '\n' ' ')"
 # The service user binds an unprivileged port; a second bind of it by root must then fail with EADDRINUSE,
 # which proves the first bind happened (a bound relay writes one `B` byte to stdout and nothing after).
-runuser -u t3 -- "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 >/tmp/bind2000.log 2>&1 &
+runuser -u service -- "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 >/tmp/bind2000.log 2>&1 &
 bind_pid=$!
 sleep 1
-echo "SK> bind-2000-as-t3: alive=$(kill -0 "$bind_pid" 2>/dev/null && echo yes || echo no) second-bind: $(timeout 3 "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 2>&1 | head -1)"
+echo "SK> bind-2000-as-service: alive=$(kill -0 "$bind_pid" 2>/dev/null && echo yes || echo no) second-bind: $(timeout 3 "$agent" port-relay --vsock-port 2000 --to 127.0.0.1:9 2>&1 | head -1)"
 pkill -f -- "port-relay --vsock-port 2000" 2>/dev/null || true
 echo "SK> secrets-dir: $(stat -c '%a %U' /run/sandy/secrets 2>&1)"
 echo "SK> secret-as-root: $(cat /run/sandy/secrets/SKSECRET 2>&1)"
-echo "SK> secret-as-t3: $(runuser -u t3 -- cat /run/sandy/secrets/SKSECRET 2>&1 | head -1)"
-mkdir -p /var/lib/t3/data
-chown -R t3:t3 /var/lib/t3
-runuser -u t3 -- t3 serve --host 127.0.0.1 --port 3773 --base-dir /var/lib/t3/data --no-browser >/tmp/t3.log 2>&1 &
+echo "SK> secret-as-service: $(runuser -u service -- cat /run/sandy/secrets/SKSECRET 2>&1 | head -1)"
+mkdir -p /var/lib/service/data
+chown -R service:service /var/lib/service
+runuser -u service -- sandy-example-service --port 3773 --dir /var/lib/service/data >/tmp/service.log 2>&1 &
 i=0
-until sandy-t3-ready; do
+until sandy-http-ready; do
   i=$((i + 1))
-  if [ "$i" -gt 120 ]; then echo "SK> t3 never ready"; exit 3; fi
+  if [ "$i" -gt 120 ]; then echo "SK> service never ready"; exit 3; fi
   sleep 1
 done
-echo "SK> t3 ready after ${i}s"
+echo "SK> service ready after ${i}s"
 # Keep the guest up past the host test's poll bound (120 s) plus its 60 s read timeout.
 sleep 180
 echo "SK> done"
@@ -91,15 +91,15 @@ cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
 cargo nextest run -p sandy-conn --features live --test live_vsock_bridge --no-run
 
-echo "== building the T3 guest"
-nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-t3"
+echo "== building the service guest"
+nix build --no-link "$repo_root/nix/guest#packages.x86_64-linux.guest-runner-service"
 
 echo "== booting the guest"
 (
   TMPDIR="$work" SANDY_HOME="$work/home" SANDY_EGRESS=proxy \
     SANDY_EGRESS_PROXY_BIN="$repo_root/target/debug/sandy-egress-proxy" \
     nix shell nixpkgs#qemu nixpkgs#virtiofsd -c \
-    "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-t3" \
+    "$repo_root/target/debug/sandy" -o json run "$repo_root/nix/guest#topologies.x86_64-linux.qemu-service" \
     --timeout 900 --allow example.com:443 --secret "SKSECRET=@$work/secret.txt" --input "$work/guest.sh:guest.sh" -- bash /run/sandy/inputs/guest.sh \
     >"$work/result.json" 2>"$work/stderr.log"
 ) &
@@ -144,7 +144,7 @@ if result.get("status") != "succeeded":
     sys.exit(1)
 joined = "\n".join(lines)
 # The kernel lets only a process with CAP_NET_BIND_SERVICE bind a vsock port of 1023 or below.
-if not re.search(r"squat-999-as-t3:.*Permission denied", joined):
+if not re.search(r"squat-999-as-service:.*Permission denied", joined):
     print("a non-root process could bind a privileged vsock port", file=sys.stderr)
     sys.exit(1)
 # The secrets mount belongs to root: the service user must not read a job secret.
@@ -154,10 +154,10 @@ if not re.search(r"secrets-dir: 700 ", joined):
 if "sk-secret-value" not in joined.split("secret-as-root:", 1)[-1].split("\n", 1)[0]:
     print("root could not read the staged secret", file=sys.stderr)
     sys.exit(1)
-if not re.search(r"secret-as-t3:.*Permission denied", joined):
+if not re.search(r"secret-as-service:.*Permission denied", joined):
     print("the service user could read a job secret", file=sys.stderr)
     sys.exit(1)
-if not re.search(r"bind-2000-as-t3: alive=yes second-bind:.*Address already in use", joined):
+if not re.search(r"bind-2000-as-service: alive=yes second-bind:.*Address already in use", joined):
     print("an unprivileged vsock port could not be bound as the service user", file=sys.stderr)
     sys.exit(1)
 PY

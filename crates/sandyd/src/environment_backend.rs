@@ -22,10 +22,10 @@
 //!
 //! | variable | meaning |
 //! | --- | --- |
-//! | `SANDY_ENV_VM_TEMPLATE` | the guest topology: a flake attr such as `<flake>#topologies.x86_64-linux.qemu-t3`, or a prebuilt topology JSON file |
+//! | `SANDY_ENV_VM_TEMPLATE` | the guest topology: a flake attr such as `<flake>#topologies.x86_64-linux.qemu-service`, or a prebuilt topology JSON file |
 //! | `SANDY_ENV_VM_COMMAND` | the service argv in the guest, split on whitespace; must contain `{port}` |
 //! | `SANDY_ENV_VM_SERVICE_PORT` | the guest loopback port the service listens on |
-//! | `SANDY_ENV_VM_SERVICE_USER` | the guest account the service runs as; default `t3`, never root |
+//! | `SANDY_ENV_VM_SERVICE_USER` | the guest account the service runs as; default `service`, never root |
 //! | `SANDY_ENV_VM_BOOT_TIMEOUT_SECS` | sizes the hypervisor's connect budgets (not a deadline); default 600 |
 //! | `SANDY_ENV_VM_HOST_CHECK` | how the host decides the service is Ready: `http` (default: `GET /` answers below 500, as a typical service does) or `connect` (the service port accepted a connection through the bridge, for a service that does not speak HTTP); any other value is refused |
 
@@ -360,7 +360,7 @@ fn vm_settings(
         user: get("SANDY_ENV_VM_SERVICE_USER")
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "t3".to_owned()),
+            .unwrap_or_else(|| "service".to_owned()),
         probe: HealthProbe {
             check: ProbeCheck::Tcp { port },
             interval_secs: 2,
@@ -412,7 +412,10 @@ mod tests {
     fn vm_base() -> Vec<(&'static str, &'static str)> {
         vec![
             ("SANDY_ENV_BACKEND", "vm-qemu"),
-            ("SANDY_ENV_VM_TEMPLATE", "/srv/guest#topologies.x86_64-linux.qemu-t3"),
+            (
+                "SANDY_ENV_VM_TEMPLATE",
+                "/srv/guest#topologies.x86_64-linux.qemu-service",
+            ),
             ("SANDY_ENV_VM_COMMAND", "service serve --port {port}"),
             ("SANDY_ENV_VM_SERVICE_PORT", "3773"),
         ]
@@ -842,11 +845,14 @@ mod tests {
         };
         assert_eq!(vm.command, ["service", "serve", "--port", "3773"]);
         assert_eq!(vm.boot_timeout_secs, 900);
-        assert_eq!(cfg.driver.template, "/srv/guest#topologies.x86_64-linux.qemu-t3");
+        assert_eq!(cfg.driver.template, "/srv/guest#topologies.x86_64-linux.qemu-service");
         assert_eq!(cfg.driver.service_port, Some(3773));
         assert_eq!(cfg.driver.provision_timeout, Duration::from_secs(1000));
         let spec: sandy_guest_template::manifest::ServiceSpec = serde_json::from_str(&vm.service_env)?;
-        assert_eq!(spec.user, "t3", "the default service user is the image's t3 account");
+        assert_eq!(
+            spec.user, "service",
+            "the default service user is the image's service account"
+        );
         assert_eq!(spec.port, Some(3773));
         assert!(vm.service_env.len() <= MAX_SERVICE_ENV_BYTES);
         Ok(())

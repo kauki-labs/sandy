@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live gate for #666, tier-3, never counted green from a fake (INV-S9).
 #
-# Boots the T3 guest under `sandy run` with an input share and the egress proxy, so qemu, virtiofsd and the proxy all
+# Boots the service guest under `sandy run` with an input share and the egress proxy, so qemu, virtiofsd and the proxy all
 # run. Then it:
 #   1. runs the start-up sweep while the host process is alive, both directly and as `sandy run` makes it, and checks
 #      that it touches nothing;
@@ -24,14 +24,14 @@ Linux)
     echo "refusing: /dev/vhost-vsock is not accessible to this user" >&2
     exit 2
   fi
-  guest_runner=packages.x86_64-linux.guest-runner-t3
-  topology=topologies.x86_64-linux.qemu-t3
+  guest_runner=packages.x86_64-linux.guest-runner-service
+  topology=topologies.x86_64-linux.qemu-service
   tools=(nixpkgs#qemu nixpkgs#virtiofsd)
   expect_procs=3
   ;;
 Darwin)
-  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-t3
-  topology=topologies.aarch64-linux.vfkit-t3
+  guest_runner=packages.aarch64-darwin.guest-runner-vfkit-service
+  topology=topologies.aarch64-linux.vfkit-service
   tools=(nixpkgs#vfkit)
   expect_procs=2
   ;;
@@ -68,7 +68,7 @@ echo "== building sandy, the egress proxy and the sweep"
 cargo build -q -p sandy-cli --bin sandy
 cargo build -q -p sandy-egress-proxy
 cargo build -q -p sandy-impls-vm --example sweep_orphans
-echo "== building the T3 guest"
+echo "== building the service guest"
 nix build --no-link "$repo_root/nix/guest#$guest_runner"
 
 # The sweep as `sandy run` makes it (#666): the first thing a run does, before it goes on with its template. A template
