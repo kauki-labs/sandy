@@ -68,6 +68,7 @@ impl std::fmt::Debug for OutputChunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutputChunk")
             .field("name", &self.name)
+            .field("output_index", &self.output_index)
             .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
             .finish()
     }
@@ -504,6 +505,7 @@ mod tests {
             data_link_message::Op::OutputChunk(OutputChunk {
                 name: "out/result.bin".to_owned(),
                 bytes: vec![4, 5],
+                output_index: 2,
             }),
             data_link_message::Op::OutputEnd(OutputEnd {}),
             data_link_message::Op::TransferError(TransferError {
@@ -543,6 +545,54 @@ mod tests {
         Ok(())
     }
 
+    /// `output_index` says which declared output a file belongs to: the same relative name can be covered by a named
+    /// output and a catch-all, or by two outputs with different destinations, so the name alone is ambiguous.
+    #[tokio::test]
+    async fn an_output_chunk_carries_the_index_of_its_output() -> anyhow::Result<()> {
+        let message = DataLinkMessage {
+            op: Some(data_link_message::Op::OutputChunk(OutputChunk {
+                name: "n/x".to_owned(),
+                bytes: vec![1],
+                output_index: 7,
+            })),
+        };
+        let (mut write_side, mut read_side) = tokio::io::duplex(4096);
+        write_frame(&mut write_side, &message).await?;
+        let decoded: DataLinkMessage = read_frame(&mut read_side)
+            .await?
+            .context("expected a frame, got a clean close")?;
+        let Some(data_link_message::Op::OutputChunk(chunk)) = decoded.op else {
+            anyhow::bail!("not an output chunk");
+        };
+        assert_eq!(chunk.output_index, 7);
+        Ok(())
+    }
+
+    /// A chunk from a sender that predates the field decodes as output 0 and keeps its name and bytes.
+    #[test]
+    fn an_output_chunk_without_an_index_decodes_as_output_zero() -> anyhow::Result<()> {
+        use prost::Message;
+
+        // field 1 (name) "a", field 2 (bytes) empty: the pre-index shape.
+        let chunk = OutputChunk::decode(&[0x0a, 0x01, b'a', 0x12, 0x00][..]).context("decode")?;
+        assert_eq!((chunk.name.as_str(), chunk.output_index), ("a", 0));
+        Ok(())
+    }
+
+    /// The index is not secret and helps a log line: `Debug` prints it next to the length.
+    #[test]
+    fn output_chunk_debug_prints_the_index() {
+        let rendered = format!(
+            "{:?}",
+            OutputChunk {
+                name: "a".to_owned(),
+                bytes: vec![0; 3],
+                output_index: 5,
+            }
+        );
+        assert!(rendered.contains("output_index: 5"), "no index in: {rendered}");
+    }
+
     /// Adversarial: a chunk's `Debug` must not print the file bytes, whether
     /// as text or as a number list.
     #[test]
@@ -561,6 +611,7 @@ mod tests {
             OutputChunk {
                 name: "a".to_owned(),
                 bytes: marker.to_vec(),
+                output_index: 0,
             }
         );
         // Logs print the enclosing message, so cover that path too.

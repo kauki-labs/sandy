@@ -742,6 +742,7 @@ mod tests {
             op: Some(Op::OutputChunk(OutputChunk {
                 name: "x".to_owned(),
                 bytes: b"x".to_vec(),
+                output_index: 0,
             })),
         };
         let (pulled, _peer) = run(&[output], false, &["x"], PullLimits::default(), root.path()).await?;

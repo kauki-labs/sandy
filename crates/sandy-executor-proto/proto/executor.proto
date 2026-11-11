@@ -309,10 +309,16 @@ message InputEnd {}
 // when that output is a directory; an output with no declared name (the
 // catch-all) uses the path relative to the outputs root. The chunks of one
 // file are contiguous and in order; a file is complete when the next file's
-// chunk or `OutputEnd` arrives.
+// chunk or `OutputEnd` arrives. `output_index` is the position in
+// `Dispatch.outputs` of the declared output the file belongs to: a named output
+// and a catch-all (or two outputs with different destinations) can cover the
+// same relative name, so the name alone does not say where the file goes. A
+// file covered by several outputs is sent once per output, as local collection
+// writes it to each. A sender that predates the field sends 0.
 message OutputChunk {
   string name = 1;
   bytes bytes = 2;
+  uint32 output_index = 3;
 }
 
 // Host-executor -> orchestrator: every output has been sent.
