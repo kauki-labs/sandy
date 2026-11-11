@@ -20,7 +20,7 @@
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -185,7 +185,9 @@ pub async fn receive_outputs(
         return result;
     };
     // The partial file goes first, so the peer's view and the disk agree when it hears of the failure.
-    drop(receive.current.take());
+    if let Some(current) = receive.current.take() {
+        current.discard().await;
+    }
     if !matches!(
         error,
         ReceiveError::Frame(_) | ReceiveError::Truncated | ReceiveError::Idle | ReceiveError::PeerError(_)
@@ -247,22 +249,97 @@ struct Receive<'a> {
 }
 
 /// The file being received: written under a temp name in its final directory, renamed into place on completion,
-/// and removed on drop if it never completed.
+/// and removed if it never completed.
 struct InFlight {
     key: (u32, String),
-    dir: Beneath,
-    temp: OsString,
     name: OsString,
     file: tokio::fs::File,
-    committed: bool,
+    cleanup: Cleanup,
 }
 
-impl Drop for InFlight {
+impl InFlight {
+    /// Remove the temp file and wait for it, so the destination is clean when the caller goes on (a failed receive
+    /// tells the peer after this).
+    async fn discard(mut self) {
+        let cleanup = self.cleanup.take();
+        let _ = tokio::task::spawn_blocking(move || cleanup.remove_now()).await;
+    }
+}
+
+/// The unlink of a temp file that never completed, through the directory handle it was created in, so nothing is
+/// resolved again. Unlinking is blocking I/O (a hung destination stalls its thread), so dropping one queues the unlink
+/// on the blocking pool instead of running it on the async worker (#779). The write that may still be in flight on
+/// another blocking thread goes to the then unlinked file.
+///
+/// Queueing is not enough on its own: tokio cancels a `spawn_blocking` task that is still queued when the runtime shuts
+/// down, and one spawned after, without running them. So the work travels as an [`UnlinkOnDrop`] guard that the queued
+/// closure owns. The closure runs and drops it on a pool thread; a cancelled closure is dropped by tokio, and the
+/// guard unlinks inline on the thread that cancels it. Neither path loses the unlink.
+struct Cleanup(Option<(Beneath, OsString)>);
+
+impl Cleanup {
+    fn new(dir: Beneath, temp: OsString) -> Self {
+        Self(Some((dir, temp)))
+    }
+
+    /// Take the work out, leaving a guard that does nothing.
+    fn take(&mut self) -> Self {
+        Self(self.0.take())
+    }
+
+    /// The file is in place under its final name: nothing to remove.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    /// Remove the file now, on the calling thread. Callers run it on the blocking pool.
+    fn remove_now(mut self) {
+        drop(UnlinkOnDrop(self.0.take()));
+    }
+}
+
+impl Drop for Cleanup {
     fn drop(&mut self) {
-        if !self.committed {
-            // Through the held directory handle, so nothing is resolved again. The write that may still be in
-            // flight on a blocking thread goes to the now unlinked file.
-            let _ = self.dir.remove_file(&self.temp);
+        let Some(target) = self.0.take() else {
+            return;
+        };
+        let guard = UnlinkOnDrop(Some(target));
+        match tokio::runtime::Handle::try_current() {
+            // The closure owns the guard: run, it unlinks on a pool thread; cancelled at shutdown, it unlinks inline.
+            Ok(handle) => drop(handle.spawn_blocking(move || drop(guard))),
+            // No runtime on this thread: nothing to queue on.
+            Err(_) => drop(guard),
+        }
+    }
+}
+
+/// Unlinks its temp file when dropped, wherever that happens.
+struct UnlinkOnDrop(Option<(Beneath, OsString)>);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        if let Some((dir, temp)) = self.0.take() {
+            let _ = dir.remove_file(&temp);
+        }
+    }
+}
+
+/// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
+/// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
+/// including when the receive that asked for it is gone by the time this ends.
+fn open_temp(root: &Path, parts: &[String], mut seq: u64) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
+    let mut dir = Beneath::create_dir_at(root)?;
+    for part in parts {
+        dir = dir.create_dir(OsStr::new(part))?;
+    }
+    loop {
+        seq += 1;
+        let temp = OsString::from(format!(".sandy-recv-{}-{seq}", std::process::id()));
+        match dir.create_new_file(&temp) {
+            Ok(file) => return Ok((Cleanup::new(dir, temp), file, seq)),
+            // A stale name from a crashed receive: try the next one.
+            Err(sandy_fsutil::FsError::Unsafe { .. }) if seq < 1000 => {}
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -305,23 +382,43 @@ impl<'a> Receive<'a> {
         Ok(())
     }
 
-    /// Complete the file in flight, if any: flush it and rename it into place.
+    /// Complete the file in flight, if any: flush it and rename it into place (on the blocking pool).
     async fn finish_file(&mut self) -> Result<(), ReceiveError> {
         let Some(mut current) = self.current.take() else {
             return Ok(());
         };
         current.file.flush().await.map_err(ReceiveError::Io)?;
-        current.dir.rename(&current.temp, &current.name)?;
-        current.committed = true;
-        self.done.insert(current.key.clone());
+        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
+            let renamed = match current.cleanup.0.as_ref() {
+                Some((dir, temp)) => dir.rename(temp, &current.name),
+                None => Err(sandy_fsutil::FsError::Unsafe {
+                    path: PathBuf::from(&current.name),
+                    reason: "the temp file was already removed".to_owned(),
+                }),
+            };
+            match renamed {
+                Ok(()) => {
+                    current.cleanup.disarm();
+                    Ok(current)
+                }
+                Err(e) => {
+                    // Done here, before the peer hears of the failure.
+                    current.cleanup.take().remove_now();
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        self.done.insert(current.key);
         self.received.files += 1;
         Ok(())
     }
 
-    /// Open the destination directory beneath its root, creating what is missing, and a temp file in it.
+    /// Open the destination directory beneath its root, creating what is missing, and a temp file in it. The caps are
+    /// counted first; the directory work runs on the blocking pool.
     async fn start_file(&mut self, key: (u32, String)) -> Result<(), ReceiveError> {
         let (root, parts, name) = self.target(&key)?;
-        let mut dir = Beneath::create_dir_at(&root)?;
         let mut prefix = String::new();
         for part in &parts {
             if !prefix.is_empty() {
@@ -331,26 +428,18 @@ impl<'a> Receive<'a> {
             if self.dirs.insert((key.0, prefix.clone())) {
                 self.count_entry()?;
             }
-            dir = dir.create_dir(OsStr::new(part))?;
         }
         self.count_entry()?;
-        let (temp, file) = loop {
-            self.temp_seq += 1;
-            let temp = OsString::from(format!(".sandy-recv-{}-{}", std::process::id(), self.temp_seq));
-            match dir.create_new_file(&temp) {
-                Ok(file) => break (temp, file),
-                // A stale name from a crashed receive: try the next one.
-                Err(sandy_fsutil::FsError::Unsafe { .. }) if self.temp_seq < 1000 => {}
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let seq = self.temp_seq;
+        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq))
+            .await
+            .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        self.temp_seq = seq;
         self.current = Some(InFlight {
             key,
-            dir,
-            temp,
             name: OsString::from(name),
             file: tokio::fs::File::from_std(file),
-            committed: false,
+            cleanup,
         });
         Ok(())
     }
@@ -479,7 +568,14 @@ mod tests {
                     walk(&path, root, into)?;
                 } else {
                     let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
-                    into.insert(rel, std::fs::read(&path)?);
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            into.insert(rel, bytes);
+                        }
+                        // A queued cleanup can remove a temp file between the listing and the read.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
             Ok(())
@@ -808,10 +904,163 @@ mod tests {
         )
         .await;
         assert!(stopped.is_err(), "the receive must still be waiting");
+        // The unlink is queued on the blocking pool by the drop, so it ends a moment later.
+        let mut left = tree(dest.path())?;
+        for _ in 0..40 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            left = tree(dest.path())?;
+        }
+        assert!(left.is_empty(), "no partial file may stay: {left:?}");
+        drop(peer);
+        Ok(())
+    }
+
+    /// Poll `receive` until a temp file is on disk (the file is in flight), failing if the receive ends first.
+    async fn wait_until_a_file_is_in_flight(
+        receive: &mut (impl std::future::Future<Output = Result<Received, ReceiveError>> + Unpin),
+        dest: &Path,
+    ) -> anyhow::Result<()> {
+        for _ in 0..80 {
+            tokio::select! {
+                ended = &mut *receive => anyhow::bail!("the receive ended with the peer silent: {ended:?}"),
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+            if !tree(dest)?.is_empty() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("no file was ever in flight")
+    }
+
+    /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
+    fn runtime_with_one_blocking_thread() -> anyhow::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .context("build the runtime")
+    }
+
+    /// Directory work is blocking I/O (a slow or hung destination stalls its thread): it runs on the blocking pool,
+    /// never inline on the async worker. With the pool's only thread occupied, the receive must not have created the
+    /// directory yet; before the fix it created it at once, on the worker (#779).
+    #[test]
+    fn creating_directories_waits_for_the_blocking_pool() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        rt.block_on(async {
+            let dest = tempfile::tempdir().context("dest")?;
+            let outputs = [out(None, dest.path())];
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+            write_frame(&mut peer, &chunk(0, "sub/f", b"x"))
+                .await
+                .context("write")?;
+            let stalled = tokio::time::timeout(
+                Duration::from_millis(400),
+                receive_outputs(&mut local, &outputs, quick()),
+            )
+            .await;
+            assert!(stalled.is_err(), "the receive cannot finish while the pool is occupied");
+            assert!(
+                !dest.path().join("sub").exists(),
+                "a directory was created on the async worker, not the blocking pool"
+            );
+            release.send(()).context("release")?;
+            blocker.await.context("blocker")?;
+            // The queued work of the dropped receive may still run; let it end before the directory goes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        })
+    }
+
+    /// The unlink of a file in flight, when the receive is dropped (a cancelled job), is blocking I/O too: it is
+    /// queued on the blocking pool, not run inside `Drop` on the async worker, and it still happens.
+    #[test]
+    fn a_dropped_receives_cleanup_runs_on_the_blocking_pool() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        rt.block_on(async {
+            let dest = tempfile::tempdir().context("dest")?;
+            let outputs = [out(None, dest.path())];
+            let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+            write_frame(&mut peer, &chunk(0, "half", b"x")).await.context("write")?;
+
+            let patient = ReceiveLimits {
+                idle: Duration::from_secs(30),
+                ..quick()
+            };
+            let mut receive = Box::pin(receive_outputs(&mut local, &outputs, patient));
+            wait_until_a_file_is_in_flight(&mut receive, dest.path()).await?;
+
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(receive);
+            assert!(
+                !tree(dest.path())?.is_empty(),
+                "the temp file was unlinked inside Drop, on the async worker"
+            );
+
+            release.send(()).context("release")?;
+            blocker.await.context("blocker")?;
+            let mut left = tree(dest.path())?;
+            for _ in 0..40 {
+                if left.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                left = tree(dest.path())?;
+            }
+            assert!(
+                left.is_empty(),
+                "the queued cleanup must still remove the temp file: {left:?}"
+            );
+            drop(peer);
+            Ok(())
+        })
+    }
+
+    /// A receive dropped after its runtime has shut down still removes its temp file. Tokio rejects a `spawn_blocking`
+    /// made on a pool that has shut down, without running it, so a cleanup that only queues the unlink loses it. A task
+    /// the runtime drops late is in this position: its `Drop` runs with the runtime's handle entered and the pool gone.
+    #[test]
+    fn a_receive_dropped_after_the_runtime_shut_down_still_removes_its_temp_file() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = vec![out(None, dest.path())];
+        let (mut peer, local) = tokio::io::duplex(1024 * 1024);
+        let patient = ReceiveLimits {
+            idle: Duration::from_secs(30),
+            ..quick()
+        };
+        let mut receive = Box::pin(async move {
+            let mut local = local;
+            receive_outputs(&mut local, &outputs, patient).await
+        });
+        rt.block_on(async {
+            write_frame(&mut peer, &chunk(0, "half", b"x")).await.context("write")?;
+            wait_until_a_file_is_in_flight(&mut receive, dest.path()).await
+        })?;
+
+        let handle = rt.handle().clone();
+        drop(rt);
+        let _entered = handle.enter();
+        drop(receive);
+
+        let left = tree(dest.path())?;
         assert!(
-            tree(dest.path())?.is_empty(),
-            "no partial file may stay: {:?}",
-            tree(dest.path())?
+            left.is_empty(),
+            "the unlink was lost with the pool, the temp file stays: {left:?}"
         );
         drop(peer);
         Ok(())
