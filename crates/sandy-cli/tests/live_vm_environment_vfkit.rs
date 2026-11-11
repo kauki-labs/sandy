@@ -204,6 +204,7 @@ async fn a_vfkit_environment_becomes_ready_answers_http_and_leaves_nothing_after
                 }),
                 ..EnvironmentSpec::default()
             }),
+            ..CreateEnvironmentRequest::default()
         }),
     )
     .await?;
