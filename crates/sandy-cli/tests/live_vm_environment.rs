@@ -3,7 +3,7 @@
 //! run directory behind once the environment is deleted.
 //!
 //! Tier-3, behind the `live` feature like the other live suites (INV-S9). Linux with KVM and `/dev/vhost-vsock`
-//! only; the first run builds a 3.7 GB guest image, so the provision timeout is far above the 120 s default.
+//! only; a cold first run builds the guest image, so the provision timeout is far above the 120 s default.
 //!
 //!   SANDY_LIVE=1 nix shell nixpkgs#qemu -c cargo nextest run -p sandy-cli --features live --test live_vm_environment
 //!

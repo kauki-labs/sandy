@@ -3,7 +3,7 @@
 //! process, `env-svc-*.sock` socket or staging entry behind once the environment is deleted.
 //!
 //! Tier-3, behind the `live` feature like the other live suites (INV-S9). macOS on Apple silicon with vfkit on `PATH`
-//! (or `SANDY_VFKIT_BIN`) and a linux-builder; the first run builds a 3.7 GB guest image, so the provision timeout is
+//! (or `SANDY_VFKIT_BIN`) and a linux-builder; a cold first run builds the guest image, so the provision timeout is
 //! far above the 120 s default.
 //!
 //!   SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live --test live_vm_environment_vfkit
