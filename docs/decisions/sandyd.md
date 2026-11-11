@@ -1894,7 +1894,12 @@ decisions, not itself an owner decision.
   here since the bytes crossed an untrusted boundary in between. Each
   output is written to a temp name in the destination's own directory and
   renamed into place only once fully received and validated, never
-  streamed directly onto the final path.
+  streamed directly onto the final path. The name and size checks are one pure function, `DataLinkMessage::validate`
+  (`sandy-executor-proto`, slice 2): a chunk of at most `MAX_CHUNK_BYTES` with a relative name of at most
+  `MAX_CHUNK_NAME_BYTES` (no empty, `.` or `..` component, not absolute, no NUL), and an input chunk whose
+  `offset + len` does not overflow. The codec enforces none of it (a frame decodes to a chunk four times the cap), so
+  every receiver calls it before acting on a message, whatever the sender claims to keep. A symlink component is a
+  filesystem check made at write time, not one a name can show. Its errors never repeat the peer's name or bytes.
 - **Disk I/O off the connection-driving task.** Reading a local input
   file to send, or writing a received output chunk, goes through a
   bounded channel into a blocking task, the same shape `spawn_blocking`
