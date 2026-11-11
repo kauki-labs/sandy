@@ -185,7 +185,9 @@ pub async fn receive_outputs(
         return result;
     };
     // The partial file goes first, so the peer's view and the disk agree when it hears of the failure.
-    drop(receive.current.take());
+    if let Some(current) = receive.current.take() {
+        current.discard().await;
+    }
     if !matches!(
         error,
         ReceiveError::Frame(_) | ReceiveError::Truncated | ReceiveError::Idle | ReceiveError::PeerError(_)
@@ -247,22 +249,84 @@ struct Receive<'a> {
 }
 
 /// The file being received: written under a temp name in its final directory, renamed into place on completion,
-/// and removed on drop if it never completed.
+/// and removed if it never completed.
 struct InFlight {
     key: (u32, String),
-    dir: Beneath,
-    temp: OsString,
     name: OsString,
     file: tokio::fs::File,
-    committed: bool,
+    cleanup: Cleanup,
 }
 
-impl Drop for InFlight {
+impl InFlight {
+    /// Remove the temp file and wait for it, so the destination is clean when the caller goes on (a failed receive
+    /// tells the peer after this).
+    async fn discard(mut self) {
+        let cleanup = self.cleanup.take();
+        let _ = tokio::task::spawn_blocking(move || cleanup.remove_now()).await;
+    }
+}
+
+/// The unlink of a temp file that never completed, through the directory handle it was created in, so nothing is
+/// resolved again. Unlinking is blocking I/O (a hung destination stalls its thread), so dropping one queues the unlink
+/// on the blocking pool instead of running it on the async worker (#779). The write that may still be in flight on
+/// another blocking thread goes to the then unlinked file.
+struct Cleanup(Option<(Beneath, OsString)>);
+
+impl Cleanup {
+    fn new(dir: Beneath, temp: OsString) -> Self {
+        Self(Some((dir, temp)))
+    }
+
+    /// Take the work out, leaving a guard that does nothing.
+    fn take(&mut self) -> Self {
+        Self(self.0.take())
+    }
+
+    /// The file is in place under its final name: nothing to remove.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    fn remove_now(mut self) {
+        if let Some((dir, temp)) = self.0.take() {
+            let _ = dir.remove_file(&temp);
+        }
+    }
+}
+
+impl Drop for Cleanup {
     fn drop(&mut self) {
-        if !self.committed {
-            // Through the held directory handle, so nothing is resolved again. The write that may still be in
-            // flight on a blocking thread goes to the now unlinked file.
-            let _ = self.dir.remove_file(&self.temp);
+        let Some((dir, temp)) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => drop(handle.spawn_blocking(move || {
+                let _ = dir.remove_file(&temp);
+            })),
+            // No runtime left (shutdown): nothing else can run it.
+            Err(_) => {
+                let _ = dir.remove_file(&temp);
+            }
+        }
+    }
+}
+
+/// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
+/// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
+/// including when the receive that asked for it is gone by the time this ends.
+fn open_temp(root: &Path, parts: &[String], mut seq: u64) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
+    let mut dir = Beneath::create_dir_at(root)?;
+    for part in parts {
+        dir = dir.create_dir(OsStr::new(part))?;
+    }
+    loop {
+        seq += 1;
+        let temp = OsString::from(format!(".sandy-recv-{}-{seq}", std::process::id()));
+        match dir.create_new_file(&temp) {
+            Ok(file) => return Ok((Cleanup::new(dir, temp), file, seq)),
+            // A stale name from a crashed receive: try the next one.
+            Err(sandy_fsutil::FsError::Unsafe { .. }) if seq < 1000 => {}
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -305,23 +369,30 @@ impl<'a> Receive<'a> {
         Ok(())
     }
 
-    /// Complete the file in flight, if any: flush it and rename it into place.
+    /// Complete the file in flight, if any: flush it and rename it into place (on the blocking pool).
     async fn finish_file(&mut self) -> Result<(), ReceiveError> {
         let Some(mut current) = self.current.take() else {
             return Ok(());
         };
         current.file.flush().await.map_err(ReceiveError::Io)?;
-        current.dir.rename(&current.temp, &current.name)?;
-        current.committed = true;
-        self.done.insert(current.key.clone());
+        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
+            if let Some((dir, temp)) = current.cleanup.0.as_ref() {
+                dir.rename(temp, &current.name)?;
+            }
+            current.cleanup.disarm();
+            Ok(current)
+        })
+        .await
+        .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        self.done.insert(current.key);
         self.received.files += 1;
         Ok(())
     }
 
-    /// Open the destination directory beneath its root, creating what is missing, and a temp file in it.
+    /// Open the destination directory beneath its root, creating what is missing, and a temp file in it. The caps are
+    /// counted first; the directory work runs on the blocking pool.
     async fn start_file(&mut self, key: (u32, String)) -> Result<(), ReceiveError> {
         let (root, parts, name) = self.target(&key)?;
-        let mut dir = Beneath::create_dir_at(&root)?;
         let mut prefix = String::new();
         for part in &parts {
             if !prefix.is_empty() {
@@ -331,26 +402,18 @@ impl<'a> Receive<'a> {
             if self.dirs.insert((key.0, prefix.clone())) {
                 self.count_entry()?;
             }
-            dir = dir.create_dir(OsStr::new(part))?;
         }
         self.count_entry()?;
-        let (temp, file) = loop {
-            self.temp_seq += 1;
-            let temp = OsString::from(format!(".sandy-recv-{}-{}", std::process::id(), self.temp_seq));
-            match dir.create_new_file(&temp) {
-                Ok(file) => break (temp, file),
-                // A stale name from a crashed receive: try the next one.
-                Err(sandy_fsutil::FsError::Unsafe { .. }) if self.temp_seq < 1000 => {}
-                Err(e) => return Err(e.into()),
-            }
-        };
+        let seq = self.temp_seq;
+        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq))
+            .await
+            .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        self.temp_seq = seq;
         self.current = Some(InFlight {
             key,
-            dir,
-            temp,
             name: OsString::from(name),
             file: tokio::fs::File::from_std(file),
-            committed: false,
+            cleanup,
         });
         Ok(())
     }
@@ -808,11 +871,16 @@ mod tests {
         )
         .await;
         assert!(stopped.is_err(), "the receive must still be waiting");
-        assert!(
-            tree(dest.path())?.is_empty(),
-            "no partial file may stay: {:?}",
-            tree(dest.path())?
-        );
+        // The unlink is queued on the blocking pool by the drop, so it ends a moment later.
+        let mut left = tree(dest.path())?;
+        for _ in 0..40 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            left = tree(dest.path())?;
+        }
+        assert!(left.is_empty(), "no partial file may stay: {left:?}");
         drop(peer);
         Ok(())
     }
