@@ -499,6 +499,13 @@ pub enum HandleDispatchError {
     /// Launching or running the sandbox failed.
     #[error("running the sandbox: {0}")]
     Backend(#[from] BackendError),
+    /// `Dispatch.data_link_token` was neither empty nor exactly `REMOTE_LINK_TOKEN_LEN` bytes.
+    #[error("data_link_token is {0} bytes, expected {REMOTE_LINK_TOKEN_LEN} or none")]
+    InvalidDataLinkTokenLength(usize),
+    /// The inputs could not be pulled over the data link (#482). The job never booted: this is a transfer failure,
+    /// a cancel or a deadline during the pull, never a guest failure.
+    #[error("staging the inputs from the data link: {0}")]
+    DataLink(#[from] crate::input_stage::StageError),
 }
 
 /// Handle one [`Dispatch`]: decode its manifest, independently re-check the
@@ -1280,6 +1287,97 @@ mod tests {
             matches!(err, HandleDispatchError::UnsupportedBackend(backend)
                 if backend == i32::from(sandy_executor_proto::SandboxKind::Vm)),
             "expected UnsupportedBackend, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A `Process` dispatch whose manifest names a command that cannot start, so a run that is wrongly reached fails
+    /// at spawn at once and touches nothing. `data_token` is the dispatch's data link token.
+    fn process_dispatch_with_data_token(data_token: Vec<u8>, forward_back: &str) -> anyhow::Result<Dispatch> {
+        Ok(Dispatch {
+            job_id: "job-1".to_string(),
+            manifest: serde_json::to_vec(&["/nonexistent/sandy-test-command"]).context("encoding the test manifest")?,
+            manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Process.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: forward_back.to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: vec![sandy_executor_proto::Input {
+                host: "/submitter/path".to_string(),
+                name: "data".to_string(),
+                guest_path: None,
+            }],
+            outputs: Vec::new(),
+            secrets: Vec::new(),
+            data_link_token: data_token,
+        })
+    }
+
+    /// `handle_dispatch` blocks (it is called from `spawn_blocking` in production), so a test that reaches the data
+    /// link's `block_on` must run it on a blocking thread too.
+    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Outcome, HandleDispatchError>> {
+        let rt = tokio::runtime::Handle::current();
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        tokio::task::spawn_blocking(move || {
+            handle_dispatch(
+                &dispatch,
+                containment,
+                PathBuf::from("/nonexistent/sandy-agent"),
+                rt,
+                false,
+                sandy_api::backend::RunControl::with_timeout_secs(60),
+                test_mesh_tls_config(),
+            )
+        })
+        .await
+        .context("the blocking dispatch task")
+    }
+
+    /// A data link token that is not 32 bytes is refused up front, like a bad agent link token.
+    #[tokio::test]
+    async fn handle_dispatch_refuses_a_data_link_token_of_the_wrong_length() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(vec![7u8; 5], "127.0.0.1:9000")?;
+        let err = run_blocking(dispatch)
+            .await?
+            .expect_err("a short data link token must be refused");
+        assert!(
+            matches!(err, HandleDispatchError::InvalidDataLinkTokenLength(5)),
+            "expected InvalidDataLinkTokenLength(5), got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A non-empty data link token makes the host dial the data link BEFORE it runs anything: with nothing
+    /// listening, the dispatch fails as a data link error, not as a sandbox failure. The job never boots.
+    #[tokio::test]
+    async fn handle_dispatch_dials_the_data_link_before_it_runs() -> anyhow::Result<()> {
+        // A port that was just free and is now closed, so the dial is refused at once.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").context("bind")?;
+        let addr = closed.local_addr().context("local_addr")?;
+        drop(closed);
+
+        let dispatch = process_dispatch_with_data_token(vec![7u8; REMOTE_LINK_TOKEN_LEN], &addr.to_string())?;
+        let err = run_blocking(dispatch).await?.expect_err("the dial must fail");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::DataLink(crate::input_stage::StageError::Dial(_))
+            ),
+            "expected a data link dial error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// An empty data link token means no dial and today's behaviour: the dispatch goes straight to the run.
+    #[tokio::test]
+    async fn handle_dispatch_without_a_data_link_token_runs_as_before() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?;
+        let err = run_blocking(dispatch)
+            .await?
+            .expect_err("the nonexistent command cannot run");
+        assert!(
+            matches!(err, HandleDispatchError::Backend(_)),
+            "expected a backend error, got {err:?}"
         );
         Ok(())
     }
