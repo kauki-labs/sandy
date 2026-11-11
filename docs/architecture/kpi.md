@@ -341,6 +341,8 @@ Whether an HTTPS client in the guest uses the guest's proxy relay. Live rows run
 | KHE5 | vfkit leg                 | The same checks on an Apple silicon guest.                                                                              | `live-guest-proxy.sh` (macOS branch, `vfkit-service`) | vfkit  | not run                          |
 | KHE6 | Real request              | A guest client completes a real request with a real credential.                                                         | not written (needs the identity profile, #592)        | qemu   | not run                          |
 
+KHE2/KHE3 formerly ran the real claude/codex through the proxy (green 2026-11-03); the generic guest cannot, restoring them is #767.
+
 ## Orphaned VM sweep (#666)
 
 Whether a restart stops the VM that a killed host process left behind ([`run-plane.md`](../decisions/run-plane.md) decision 6). The tier-2 rows run over a table of invented processes. Live rows run `scripts/dev/live-orphan-sweep.sh` on a Linux KVM host (the service guest, `qemu-service`, an input share and the egress proxy, so qemu, virtiofsd and the proxy all run). The live rows run the sweep as `sandy run` makes it (a run whose template does not exist ends within seconds, after its sweep) and, for the report, through the `sweep_orphans` example. `sandy run` calls the sweep, and `sandyd` calls it once when it builds the `vm-qemu` environment backend (KENV19). The live gate unsets `SANDY_QEMU_BIN` and `SANDY_VIRTIOFSD_BIN`, so a stub never counts.
