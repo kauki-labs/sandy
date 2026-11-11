@@ -144,6 +144,7 @@ mod tests {
             op: Some(Op::OutputChunk(OutputChunk {
                 name: name.to_owned(),
                 bytes: vec![0u8; len],
+                output_index: 0,
             })),
         }
     }
