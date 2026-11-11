@@ -2589,7 +2589,8 @@ option (C, #707); nothing here waits for it.
 outside the staged file.
 
 **Check still owed.** The slice 2 live row (VM backend, real guest) must show that the token the guest reads changes
-across a renewal and that the provider rejects the old one. It needs a short renewal margin or a long run, and the
+across a renewal, how long the guest takes to see the atomic rename (the virtiofsd cache mode), and that the
+provider rejects the old token. It needs a short renewal margin or a long run, and the
 stub trust root (#733) cannot show the provider side.
 
 **A stub trust root for the live gate (#733).** Every vm environment needs a registered trust root, and the only
