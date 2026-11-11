@@ -20,7 +20,7 @@
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -270,6 +270,11 @@ impl InFlight {
 /// resolved again. Unlinking is blocking I/O (a hung destination stalls its thread), so dropping one queues the unlink
 /// on the blocking pool instead of running it on the async worker (#779). The write that may still be in flight on
 /// another blocking thread goes to the then unlinked file.
+///
+/// Queueing is not enough on its own: tokio cancels a `spawn_blocking` task that is still queued when the runtime shuts
+/// down, and one spawned after, without running them. So the work travels as an [`UnlinkOnDrop`] guard that the queued
+/// closure owns. The closure runs and drops it on a pool thread; a cancelled closure is dropped by tokio, and the
+/// guard unlinks inline on the thread that cancels it. Neither path loses the unlink.
 struct Cleanup(Option<(Beneath, OsString)>);
 
 impl Cleanup {
@@ -287,26 +292,34 @@ impl Cleanup {
         self.0 = None;
     }
 
+    /// Remove the file now, on the calling thread. Callers run it on the blocking pool.
     fn remove_now(mut self) {
-        if let Some((dir, temp)) = self.0.take() {
-            let _ = dir.remove_file(&temp);
-        }
+        drop(UnlinkOnDrop(self.0.take()));
     }
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let Some((dir, temp)) = self.0.take() else {
+        let Some(target) = self.0.take() else {
             return;
         };
+        let guard = UnlinkOnDrop(Some(target));
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => drop(handle.spawn_blocking(move || {
-                let _ = dir.remove_file(&temp);
-            })),
-            // No runtime left (shutdown): nothing else can run it.
-            Err(_) => {
-                let _ = dir.remove_file(&temp);
-            }
+            // The closure owns the guard: run, it unlinks on a pool thread; cancelled at shutdown, it unlinks inline.
+            Ok(handle) => drop(handle.spawn_blocking(move || drop(guard))),
+            // No runtime on this thread: nothing to queue on.
+            Err(_) => drop(guard),
+        }
+    }
+}
+
+/// Unlinks its temp file when dropped, wherever that happens.
+struct UnlinkOnDrop(Option<(Beneath, OsString)>);
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        if let Some((dir, temp)) = self.0.take() {
+            let _ = dir.remove_file(&temp);
         }
     }
 }
@@ -376,11 +389,24 @@ impl<'a> Receive<'a> {
         };
         current.file.flush().await.map_err(ReceiveError::Io)?;
         let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
-            if let Some((dir, temp)) = current.cleanup.0.as_ref() {
-                dir.rename(temp, &current.name)?;
+            let renamed = match current.cleanup.0.as_ref() {
+                Some((dir, temp)) => dir.rename(temp, &current.name),
+                None => Err(sandy_fsutil::FsError::Unsafe {
+                    path: PathBuf::from(&current.name),
+                    reason: "the temp file was already removed".to_owned(),
+                }),
+            };
+            match renamed {
+                Ok(()) => {
+                    current.cleanup.disarm();
+                    Ok(current)
+                }
+                Err(e) => {
+                    // Done here, before the peer hears of the failure.
+                    current.cleanup.take().remove_now();
+                    Err(e)
+                }
             }
-            current.cleanup.disarm();
-            Ok(current)
         })
         .await
         .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
