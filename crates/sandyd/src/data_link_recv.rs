@@ -817,6 +817,101 @@ mod tests {
         Ok(())
     }
 
+    /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
+    fn runtime_with_one_blocking_thread() -> anyhow::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .context("build the runtime")
+    }
+
+    /// Directory work is blocking I/O (a slow or hung destination stalls its thread): it runs on the blocking pool,
+    /// never inline on the async worker. With the pool's only thread occupied, the receive must not have created the
+    /// directory yet; before the fix it created it at once, on the worker (#779).
+    #[test]
+    fn creating_directories_waits_for_the_blocking_pool() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        rt.block_on(async {
+            let dest = tempfile::tempdir().context("dest")?;
+            let outputs = [out(None, dest.path())];
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+            write_frame(&mut peer, &chunk(0, "sub/f", b"x"))
+                .await
+                .context("write")?;
+            let stalled = tokio::time::timeout(
+                Duration::from_millis(400),
+                receive_outputs(&mut local, &outputs, quick()),
+            )
+            .await;
+            assert!(stalled.is_err(), "the receive cannot finish while the pool is occupied");
+            assert!(
+                !dest.path().join("sub").exists(),
+                "a directory was created on the async worker, not the blocking pool"
+            );
+            release.send(()).context("release")?;
+            blocker.await.context("blocker")?;
+            // The queued work of the dropped receive may still run; let it end before the directory goes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        })
+    }
+
+    /// The unlink of a file in flight, when the receive is dropped (a cancelled job), is blocking I/O too: it is
+    /// queued on the blocking pool, not run inside `Drop` on the async worker, and it still happens.
+    #[test]
+    fn a_dropped_receives_cleanup_runs_on_the_blocking_pool() -> anyhow::Result<()> {
+        let rt = runtime_with_one_blocking_thread()?;
+        rt.block_on(async {
+            let dest = tempfile::tempdir().context("dest")?;
+            let outputs = [out(None, dest.path())];
+            let (mut peer, mut local) = tokio::io::duplex(1024 * 1024);
+            write_frame(&mut peer, &chunk(0, "half", b"x")).await.context("write")?;
+
+            let mut receive = Box::pin(receive_outputs(&mut local, &outputs, quick()));
+            tokio::select! {
+                _ = &mut receive => anyhow::bail!("the receive ended with the peer silent"),
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            assert!(!tree(dest.path())?.is_empty(), "the file must be in flight");
+
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(receive);
+            assert!(
+                !tree(dest.path())?.is_empty(),
+                "the temp file was unlinked inside Drop, on the async worker"
+            );
+
+            release.send(()).context("release")?;
+            blocker.await.context("blocker")?;
+            let mut left = tree(dest.path())?;
+            for _ in 0..40 {
+                if left.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                left = tree(dest.path())?;
+            }
+            assert!(
+                left.is_empty(),
+                "the queued cleanup must still remove the temp file: {left:?}"
+            );
+            drop(peer);
+            Ok(())
+        })
+    }
+
     /// The byte cap is counted as bytes arrive: exactly at it passes, one past it stops, and what was written
     /// before the stop is a prefix of complete files only.
     #[tokio::test]
