@@ -1,0 +1,355 @@
+//! Stage a job's inputs from the data link before the run (#482 slice 5b, sandyd.md §22).
+//!
+//! `handle_dispatch` calls [`dial_data_link`] and [`stage_remote_inputs`] when `Dispatch.data_link_token` is not
+//! empty. The pull writes the inputs under a private root and the run takes its `Input` list from there, so
+//! `stage_inputs` and the backends stay as they are. The caller owns the result: dropping [`StagedInputs`] removes
+//! the root, on success and on every failure path.
+//!
+//! What this does NOT do: send outputs back (slice 6), or decide whether a job needs a data link (the sender's
+//! Submit-side rule, slice 7).
+
+use std::{io, net::SocketAddr, path::Path, time::Duration};
+
+use sandy_api::backend::{Input, RunControl};
+use sandy_executor_proto::REMOTE_LINK_TOKEN_LEN;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::input_pull::{PullError, PullLimits};
+
+/// The most time the whole input pull may take. `PullLimits::idle` bounds the gap between frames, and the job's
+/// deadline can be suspended while a client is attached, so neither bounds the pull as a whole: a peer that sends a
+/// frame every 29 s would otherwise hold this host's sequential dispatch loop for as long as it likes.
+pub const INPUT_PULL_TOTAL_SECS: u64 = 1800;
+
+/// Why the inputs could not be staged. Every variant means the job never booted.
+#[derive(Debug, thiserror::Error)]
+pub enum StageError {
+    /// A transferred input has an empty `Input.name`, so the sender cannot name its chunks.
+    #[error("a transferred input must be named")]
+    UnnamedInput,
+    /// The staging root could not be created.
+    #[error("creating the staging root: {0}")]
+    Root(#[source] io::Error),
+    /// The data link could not be dialed or claimed.
+    #[error("dialing the data link: {0}")]
+    Dial(String),
+    /// The pull failed.
+    #[error("the input transfer failed: {0}")]
+    Pull(#[from] PullError),
+    /// The job was cancelled during the pull.
+    #[error("the job was cancelled while its inputs were being pulled")]
+    Cancelled,
+    /// The job's deadline passed during the pull.
+    #[error("the job's deadline passed while its inputs were being pulled")]
+    DeadlinePassed,
+    /// The pull took longer than its total time cap.
+    #[error("the input transfer took longer than its total time cap")]
+    TotalCapExceeded,
+}
+
+/// The staged inputs. Owns the root and the data link: the link stays open through the run, because a data link
+/// claims once and slice 6 sends the outputs back over it.
+pub struct StagedInputs {
+    /// The `Input` list for the run: `host` points into the staging root; name and guest path are as declared.
+    pub inputs: Vec<Input>,
+    _root: tempfile::TempDir,
+    _link: Box<dyn Send>,
+}
+
+/// Dial the orchestrator's mesh listener and claim the job's data link with `data_token`.
+///
+/// # Errors
+/// [`StageError::Dial`] if the dial, the handshake or the prefix write fails or times out.
+pub async fn dial_data_link(
+    _forward_back: SocketAddr,
+    _job_id: &str,
+    _data_token: &[u8; REMOTE_LINK_TOKEN_LEN],
+    _mesh_tls: &sandy_fabric_local::mesh_link::MeshTlsIdentity,
+) -> Result<Box<dyn sandy_conn::Conn>, StageError> {
+    Err(StageError::Dial("not implemented".to_owned()))
+}
+
+/// Pull the declared `inputs` from `link` into a fresh private root under `parent`.
+///
+/// Races the pull against `control` (cancel, deadline) and `total_cap`.
+///
+/// # Errors
+/// See [`StageError`]. The root is gone on every error.
+pub async fn stage_remote_inputs<C>(
+    _link: C,
+    _inputs: &[sandy_executor_proto::Input],
+    _parent: &Path,
+    _control: &RunControl,
+    _total_cap: Duration,
+    _limits: PullLimits,
+) -> Result<StagedInputs, StageError>
+where
+    C: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    Err(StageError::Pull(PullError::Truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use sandy_control_proto::write_frame;
+    use sandy_executor_proto::{DataLinkMessage, InputChunk, InputEnd, TransferError, data_link_message::Op};
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    use super::*;
+
+    fn declared(name: &str, guest: Option<&str>) -> sandy_executor_proto::Input {
+        sandy_executor_proto::Input {
+            host: "/submitter/path/ignored".to_owned(),
+            name: name.to_owned(),
+            guest_path: guest.map(str::to_owned),
+        }
+    }
+
+    fn chunk(name: &str, offset: u64, bytes: &[u8]) -> DataLinkMessage {
+        DataLinkMessage {
+            op: Some(Op::InputChunk(InputChunk {
+                name: name.to_owned(),
+                offset,
+                bytes: bytes.to_vec(),
+            })),
+        }
+    }
+
+    fn end() -> DataLinkMessage {
+        DataLinkMessage {
+            op: Some(Op::InputEnd(InputEnd {})),
+        }
+    }
+
+    fn entries(dir: &Path) -> anyhow::Result<usize> {
+        Ok(std::fs::read_dir(dir).context("read the parent")?.count())
+    }
+
+    const CAP: Duration = Duration::from_secs(5);
+
+    async fn stage(
+        peer_messages: &[DataLinkMessage],
+        inputs: &[sandy_executor_proto::Input],
+        parent: &Path,
+        control: &RunControl,
+        total_cap: Duration,
+    ) -> anyhow::Result<(Result<StagedInputs, StageError>, DuplexStream)> {
+        let (mut peer, local) = tokio::io::duplex(4 * 1024 * 1024);
+        for message in peer_messages {
+            write_frame(&mut peer, message).await.context("peer write")?;
+        }
+        let limits = PullLimits {
+            idle: Duration::from_secs(2),
+            ..PullLimits::default()
+        };
+        let staged = tokio::time::timeout(
+            Duration::from_secs(10),
+            stage_remote_inputs(local, inputs, parent, control, total_cap, limits),
+        )
+        .await
+        .context("staging hung")?;
+        Ok((staged, peer))
+    }
+
+    fn live() -> RunControl {
+        RunControl::with_timeout_secs(600)
+    }
+
+    /// The pulled inputs land under a root inside `parent`, and the run's `Input` list points at them with the
+    /// declared name and guest path, never at the submitter's `host` path.
+    #[tokio::test]
+    async fn staged_inputs_point_into_the_private_root() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let inputs = [declared("data", Some("/work/data")), declared("src", None)];
+        let messages = [chunk("data", 0, b"hello"), chunk("src/a.txt", 0, b"A"), end()];
+        let (staged, _peer) = stage(&messages, &inputs, parent.path(), &live(), CAP).await?;
+        let staged = staged.context("the staging")?;
+
+        assert_eq!(staged.inputs.len(), 2);
+        assert_eq!(staged.inputs[0].name, "data");
+        assert_eq!(staged.inputs[0].guest_path.as_deref(), Some(Path::new("/work/data")));
+        assert_eq!(staged.inputs[1].guest_path, None);
+        for input in &staged.inputs {
+            assert!(
+                input.host.starts_with(parent.path()),
+                "{:?} is outside the parent",
+                input.host
+            );
+        }
+        assert_eq!(std::fs::read(&staged.inputs[0].host).context("data")?, b"hello");
+        assert_eq!(
+            std::fs::read(staged.inputs[1].host.join("a.txt")).context("a.txt")?,
+            b"A"
+        );
+        assert_eq!(entries(parent.path())?, 1, "exactly one root under the parent");
+        Ok(())
+    }
+
+    /// Dropping the staged inputs removes the root, and only then does the link close: it stays open through the
+    /// run so slice 6 can send the outputs back over the one claim.
+    #[tokio::test]
+    async fn the_root_and_the_link_live_until_the_staged_inputs_drop() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let inputs = [declared("data", None)];
+        let (staged, mut peer) = stage(&[chunk("data", 0, b"x"), end()], &inputs, parent.path(), &live(), CAP).await?;
+        let staged = staged.context("the staging")?;
+
+        let mut byte = [0u8; 1];
+        let open = tokio::time::timeout(Duration::from_millis(300), peer.read(&mut byte)).await;
+        assert!(
+            open.is_err(),
+            "the link must stay open while the staged inputs live: {open:?}"
+        );
+
+        drop(staged);
+        assert_eq!(entries(parent.path())?, 0, "the root must be removed on drop");
+        let closed = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+            .await
+            .context("the link must close after the drop")?
+            .context("read")?;
+        assert_eq!(closed, 0);
+        Ok(())
+    }
+
+    /// A job with no declared inputs (outputs only) still reads to `InputEnd` and stages nothing.
+    #[tokio::test]
+    async fn zero_inputs_stage_nothing_and_succeed() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let (staged, _peer) = stage(&[end()], &[], parent.path(), &live(), CAP).await?;
+        assert!(staged.context("the staging")?.inputs.is_empty());
+        Ok(())
+    }
+
+    /// Every failure leaves the parent empty, and names the cause distinctly from a guest failure.
+    #[tokio::test]
+    async fn a_failed_pull_removes_the_root_and_names_the_cause() -> anyhow::Result<()> {
+        let inputs = [declared("data", None)];
+        let transfer_error = DataLinkMessage {
+            op: Some(Op::TransferError(TransferError {
+                reason: "disk full".to_owned(),
+            })),
+        };
+        for (messages, check) in [
+            (vec![chunk("data", 0, b"x")], "silent after a chunk"),
+            (vec![transfer_error], "peer"),
+            (vec![chunk("evil", 0, b"x"), end()], "undeclared"),
+        ] {
+            let parent = tempfile::tempdir().context("parent")?;
+            let (staged, _peer) = stage(&messages, &inputs, parent.path(), &live(), CAP).await?;
+            match staged {
+                Err(StageError::Pull(_)) => {}
+                Err(other) => anyhow::bail!("{check}: expected a Pull error, got {other}"),
+                Ok(_) => anyhow::bail!("{check}: expected a failure"),
+            }
+            assert_eq!(entries(parent.path())?, 0, "{check}: the root must be gone");
+        }
+        Ok(())
+    }
+
+    /// A Cancel during the pull ends it promptly with `Cancelled`, not a transfer failure, and cleans up.
+    #[tokio::test]
+    async fn a_cancel_during_the_pull_is_reported_as_cancelled() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let control = live();
+        let canceller = control.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let (staged, _peer) = stage(
+            &[chunk("data", 0, b"x")],
+            &[declared("data", None)],
+            parent.path(),
+            &control,
+            CAP,
+        )
+        .await?;
+        assert!(matches!(staged, Err(StageError::Cancelled)), "got {:?}", staged.err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the cancel must end the pull promptly"
+        );
+        assert_eq!(entries(parent.path())?, 0);
+        Ok(())
+    }
+
+    /// A deadline that has already passed ends the pull with `DeadlinePassed`.
+    #[tokio::test]
+    async fn a_passed_deadline_ends_the_pull() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let control = RunControl::new(std::time::Instant::now());
+        let (staged, _peer) = stage(
+            &[chunk("data", 0, b"x")],
+            &[declared("data", None)],
+            parent.path(),
+            &control,
+            CAP,
+        )
+        .await?;
+        assert!(
+            matches!(staged, Err(StageError::DeadlinePassed)),
+            "got {:?}",
+            staged.err()
+        );
+        assert_eq!(entries(parent.path())?, 0);
+        Ok(())
+    }
+
+    /// A peer that sends a frame inside every idle gap, forever, is stopped by the total cap.
+    #[tokio::test]
+    async fn a_trickle_under_the_idle_gap_hits_the_total_cap() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let (mut peer, local) = tokio::io::duplex(4 * 1024 * 1024);
+        let sender = tokio::spawn(async move {
+            for offset in 0..200u64 {
+                if write_frame(&mut peer, &chunk("data", offset, b"x")).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            peer
+        });
+        let limits = PullLimits {
+            idle: Duration::from_secs(2),
+            ..PullLimits::default()
+        };
+        let staged = stage_remote_inputs(
+            local,
+            &[declared("data", None)],
+            parent.path(),
+            &live(),
+            Duration::from_millis(400),
+            limits,
+        )
+        .await;
+        assert!(
+            matches!(staged, Err(StageError::TotalCapExceeded)),
+            "got {:?}",
+            staged.err()
+        );
+        assert_eq!(entries(parent.path())?, 0);
+        sender.abort();
+        Ok(())
+    }
+
+    /// An input with an empty name is refused before any root is made: the sender cannot name its chunks.
+    #[tokio::test]
+    async fn an_unnamed_input_is_refused_before_a_root_exists() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir().context("parent")?;
+        let unnamed = sandy_executor_proto::Input {
+            host: "/x".to_owned(),
+            name: String::new(),
+            guest_path: None,
+        };
+        let (staged, _peer) = stage(&[end()], &[unnamed], parent.path(), &live(), CAP).await?;
+        assert!(
+            matches!(staged, Err(StageError::UnnamedInput)),
+            "got {:?}",
+            staged.err()
+        );
+        assert_eq!(entries(parent.path())?, 0);
+        Ok(())
+    }
+}
