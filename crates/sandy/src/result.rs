@@ -86,6 +86,55 @@ pub fn classify_invalid_plan(_error: &PlanError) -> Classification {
     invalid_plan()
 }
 
+/// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
+///
+/// `outputs` are the files the backend collected to the job's declared
+/// destinations (empty when the run never collected, e.g. an invalid plan or an
+/// infra fault). `receipt` is the audit receipt (#361): `None` for a run that
+/// never reached the backend (invalid plan) or never ran one (`kill`'s synthetic
+/// cancellation). Provenance remains a placeholder (provenance capture lands
+/// with #26).
+#[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every field of the LOCKED envelope this helper assembles; a bundling struct would just move the fields, \
+              not reduce them"
+)]
+pub fn build_envelope(
+    job_id: &str,
+    box_id: Option<String>,
+    classification: Classification,
+    guest_exit: Option<i32>,
+    message: String,
+    console: String,
+    outputs: Vec<OutputRef>,
+    receipt: Option<AuditReceipt>,
+) -> ResultEnvelope {
+    ResultEnvelope {
+        result_schema_version: RESULT_SCHEMA_VERSION,
+        job_id: job_id.to_string(),
+        box_id,
+        status: classification.status,
+        retryable: classification.retryable,
+        message,
+        exit_code: guest_exit,
+        outputs,
+        receipts: vec![],
+        provenance: Provenance {
+            template_store_path: String::new(),
+        },
+        // The captured guest console tail (boot log + command output), so a boot
+        // that never reached the command is diagnosable from the envelope alone.
+        // Redaction (M-6) happens in the caller, right before this console is
+        // passed in — there's no seam after `build_envelope` returns.
+        logs: Logs { tail: console },
+        // A credentialed run folds a non-fatal teardown fault in here after this
+        // envelope is built (L-12); every other path leaves it empty.
+        warnings: vec![],
+        receipt,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use anyhow::Context;

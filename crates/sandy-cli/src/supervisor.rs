@@ -27,9 +27,9 @@ use sandy::{
     AuditReceipt, BackendError, CALL_DEADLINE, Classification, CoreError, CredentialProvider, CredentialReceipt,
     DirFingerprint, EgressApplier, EgressOs, EgressOutcome, EgressPlan, GuestReported, JOURNAL_SCHEMA_VERSION, JobLock,
     JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
-    ResultEnvelope, Scope, SecretSource, Status, VmBackend, classify_backend_error, classify_invalid_plan,
-    classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped, reconcile_job,
-    validate_egress_hosts, validate_network_mode, validate_no_secret_leak, validate_proxy_egress,
+    ResultEnvelope, Scope, SecretSource, Status, VmBackend, build_envelope, classify_backend_error,
+    classify_invalid_plan, classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped,
+    reconcile_job, validate_egress_hosts, validate_network_mode, validate_no_secret_leak, validate_proxy_egress,
 };
 use zeroize::Zeroizing;
 
@@ -43,7 +43,7 @@ mod outputs;
 
 use cred_refresh::{CredTeardown, refresh_interval, refresh_loop, safe_heartbeat_tick};
 pub use cred_refresh::{DEFAULT_REFRESH_MARGIN_SECS, DEFAULT_REFRESH_TICK_SECS};
-use envelope::{build_envelope, build_host_observed, no_network_allow_warning, redact_console, redact_with_refreshes};
+use envelope::{build_host_observed, no_network_allow_warning, redact_console, redact_with_refreshes};
 pub use journal::JournalWriter;
 use journal::{JobOutcome, write_terminal_record};
 use lifecycle::{gc_against, gc_records};

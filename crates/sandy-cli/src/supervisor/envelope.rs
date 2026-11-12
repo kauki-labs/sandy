@@ -1,4 +1,4 @@
-//! Build the LOCKED [`ResultEnvelope`] and its supporting pieces: console
+//! The supporting pieces of the LOCKED result envelope (built by `sandy::build_envelope`): console
 //! redaction (M-6), the audit receipt's host-observed half (#361), and the
 //! no-network-allow warning (#358). Consumed by
 //! [`super::run_job_core`]/[`super::run_job_with_credential_timed`].
@@ -6,9 +6,8 @@
 use std::time::SystemTime;
 
 use sandy::{
-    AllowList, AuditReceipt, Classification, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt, HostObserved,
-    Location, Logs, NetworkMode, OutputRef, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, SandboxKind, Timing,
-    What, Who,
+    AllowList, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt, HostObserved, Location, NetworkMode,
+    SandboxKind, Timing, What, Who,
 };
 use zeroize::Zeroizing;
 
@@ -41,54 +40,6 @@ pub(super) fn redact_console<S: AsRef<str>>(mut console: String, secrets: &[S]) 
 /// every occurrence of it into `[REDACTED]`.
 pub(super) fn redact_with_refreshes(console: String, initial: &str, refreshed: &[Zeroizing<String>]) -> String {
     redact_console(redact_console(console, &[initial]), refreshed)
-}
-
-/// Build the LOCKED [`ResultEnvelope`] from a terminal [`Classification`].
-///
-/// `outputs` are the files the backend collected to the job's declared
-/// destinations (empty when the run never collected, e.g. an invalid plan or an
-/// infra fault). `receipt` is the audit receipt (#361): `None` for a run that
-/// never reached the backend (invalid plan) or never ran one (`kill`'s synthetic
-/// cancellation). Provenance remains a placeholder (provenance capture lands
-/// with #26).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "every field of the LOCKED envelope this helper assembles; a bundling struct would just move the fields, \
-              not reduce them"
-)]
-pub(super) fn build_envelope(
-    job_id: &str,
-    box_id: Option<String>,
-    classification: Classification,
-    guest_exit: Option<i32>,
-    message: String,
-    console: String,
-    outputs: Vec<OutputRef>,
-    receipt: Option<AuditReceipt>,
-) -> ResultEnvelope {
-    ResultEnvelope {
-        result_schema_version: RESULT_SCHEMA_VERSION,
-        job_id: job_id.to_string(),
-        box_id,
-        status: classification.status,
-        retryable: classification.retryable,
-        message,
-        exit_code: guest_exit,
-        outputs,
-        receipts: vec![],
-        provenance: Provenance {
-            template_store_path: String::new(),
-        },
-        // The captured guest console tail (boot log + command output), so a boot
-        // that never reached the command is diagnosable from the envelope alone.
-        // Redaction (M-6) happens in the caller, right before this console is
-        // passed in — there's no seam after `build_envelope` returns.
-        logs: Logs { tail: console },
-        // A credentialed run folds a non-fatal teardown fault in here after this
-        // envelope is built (L-12); every other path leaves it empty.
-        warnings: vec![],
-        receipt,
-    }
 }
 
 /// The backend kind name for [`Location::backend`] (#361): `"process"` for the
