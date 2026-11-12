@@ -120,6 +120,53 @@ fn credential_placement_refusal() -> String {
         .to_owned()
 }
 
+/// Refuse a Submit that names an input or an output the data link would refuse (#807, #764), before placement or any
+/// job: the same rule the sender and the receiver apply (`DataLinkMessage::validate`), so a name that cannot cross the
+/// mesh, or that would leave the staging root, fails here with the field named, not on a host after a transfer began.
+/// Two names in one field that are equal, or one nested inside the other (`a` and `a/b`), clash the same way the
+/// sender and the staging root refuse them. An output with no name is the catch-all and has no name to check.
+fn transfer_name_refusal(submit: &SubmitRequest) -> Option<String> {
+    let inputs: Vec<&str> = submit.inputs.iter().map(|input| input.name.as_str()).collect();
+    let outputs: Vec<&str> = submit
+        .outputs
+        .iter()
+        .filter_map(|output| output.name.as_deref())
+        .collect();
+    [("inputs", inputs), ("outputs", outputs)]
+        .into_iter()
+        .find_map(|(field, names)| field_name_refusal(field, &names))
+}
+
+fn field_name_refusal(field: &str, names: &[&str]) -> Option<String> {
+    for name in names {
+        let probe = sandy_executor_proto::DataLinkMessage {
+            op: Some(sandy_executor_proto::data_link_message::Op::InputChunk(
+                sandy_executor_proto::InputChunk {
+                    name: (*name).to_owned(),
+                    offset: 0,
+                    bytes: Vec::new(),
+                },
+            )),
+        };
+        if let Err(e) = probe.validate() {
+            return Some(format!(
+                "{field}: the name {name:?} is not a plain relative path the data link accepts: {e}"
+            ));
+        }
+    }
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            let nested = |outer: &str, inner: &str| inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('/'));
+            if a == b || nested(a, b) || nested(b, a) {
+                return Some(format!(
+                    "{field}: the names {a:?} and {b:?} clash (equal, or one inside the other)"
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
 /// any side effect: `cred_capabilities` with no `credential`, a credential name
 /// that is not a single file name, a credential on a daemon with no credential
@@ -437,6 +484,12 @@ pub async fn handle(
             // #481: a credential request this daemon cannot honor is refused
             // before placement and before any mint.
             if let Some(message) = credential_request_refusal(&submit, registry) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
+            if let Some(message) = transfer_name_refusal(&submit) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(ControlError { message })),
@@ -2749,6 +2802,129 @@ mod tests {
                 egress: None,
             }),
         )
+    }
+
+    fn submit_with_names(input: Option<&str>, output: Option<Option<&str>>) -> ControlRequest {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.inputs = input
+                .map(|name| {
+                    vec![sandy_control_proto::Input {
+                        host: "/src".to_owned(),
+                        name: name.to_owned(),
+                        guest_path: None,
+                    }]
+                })
+                .unwrap_or_default();
+            submit.outputs = output
+                .map(|name| {
+                    vec![sandy_control_proto::Output {
+                        name: name.map(str::to_owned),
+                        dest: "/out".to_owned(),
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        request
+    }
+
+    /// #807, #764: a name the data link would refuse is refused at Submit, naming the field, before placement or any
+    /// job: an absolute path, a `..` or `.` component, an empty component, a NUL, an over-long name.
+    #[tokio::test]
+    async fn a_submit_with_an_unsafe_input_or_output_name_is_refused_naming_the_field() -> anyhow::Result<()> {
+        let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
+        for bad in [
+            too_long.as_str(),
+            "/abs",
+            "../up",
+            "a/../b",
+            "./a",
+            "a//b",
+            "a/",
+            "a\0b",
+            "",
+        ] {
+            for (request, field) in [
+                (submit_with_names(Some(bad), None), "inputs"),
+                (submit_with_names(None, Some(Some(bad))), "outputs"),
+            ] {
+                let (store, registry) = (new_store(), new_registry());
+                let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+                let Some(control_response::Result::Error(error)) = response.result else {
+                    anyhow::bail!("name {bad:?} in {field}: expected a refusal, got {response:?}");
+                };
+                assert!(
+                    error.message.contains("is not a plain relative path") && error.message.contains(field),
+                    "name {bad:?} in {field}: got {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #807 (sandy-86 on #822): two declared names that are equal, or one nested inside the other, are refused at
+    /// Submit, in `inputs` and in `outputs`, so a broker or MCP Submit fails before it mints a credential or places.
+    #[tokio::test]
+    async fn a_submit_with_duplicate_or_nested_names_is_refused_naming_the_field() -> anyhow::Result<()> {
+        for names in [["a", "a"], ["a", "a/b"], ["a/b", "a"]] {
+            for field in ["inputs", "outputs"] {
+                let mut request = submit_req_with_input(1);
+                if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                    if field == "inputs" {
+                        submit.inputs = names
+                            .iter()
+                            .map(|name| sandy_control_proto::Input {
+                                host: "/src".to_owned(),
+                                name: (*name).to_owned(),
+                                guest_path: None,
+                            })
+                            .collect();
+                    } else {
+                        submit.inputs = Vec::new();
+                        submit.outputs = names
+                            .iter()
+                            .map(|name| sandy_control_proto::Output {
+                                name: Some((*name).to_owned()),
+                                dest: "/out".to_owned(),
+                            })
+                            .collect();
+                    }
+                }
+                let (store, registry) = (new_store(), new_registry());
+                let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+                let Some(control_response::Result::Error(error)) = response.result else {
+                    anyhow::bail!("{names:?} in {field}: expected a refusal, got {response:?}");
+                };
+                assert!(
+                    error.message.contains("clash") && error.message.contains(field),
+                    "{names:?} in {field}: got {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A catch-all output (no name) and plain names, including a nested one, pass the name check (they may still be
+    /// refused for placement, which is a different message).
+    #[tokio::test]
+    async fn plain_names_and_a_catch_all_output_pass_the_name_check() -> anyhow::Result<()> {
+        for request in [
+            submit_with_names(Some("src"), Some(None)),
+            submit_with_names(Some("a/b/c.txt"), Some(Some("report"))),
+        ] {
+            let (store, registry) = (new_store(), new_registry());
+            let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+            if let Some(control_response::Result::Error(error)) = response.result {
+                assert!(
+                    !error.message.contains("is not a plain relative path"),
+                    "a plain name was refused: {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Place `request` on one registered host and return its `Dispatch` and
