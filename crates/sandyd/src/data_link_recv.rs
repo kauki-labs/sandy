@@ -234,6 +234,25 @@ async fn pump(
     }
 }
 
+/// The key under which a receive remembers a completed file or a created directory: a fixed-size digest of the output
+/// index and the wire name, so memory per entry does not depend on the length of a name the peer chose (#780).
+type EntryKey = [u8; 16];
+
+/// The key of `name` under the output at `index`. The name is length-prefixed, so no two (index, name) pairs share
+/// the bytes that are hashed.
+fn entry_key(index: u32, name: &str) -> EntryKey {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::new()
+        .chain_update(index.to_be_bytes())
+        .chain_update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes())
+        .chain_update(name.as_bytes())
+        .finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
 /// What one receive has done so far.
 struct Receive<'a> {
     outputs: &'a [sandy_executor_proto::Output],
@@ -241,9 +260,9 @@ struct Receive<'a> {
     received: Received,
     /// Files plus the distinct directories created below a destination: what `max_entries` caps.
     entries: usize,
-    dirs: HashSet<(u32, String)>,
+    dirs: HashSet<EntryKey>,
     /// Files already completed, by output index and wire name.
-    done: HashSet<(u32, String)>,
+    done: HashSet<EntryKey>,
     current: Option<InFlight>,
     temp_seq: u64,
 }
@@ -366,7 +385,7 @@ impl<'a> Receive<'a> {
             }
         } else {
             self.finish_file().await?;
-            if self.done.contains(&key) {
+            if self.done.contains(&entry_key(key.0, &key.1)) {
                 return Err(ReceiveError::Reopened);
             }
             self.start_file(key).await?;
@@ -410,7 +429,7 @@ impl<'a> Receive<'a> {
         })
         .await
         .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
-        self.done.insert(current.key);
+        self.done.insert(entry_key(current.key.0, &current.key.1));
         self.received.files += 1;
         Ok(())
     }
@@ -425,7 +444,7 @@ impl<'a> Receive<'a> {
                 prefix.push('/');
             }
             prefix.push_str(part);
-            if self.dirs.insert((key.0, prefix.clone())) {
+            if self.dirs.insert(entry_key(key.0, &prefix)) {
                 self.count_entry()?;
             }
         }
@@ -1063,6 +1082,68 @@ mod tests {
             "the unlink was lost with the pool, the temp file stays: {left:?}"
         );
         drop(peer);
+        Ok(())
+    }
+
+    /// The entry key tells every (output index, name) pair apart: the index counts, the name counts, and a name that
+    /// ends where another starts cannot be confused with it (the name is length-prefixed).
+    #[test]
+    fn the_entry_key_tells_pairs_apart() {
+        let keys = [
+            entry_key(0, "a"),
+            entry_key(1, "a"),
+            entry_key(0, "b"),
+            entry_key(0, "a/b"),
+            entry_key(0, "ab"),
+            entry_key(0, ""),
+            entry_key(256, "a"),
+            entry_key(0, &"a".repeat(4096)),
+            entry_key(0, &"a".repeat(4095)),
+        ];
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "two pairs share a key: {keys:?}");
+    }
+
+    /// The same pair always has the same key, or a completed file would never be recognised again.
+    #[test]
+    fn the_entry_key_is_stable() {
+        assert_eq!(entry_key(3, "out/x.txt"), entry_key(3, "out/x.txt"));
+    }
+
+    /// The memory a receive holds per entry is the key, not the name: a key is 16 bytes however long the name.
+    #[test]
+    fn a_key_does_not_grow_with_the_name() {
+        assert_eq!(std::mem::size_of_val(&entry_key(0, &"n".repeat(4096))), 16);
+        assert_eq!(std::mem::size_of_val(&entry_key(0, "n")), 16);
+    }
+
+    /// A file that arrives twice is still refused with keys in place of names, and a different name is not mistaken
+    /// for it, including one that shares a long prefix.
+    #[tokio::test]
+    async fn reopening_is_detected_by_key_and_near_names_are_not_confused() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let long = "d".repeat(200);
+        let near = format!("{long}x");
+        let messages = [
+            chunk(0, &long, b"1"),
+            chunk(0, &near, b"2"),
+            chunk(0, "other", b"3"),
+            end(),
+        ];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert_eq!(received.context("three different files")?.files, 3);
+
+        let dest = tempfile::tempdir().context("dest")?;
+        let outputs = [out(None, dest.path())];
+        let messages = [
+            chunk(0, &long, b"1"),
+            chunk(0, "other", b"2"),
+            chunk(0, &long, b"3"),
+            end(),
+        ];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert!(matches!(received, Err(ReceiveError::Reopened)), "got {received:?}");
         Ok(())
     }
 

@@ -2026,6 +2026,9 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The receiver refuses an index past `Dispatch.outputs`, a name outside its named output, a file that arrives twice
   (outputs carry no offset), an empty chunk after data or repeated, a message that is not an output message, and a
   transfer past the byte, entry or idle limit. The peer is told a fixed text.
+- The receive remembers a completed file and a created directory by a fixed 16-byte key (a truncated SHA-256 of the
+  output index and the length-prefixed name), not by the name, so a hostile host cannot make it hold about 400 MB
+  with 100,000 entries of 4 KiB names (#780). A collision needs a 128-bit hash collision.
 - A receive is also bounded in total: `DEFAULT_TOTAL` (30 minutes, as the host's input pull) ends it with
   `TotalDeadline` however steadily frames arrive, and `max_frames` (twice the entries plus one chunk per
   `MAX_CHUNK_BYTES` of the byte cap) ends it with `TooManyFrames`, so a peer cannot hold the link and an open file
