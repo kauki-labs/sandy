@@ -875,6 +875,55 @@ mod tests {
         Ok(())
     }
 
+    /// A2 (#483, sandy-5e on #828): the envelope's `message` comes from the executor's own report and can hold the
+    /// staged token like the console does, so it is redacted before it is stored.
+    #[tokio::test]
+    async fn a_token_in_the_transport_error_never_reaches_the_stored_envelope() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_host_with(&d, "host-1", capabilities(true)).await?;
+        let submitted = match submit(&d, submit_req(Some("gh-test"), Vec::new())).await? {
+            control_response::Result::Submit(ok) => ok,
+            other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
+        };
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: None,
+                    timed_out: false,
+                    transport_error: Some(format!("agent link failed: GITHUB_TOKEN={TOKEN}")),
+                    console: String::new(),
+                    outputs_follow: false,
+                })),
+            },
+        )
+        .await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        wait_status(&d, &submitted.job_id, JobStatus::Failed).await?;
+
+        let envelope = d
+            .store
+            .envelope(&submitted.job_id)?
+            .context("a terminal job carries an envelope")?;
+        assert!(!envelope.message.contains(TOKEN), "message: {:?}", envelope.message);
+        assert!(
+            envelope.message.contains("agent link failed"),
+            "the rest of the message is kept: {:?}",
+            envelope.message
+        );
+        let json = d.store.envelope_json(&submitted.job_id)?.unwrap_or_default();
+        assert!(!json.contains(TOKEN), "the stored JSON holds no token");
+
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
     /// Acceptance 5: a revoke failure is surfaced in the daemon log, naming the
     /// job, and the staged file is still removed.
     #[tokio::test]

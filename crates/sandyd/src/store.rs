@@ -814,6 +814,28 @@ mod tests {
         Ok(())
     }
 
+    /// A2 (#483, sandy-5e on #828): a cancelled job records the cancelled envelope in the cancel's own statement, from
+    /// `Pending` and from `Running`, so no terminal row lacks one. The direct `kill` writes the same shape.
+    #[test]
+    fn a_cancelled_job_records_a_cancelled_envelope() -> anyhow::Result<()> {
+        for running in [false, true] {
+            let store = JobStore::open_in_memory()?;
+            store.insert_pending("job-1", b"m", "test/v1")?;
+            if running {
+                store.mark_running("job-1")?;
+            }
+            assert_eq!(store.cancel("job-1")?, CancelOutcome::Cancelled);
+            let envelope = store
+                .envelope("job-1")?
+                .with_context(|| format!("running={running}: a cancelled job must carry an envelope"))?;
+            assert_eq!(envelope.status, sandy::Status::Cancelled, "running={running}");
+            assert!(!envelope.retryable, "a cancel is not retried by the platform");
+            assert_eq!(envelope.job_id, "job-1");
+            assert_eq!(envelope.exit_code, None);
+        }
+        Ok(())
+    }
+
     /// A non-zero exit is still recorded faithfully — the raw code is kept
     /// even when the orchestrator classifies the band as Failed.
     #[test]
