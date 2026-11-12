@@ -1496,6 +1496,13 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   with no remote placement at all, the Submit is refused naming the capability, never run unfiltered locally. `sandyd`
   and the executor both check each rule (a host, a port in 1..=65535), and the executor refuses a policy on a process
   job. The egress receipt in the result envelope is A2.
+- A4 (#483): `sandy daemon prune [--keep-last N]` (default 20) is `sandy gc` for the daemon: the `Prune` control RPC
+  deletes the terminal rows (succeeded, failed, cancelled) except the newest N, newest by creation time then insertion
+  order, and sweeps stale `cred-*` and `verify-*` dirs past `MAX_TTL_SECS` under the daemon host's sandy staging base. A
+  pending or running job is never deleted and does not count toward N. A deleted row takes its stored result envelope
+  with it. The report is `gc`'s (`evicted`, `swept_staging_dirs`), so promoting the verb to `gc` changes no format. Prune
+  is an operator verb over the 0700 socket, the same trust as `list`; it needs no attach token because it touches no
+  running job. A credential provider configured with another staging base is not swept.
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's
