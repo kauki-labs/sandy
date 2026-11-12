@@ -487,3 +487,154 @@ async fn without_a_trusted_only_backend_an_untrusted_client_may_still_spawn() ->
     spawn_id(&f, TOKEN_B, spawn_body("u1")).await?;
     Ok(())
 }
+
+fn task_body(request_id: &str, task_ref: &str) -> Value {
+    let mut body = ephemeral_body(request_id);
+    body["task_ref"] = json!(task_ref);
+    body
+}
+
+async fn state_of(f: &common::Fixture, token: &str, id: &str) -> Result<String> {
+    let (status, body) = f
+        .call("GET", &format!("/v1/environments/{id}"), Some(token), None)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(body["state"].as_str().context("state")?.to_owned())
+}
+
+/// Ending a task deletes every environment of the caller with that `task_ref` through the delete path, leaves the
+/// caller's other environments, and is idempotent (#815).
+#[tokio::test]
+async fn end_task_deletes_the_callers_environments_of_that_task_only_and_is_idempotent() -> Result<()> {
+    let f = fixture().await?;
+    let one = spawn_id(&f, TOKEN_A, task_body("e1", "task-a")).await?;
+    let two = spawn_id(&f, TOKEN_A, task_body("e2", "task-a")).await?;
+    let other = spawn_id(&f, TOKEN_A, task_body("e3", "task-b")).await?;
+    let none = spawn_id(&f, TOKEN_A, ephemeral_body("e4")).await?;
+
+    let (status, body) = f
+        .call(
+            "POST",
+            "/v1/tasks/end",
+            Some(TOKEN_A),
+            Some(json!({"task_ref": "task-a"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut ended: Vec<String> = body["ended"]
+        .as_array()
+        .context("ended")?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    ended.sort();
+    let mut want = vec![one.clone(), two.clone()];
+    want.sort();
+    assert_eq!(ended, want, "{body}");
+    assert_eq!(state_of(&f, TOKEN_A, &one).await?, "deleted");
+    assert_eq!(state_of(&f, TOKEN_A, &two).await?, "deleted");
+    assert_eq!(
+        state_of(&f, TOKEN_A, &other).await?,
+        "provisioning",
+        "another task is untouched"
+    );
+    assert_eq!(
+        state_of(&f, TOKEN_A, &none).await?,
+        "provisioning",
+        "an environment without a task is untouched"
+    );
+
+    let (status, again) = f
+        .call(
+            "POST",
+            "/v1/tasks/end",
+            Some(TOKEN_A),
+            Some(json!({"task_ref": "task-a"})),
+        )
+        .await?;
+    assert_eq!(
+        (status, &again["ended"]),
+        (StatusCode::OK, &json!([])),
+        "a repeat is a no-op: {again}"
+    );
+    Ok(())
+}
+
+/// Another client's environment with the same `task_ref` is not the caller's to end.
+#[tokio::test]
+async fn end_task_never_touches_another_clients_environment_with_the_same_task_ref() -> Result<()> {
+    let f = fixture().await?;
+    let mine = spawn_id(&f, TOKEN_A, task_body("m1", "shared")).await?;
+    let theirs = spawn_id(&f, TOKEN_B, task_body("t1", "shared")).await?;
+    let (status, body) = f
+        .call(
+            "POST",
+            "/v1/tasks/end",
+            Some(TOKEN_A),
+            Some(json!({"task_ref": "shared"})),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ended"], json!([mine.clone()]), "{body}");
+    assert_eq!(state_of(&f, TOKEN_A, &mine).await?, "deleted");
+    assert_eq!(
+        state_of(&f, TOKEN_B, &theirs).await?,
+        "provisioning",
+        "b's environment survives a's end_task"
+    );
+    Ok(())
+}
+
+/// A task that has no environment is a successful no-op, not an error.
+#[tokio::test]
+async fn end_task_of_an_unknown_task_is_a_successful_no_op() -> Result<()> {
+    let f = fixture().await?;
+    let id = spawn_id(&f, TOKEN_A, task_body("u1", "task-a")).await?;
+    let (status, body) = f
+        .call(
+            "POST",
+            "/v1/tasks/end",
+            Some(TOKEN_A),
+            Some(json!({"task_ref": "nobody-has-this"})),
+        )
+        .await?;
+    assert_eq!((status, &body["ended"]), (StatusCode::OK, &json!([])), "{body}");
+    assert_eq!(state_of(&f, TOKEN_A, &id).await?, "provisioning");
+    Ok(())
+}
+
+/// An empty `task_ref` matches no task (the list filter reads it as "any"), so it is refused and nothing is deleted.
+/// So are a too-long one, one with a control character, a missing one and an unknown field.
+#[tokio::test]
+async fn end_task_refuses_a_bad_task_ref_and_deletes_nothing() -> Result<()> {
+    let f = fixture().await?;
+    let id = spawn_id(&f, TOKEN_A, task_body("b1", "task-a")).await?;
+    let plain = spawn_id(&f, TOKEN_A, ephemeral_body("b2")).await?;
+    let long = "x".repeat(257);
+    for body in [
+        json!({"task_ref": ""}),
+        json!({"task_ref": long}),
+        json!({"task_ref": "a\nb"}),
+        json!({}),
+        json!({"task_ref": "task-a", "also": true}),
+        json!({"task_ref": 5}),
+    ] {
+        let (status, resp) = f
+            .call("POST", "/v1/tasks/end", Some(TOKEN_A), Some(body.clone()))
+            .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {resp}");
+    }
+    assert_eq!(state_of(&f, TOKEN_A, &id).await?, "provisioning");
+    assert_eq!(state_of(&f, TOKEN_A, &plain).await?, "provisioning");
+    Ok(())
+}
+
+#[tokio::test]
+async fn end_task_needs_the_bearer_token() -> Result<()> {
+    let f = fixture().await?;
+    let (status, _) = f
+        .call("POST", "/v1/tasks/end", None, Some(json!({"task_ref": "task-a"})))
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
+}

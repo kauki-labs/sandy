@@ -218,6 +218,40 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/EnvironmentSummary"}
         default: {$ref: "#/components/responses/Error"}
+  /v1/tasks/end:
+    post:
+      operationId: endTask
+      summary: >
+        End a task: delete every environment of the caller's own spawned with this task_ref (#815). Deleting an environment ends its task, and an ephemeral environment's ttl_secs is the backstop for a caller that never does. Each environment goes through the same delete as deleteEnvironment. Idempotent; a task with no environment is a successful no-op. Another client's environments are never touched.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_ref]
+              additionalProperties: false
+              properties:
+                task_ref:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                  description: At most 256 bytes of UTF-8 (the broker counts bytes, not characters) and no control characters.
+      responses:
+        "200":
+          description: The ids this call deleted (empty on a repeat or an unknown task).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ended]
+                additionalProperties: false
+                properties:
+                  ended:
+                    type: array
+                    items: {type: string}
+        default: {$ref: "#/components/responses/Error"}
   /v1/environments/{environment_id}/cancel:
     parameters:
       - {$ref: "#/components/parameters/EnvironmentId"}

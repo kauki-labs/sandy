@@ -2214,7 +2214,14 @@ so the environment operations need an MCP surface beside the job operations.
 
 - `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`, `attach`) and environment tools
   (`spawn_environment`, `get_environment`, `link_environment`, `cancel_environment`,
-  `delete_environment`, `stop_environment`, `resume_environment`, `list_environments`).
+  `delete_environment`, `end_task`, `stop_environment`, `resume_environment`, `list_environments`).
+- **Ending a task (#815, owner decision).** Deleting an environment ends its task, and an ephemeral environment's TTL is
+  the backstop when the caller never does. `end_task(task_ref)` is the bookkeeping shortcut: the broker lists the caller's
+  own environments with that `task_ref` and deletes each through the same delete as `delete_environment`
+  (`POST /v1/tasks/end`). It is idempotent, a task with no environment is a no-op, an empty `task_ref` is refused (the list
+  filter reads it as "any"), and another client's environment with the same `task_ref` is never touched because only
+  the caller's own are listed. It is a broker route, not a sandyd call: sandyd has no client identity, so a daemon call
+  by `task_ref` alone could end another client's environments. There is no lease.
 - One tool call makes one API request. The server holds no state and has no dispatch logic.
 - The contract is `docs/api/broker.openapi.yaml`. `sandy-mcp` does not depend on
   `sandy-control-proto`. A test reads `Cargo.lock` and fails if the crate reaches it.

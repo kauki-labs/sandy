@@ -991,6 +991,28 @@ fn scenario(stack: &Stack) -> Result<()> {
     stack.check_session(mcp, "ttl session")?;
     stack.wait_no_vm(60)?;
 
+    // #815: ending a task deletes its environment through the delete path, VM and credential with it, and a repeat is a
+    // no-op. A second task's environment is not touched (the broker lists only the caller's, by task_ref).
+    let mut mcp = stack.mcp()?;
+    let (is_err, spawned) = mcp.call("spawn_environment", &spawn_args("live-task", "live-task"))?;
+    ensure!(!is_err, "end_task: spawn failed: {spawned}");
+    let task_id = spawned["environment_id"].as_str().context("environment_id")?.to_owned();
+    wait_state(&mut mcp, &task_id, "ready", PROVISION_SECS + 60)?;
+    let (is_err, ended) = mcp.call("end_task", &json!({"task_ref": "live-task"}))?;
+    ensure!(
+        !is_err && ended["ended"] == json!([task_id.clone()]),
+        "end_task: {ended}"
+    );
+    stack.wait_no_vm(120)?;
+    let gone = get_environment(&mut mcp, &task_id)?;
+    ensure!(gone["state"] == json!("deleted"), "end_task: the environment is {gone}");
+    let (is_err, repeat) = mcp.call("end_task", &json!({"task_ref": "live-task"}))?;
+    ensure!(
+        !is_err && repeat["ended"] == json!([]),
+        "end_task: a repeat must be a no-op: {repeat}"
+    );
+    stack.check_session(mcp, "end_task session")?;
+
     // After the run: no non-terminal environment through the API, no VM of ours, nothing new in /tmp/sandy-*.
     stack.wait_no_vm(120)?;
     let mut mcp = stack.mcp()?;

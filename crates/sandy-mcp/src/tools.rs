@@ -49,6 +49,11 @@ fn spawn_props() -> Value {
     })
 }
 
+fn end_task_props() -> Value {
+    json!({"task_ref":{"type":"string","minLength":1,"maxLength":256,
+           "description":"The task_ref the environments were spawned with. At most 256 bytes of UTF-8 (the broker counts bytes, not characters), no control characters."}})
+}
+
 fn link_props() -> Value {
     json!({"environment_id":{"type":"string"},"primary":{"type":"string"}})
 }
@@ -175,6 +180,17 @@ pub(crate) static TOOLS: &[Tool] = &[
         query: &[],
         required: &["environment_id"],
         properties: environment_id,
+    },
+    Tool {
+        name: "end_task",
+        description: "End a task: delete every environment of yours spawned with this task_ref. Idempotent; a task \
+                      with no environment is a no-op.",
+        method: "POST",
+        path: "/v1/tasks/end",
+        path_args: &[],
+        query: &[],
+        required: &["task_ref"],
+        properties: end_task_props,
     },
     Tool {
         name: "stop_environment",

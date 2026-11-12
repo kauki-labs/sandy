@@ -64,6 +64,12 @@ struct SpawnEnvironment {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EndTask {
+    task_ref: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LifetimeBody {
     kind: LifetimeKind,
     ttl_secs: Option<u64>,
@@ -427,6 +433,31 @@ pub(crate) async fn list(state: &State, client: &Client, query: Option<&str>) ->
     .await?;
     let environments: Vec<Value> = owned.iter().map(summary).collect();
     Ok((StatusCode::OK, json!({"environments": environments})))
+}
+
+/// End a task: delete every environment of the caller's own with this `task_ref`, each through the same delete as
+/// `DELETE /v1/environments/{id}` (#815). Only the caller's environments are listed, so another client's environment
+/// with the same `task_ref` is never touched. A task with no environment is a no-op, and a repeat is too. An empty
+/// `task_ref` is refused: the list filter reads it as "any", so it would end every environment the caller has.
+pub(crate) async fn end_task(state: &State, client: &Client, req: Request<Incoming>) -> Reply {
+    let bytes = read_body(req).await?;
+    let body: EndTask = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+    if body.task_ref.is_empty() || body.task_ref.len() > 256 || body.task_ref.chars().any(char::is_control) {
+        return Err(INVALID);
+    }
+    let owned = list_all(state, EnvironmentState::Unspecified, &body.task_ref, |e| {
+        state.owners.owns_environment(&e.environment_id, &client.id) && e.state != i32::from(EnvironmentState::Deleted)
+    })
+    .await?;
+    let mut ended = Vec::with_capacity(owned.len());
+    for environment in owned {
+        let op = control_request::Op::DeleteEnvironment(DeleteEnvironmentRequest {
+            environment_id: environment.environment_id.clone(),
+        });
+        one(state, op).await?;
+        ended.push(environment.environment_id);
+    }
+    Ok((StatusCode::OK, json!({"ended": ended})))
 }
 
 fn owned(state: &State, client: &Client, id: &str) -> Result<(), ApiError> {
