@@ -1062,6 +1062,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                     mem,
                     timeout_secs: timeout,
                     service: None,
+                    from_devshell: false,
                 };
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (

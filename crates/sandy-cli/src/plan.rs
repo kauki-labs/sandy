@@ -33,7 +33,7 @@ use sandy::{
 
 /// Default wall-clock timeout when `--timeout` is omitted (5 minutes). Picked as
 /// a sane bound for an interactive foreground `run`; override with `--timeout`.
-const DEFAULT_TIMEOUT_SECS: u32 = 300;
+pub(crate) const DEFAULT_TIMEOUT_SECS: u32 = 300;
 
 /// The raw `run` arguments as clap's derived subcommand struct produces them:
 /// already-split option values (one string per occurrence) plus the trailing

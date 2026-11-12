@@ -3317,6 +3317,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         })
         .expect("a flake manifest encodes")

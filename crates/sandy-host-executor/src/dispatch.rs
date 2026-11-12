@@ -1033,6 +1033,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         };
         let spec = ServiceSpec {
@@ -1099,6 +1100,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         }
     }
@@ -1718,6 +1720,57 @@ mod tests {
             ),
             "expected UnrecognizedManifestEncoding, got {err:?} — if this is UnsupportedBackend instead, the Vm \
              branch was never reached"
+        );
+        Ok(())
+    }
+
+    /// A `flake/v1` manifest that asks for `--from-devshell` reaches `resolve_flake_template` with the flag set (A3,
+    /// #483): combined with a `kind` the resolver refuses it before any `nix` call, which a dropped flag would not.
+    #[tokio::test]
+    async fn a_from_devshell_manifest_reaches_the_resolver_with_the_flag() -> anyhow::Result<()> {
+        let manifest =
+            sandy_guest_template::manifest::encode_flake_manifest(&sandy_guest_template::manifest::FlakeManifestV1 {
+                flake: ".".to_owned(),
+                kind: Some("topology".to_owned()),
+                attr: None,
+                command: Vec::new(),
+                history_lines: 5_000,
+                env: Vec::new(),
+                cpu: None,
+                mem: None,
+                timeout_secs: None,
+                from_devshell: true,
+                service: None,
+            })?;
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest,
+            manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Vm.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
+            data_link_token: Vec::new(),
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+        let err = handle_dispatch(
+            &dispatch,
+            containment,
+            PathBuf::from("/nonexistent/sandy-agent"),
+            rt,
+            true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
+        )
+        .expect_err("--from-devshell with --kind is refused by the resolver");
+        assert!(
+            err.to_string()
+                .contains("--from-devshell cannot be combined with --kind"),
+            "the flag must reach the resolver: {err}"
         );
         Ok(())
     }
