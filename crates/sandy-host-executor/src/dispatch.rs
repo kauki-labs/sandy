@@ -50,6 +50,7 @@ use serde::Deserialize;
 use crate::{
     input_pull::PullLimits,
     input_stage::{INPUT_PULL_TOTAL_SECS, StagedInputs, dial_data_link, stage_remote_inputs},
+    output_stage::{OUTPUT_SEND_TOTAL_SECS, OutputStaging, send_staged_outputs},
 };
 
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
@@ -511,6 +512,58 @@ pub enum HandleDispatchError {
     /// a cancel or a deadline during the pull, never a guest failure.
     #[error("staging the inputs from the data link: {0}")]
     DataLink(#[from] crate::input_stage::StageError),
+    /// The staging root for the job's outputs could not be created (#482). The job never ran.
+    #[error("staging the outputs: {0}")]
+    OutputStaging(#[source] std::io::Error),
+}
+
+/// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
+#[derive(Debug)]
+pub struct Dispatched {
+    /// The physical outcome of the run.
+    pub outcome: Outcome,
+    /// True when the outputs were sent over the data link (even if the send failed), so the orchestrator must wait
+    /// for them before it records the job as finished (#482).
+    pub outputs_follow: bool,
+}
+
+/// Plan where a remote job's outputs are collected: `None` for a local dispatch (no data link) or a job with no
+/// outputs, otherwise a private staging root.
+fn stage_outputs(
+    declared: &[sandy_executor_proto::Output],
+    staged: Option<&StagedInputs>,
+) -> Result<Option<OutputStaging>, HandleDispatchError> {
+    if staged.is_none() || declared.is_empty() {
+        return Ok(None);
+    }
+    OutputStaging::new(&std::env::temp_dir(), declared)
+        .map(Some)
+        .map_err(HandleDispatchError::OutputStaging)
+}
+
+/// After the run: send the staged outputs over the retained data link and say whether they follow. The staging root
+/// and the link go away when this returns, on every path.
+fn dispatched(
+    outcome: Outcome,
+    staged: Option<StagedInputs>,
+    staging: Option<OutputStaging>,
+    rt: &tokio::runtime::Handle,
+    control: &RunControl,
+) -> Dispatched {
+    let outputs_follow = match (staged, &staging) {
+        (Some(mut staged), Some(staging)) => send_staged_outputs(
+            &mut staged.link,
+            staging,
+            rt,
+            control,
+            std::time::Duration::from_secs(OUTPUT_SEND_TOTAL_SECS),
+        ),
+        _ => false,
+    };
+    Dispatched {
+        outcome,
+        outputs_follow,
+    }
 }
 
 /// Pull the dispatch's inputs over the data link, if it has one (#482, sandyd.md decision 22). `None` when the token
@@ -590,7 +643,7 @@ pub fn handle_dispatch(
     vm_available: bool,
     control: RunControl,
     mesh_tls: sandy_fabric_local::mesh_link::MeshTlsIdentity,
-) -> Result<Outcome, HandleDispatchError> {
+) -> Result<Dispatched, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
     // An unknown or unset backend is checked as `Process`, the weaker kind, so
@@ -673,6 +726,8 @@ pub fn handle_dispatch(
                 &control,
             )?;
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
+            let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
+            let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
             let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -683,7 +738,7 @@ pub fn handle_dispatch(
                 template: &dispatch.job_id,
                 command: &decoded.command,
                 inputs: run_inputs,
-                outputs: &path_outputs,
+                outputs: run_outputs,
                 secrets: &path_secrets,
                 env: &process_run_env(&decoded.env),
                 cpu: decoded.cpu,
@@ -697,7 +752,8 @@ pub fn handle_dispatch(
                 secret_dir: None,
                 control: &control,
             };
-            Ok(backend.run(&spec)?)
+            let outcome = backend.run(&spec)?;
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
         }
         // Defense in depth (#332, mirroring `check_isolation_class`'s own
         // re-probe discipline): `vm_available` is the caller's own fresh
@@ -764,6 +820,8 @@ pub fn handle_dispatch(
                 &control,
             )?;
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
+            let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
+            let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
             let backend = QemuBackend::new().with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -774,7 +832,7 @@ pub fn handle_dispatch(
                 template: &template,
                 command: &decoded.command,
                 inputs: run_inputs,
-                outputs: &path_outputs,
+                outputs: run_outputs,
                 secrets: &path_secrets,
                 env: &env,
                 cpu: decoded.cpu,
@@ -790,7 +848,7 @@ pub fn handle_dispatch(
             // — held in scope here, across the call, not dropped before it.
             let outcome = backend.run(&spec)?;
             drop(_kept_topology_file);
-            Ok(outcome)
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
         }
         _ => Err(HandleDispatchError::UnsupportedBackend(dispatch.backend)),
     }
@@ -1385,7 +1443,7 @@ mod tests {
 
     /// `handle_dispatch` blocks (it is called from `spawn_blocking` in production), so a test that reaches the data
     /// link's `block_on` must run it on a blocking thread too.
-    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Outcome, HandleDispatchError>> {
+    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Dispatched, HandleDispatchError>> {
         let rt = tokio::runtime::Handle::current();
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         tokio::task::spawn_blocking(move || {
@@ -1435,6 +1493,66 @@ mod tests {
             ),
             "expected a data link dial error, got {err:?}"
         );
+        Ok(())
+    }
+
+    fn an_outcome() -> Outcome {
+        Outcome {
+            digests: None,
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        }
+    }
+
+    /// `dispatched` is the one place the flag is decided: outputs follow exactly when the job has a data link AND
+    /// staged outputs. A job with a link but no outputs, and a local job, send nothing and say nothing follows.
+    #[tokio::test]
+    async fn dispatched_says_outputs_follow_only_for_a_link_with_staged_outputs() -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
+        let rt = tokio::runtime::Handle::current();
+        let control = sandy_api::backend::RunControl::with_timeout_secs(60);
+        let declared = [sandy_executor_proto::Output {
+            name: None,
+            dest: "/submitter/all".to_owned(),
+        }];
+
+        // A local job: no link, no staging.
+        let local = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control)).await?
+        };
+        assert!(!local.outputs_follow, "a local job has nothing following");
+
+        // A link and no declared outputs: the link is dropped unused, nothing is written to it.
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let staged = StagedInputs::for_test(near).context("staged inputs")?;
+        let linked = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control)).await?
+        };
+        assert!(!linked.outputs_follow, "no outputs declared: nothing follows");
+        let mut rest = Vec::new();
+        far.read_to_end(&mut rest).await.context("read the link")?;
+        assert!(rest.is_empty(), "nothing may be written to a link with no outputs");
+
+        // A link and staged outputs: they are sent, the flag is set, and the link ends after them.
+        let parent = tempfile::tempdir().context("parent")?;
+        let staging = OutputStaging::new(parent.path(), &declared).context("stage")?;
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let staged = StagedInputs::for_test(near).context("staged inputs")?;
+        let sent = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control))
+                .await?
+        };
+        assert!(sent.outputs_follow, "staged outputs over a link follow");
+        let mut frames = Vec::new();
+        far.read_to_end(&mut frames).await.context("read the link")?;
+        assert!(!frames.is_empty(), "the transfer must at least end with OutputEnd");
         Ok(())
     }
 
