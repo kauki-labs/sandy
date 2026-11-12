@@ -257,7 +257,7 @@ async fn every_tool_makes_exactly_one_api_request() -> Result<()> {
         .await
         .context("list")?;
     let tools = list["result"]["tools"].as_array().context("tools")?;
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     for t in tools {
         let schema = &t["inputSchema"];
         let mut args = serde_json::Map::new();
@@ -309,5 +309,22 @@ async fn a_gitlab_token_in_an_argument_is_refused() -> Result<()> {
     let (e, _) = call(&server, "submit", submit(json!({"manifest_encoding": tok}))).await?;
     assert!(e);
     assert!(seen.lock().unwrap().is_empty());
+    Ok(())
+}
+
+/// `end_task` is one POST to `/v1/tasks/end`, and a call without `task_ref` makes no request. An empty `task_ref` is
+/// the broker's to refuse (`end_task_refuses_a_bad_task_ref_and_deletes_nothing`): the tool forwards values unchanged
+/// (#815).
+#[tokio::test]
+async fn end_task_is_one_post_and_a_missing_task_ref_makes_no_request() -> Result<()> {
+    let (url, seen) = fake(Reply::json(200, &json!({"ended": ["env-1"]})))?;
+    let server = Server::new(Api::new(&url, "c"));
+    let (e, body) = call(&server, "end_task", json!({"task_ref": "task-a"})).await?;
+    assert!(!e, "{body}");
+    assert_eq!(body["ended"], json!(["env-1"]));
+    assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/tasks/end"]);
+    let (e, _) = call(&server, "end_task", json!({})).await?;
+    assert!(e, "a missing task_ref must be refused");
+    assert_eq!(seen.lock().unwrap().len(), 1, "a refused call made a request");
     Ok(())
 }
