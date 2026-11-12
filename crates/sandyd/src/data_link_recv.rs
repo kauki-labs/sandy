@@ -1196,6 +1196,99 @@ mod tests {
         Ok(())
     }
 
+    /// The pid of a process that has exited: a short-lived child of this test binary, waited for.
+    fn a_dead_pid() -> anyhow::Result<u32> {
+        let mut child = std::process::Command::new(std::env::current_exe().context("current exe")?)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn a child")?;
+        let pid = child.id();
+        child.wait().context("wait for the child")?;
+        Ok(pid)
+    }
+
+    /// A `.sandy-recv-*` temp file a crashed process left in a destination is removed before the receive makes its own
+    /// temp file there (#782): the name says which process made it, and that process is gone. Files in a subdirectory
+    /// are swept too, once per directory.
+    #[tokio::test]
+    async fn a_stale_temp_file_of_a_dead_process_is_removed_before_the_receive_writes_there() -> anyhow::Result<()> {
+        let dead = a_dead_pid()?;
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::create_dir(dest.path().join("sub")).context("sub")?;
+        std::fs::write(dest.path().join(format!(".sandy-recv-{dead}-1")), b"stale").context("stale root")?;
+        std::fs::write(dest.path().join(format!("sub/.sandy-recv-{dead}-9")), b"stale").context("stale sub")?;
+        std::fs::write(dest.path().join("keep.txt"), b"mine").context("unrelated")?;
+
+        let outputs = [out(None, dest.path())];
+        let messages = [chunk(0, "x.txt", b"X"), chunk(0, "sub/y.txt", b"Y"), end()];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        received.context("the receive")?;
+
+        assert_eq!(
+            tree(dest.path())?,
+            files(&[("keep.txt", b"mine"), ("x.txt", b"X"), ("sub/y.txt", b"Y")]),
+            "the stale temp files must be gone, and nothing else"
+        );
+        Ok(())
+    }
+
+    /// What the sweep must not touch: a temp file of this process (another job's receive in this daemon may be writing
+    /// it), one of a live process, names that are not temp names, and entries that are not regular files.
+    #[tokio::test]
+    async fn the_sweep_leaves_live_and_foreign_entries_alone() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dead = a_dead_pid()?;
+        let own = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+        let dest = tempfile::tempdir().context("dest")?;
+        let outside = tempfile::tempdir().context("outside")?;
+        std::fs::write(outside.path().join("target"), b"TARGET").context("target")?;
+
+        std::fs::write(dest.path().join(format!(".sandy-recv-{own}-5")), b"own").context("own")?;
+        std::fs::write(dest.path().join(format!(".sandy-recv-{parent}-5")), b"live").context("live")?;
+        std::fs::write(dest.path().join(".sandy-recv-notapid-1"), b"x").context("not a pid")?;
+        std::fs::write(dest.path().join(".sandy-recv-1"), b"x").context("no counter")?;
+        std::fs::write(dest.path().join(format!(".sandy-recv-{dead}-x")), b"x").context("bad counter")?;
+        std::fs::create_dir(dest.path().join(format!(".sandy-recv-{dead}-2"))).context("a directory")?;
+        symlink(
+            outside.path().join("target"),
+            dest.path().join(format!(".sandy-recv-{dead}-3")),
+        )
+        .context("a symlink")?;
+
+        let outputs = [out(None, dest.path())];
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &outputs, quick(), false).await?;
+        received.context("the receive")?;
+
+        for kept in [
+            format!(".sandy-recv-{own}-5"),
+            format!(".sandy-recv-{parent}-5"),
+            ".sandy-recv-notapid-1".to_owned(),
+            ".sandy-recv-1".to_owned(),
+            format!(".sandy-recv-{dead}-x"),
+        ] {
+            assert!(dest.path().join(&kept).is_file(), "{kept} was removed");
+        }
+        assert!(
+            dest.path().join(format!(".sandy-recv-{dead}-2")).is_dir(),
+            "a directory was removed"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.path().join(format!(".sandy-recv-{dead}-3")))?
+                .file_type()
+                .is_symlink(),
+            "a symlink was removed"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("target")).context("target")?,
+            b"TARGET"
+        );
+        Ok(())
+    }
+
     /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
     fn runtime_with_one_blocking_thread() -> anyhow::Result<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_multi_thread()
