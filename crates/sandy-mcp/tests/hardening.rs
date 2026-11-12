@@ -322,9 +322,16 @@ async fn end_task_is_one_post_and_a_missing_task_ref_makes_no_request() -> Resul
     let (e, body) = call(&server, "end_task", json!({"task_ref": "task-a"})).await?;
     assert!(!e, "{body}");
     assert_eq!(body["ended"], json!(["env-1"]));
-    assert_eq!(seen.lock().unwrap().as_slice(), ["POST /v1/tasks/end"]);
+    let requests = |seen: &Arc<Mutex<Vec<String>>>| -> Result<Vec<String>> {
+        Ok(seen
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("the request log")?
+            .clone())
+    };
+    assert_eq!(requests(&seen)?, ["POST /v1/tasks/end"]);
     let (e, _) = call(&server, "end_task", json!({})).await?;
     assert!(e, "a missing task_ref must be refused");
-    assert_eq!(seen.lock().unwrap().len(), 1, "a refused call made a request");
+    assert_eq!(requests(&seen)?.len(), 1, "a refused call made a request");
     Ok(())
 }

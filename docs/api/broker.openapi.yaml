@@ -233,7 +233,11 @@ paths:
               required: [task_ref]
               additionalProperties: false
               properties:
-                task_ref: {type: string, minLength: 1, maxLength: 256}
+                task_ref:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                  description: At most 256 bytes of UTF-8 (the broker counts bytes, not characters) and no control characters.
       responses:
         "200":
           description: The ids this call deleted (empty on a repeat or an unknown task).
@@ -242,6 +246,7 @@ paths:
               schema:
                 type: object
                 required: [ended]
+                additionalProperties: false
                 properties:
                   ended:
                     type: array

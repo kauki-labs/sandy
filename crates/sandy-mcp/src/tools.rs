@@ -51,7 +51,7 @@ fn spawn_props() -> Value {
 
 fn end_task_props() -> Value {
     json!({"task_ref":{"type":"string","minLength":1,"maxLength":256,
-           "description":"The task_ref the environments were spawned with."}})
+           "description":"The task_ref the environments were spawned with. At most 256 bytes of UTF-8 (the broker counts bytes, not characters), no control characters."}})
 }
 
 fn link_props() -> Value {
