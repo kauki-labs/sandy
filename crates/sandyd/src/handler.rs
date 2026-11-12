@@ -1380,7 +1380,9 @@ fn attach_tokens_match(stored: &[u8], presented: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy_control_proto::{AttachRequest, CancelRequest, JobStatus, ListRequest, StatusRequest, SubmitRequest};
+    use sandy_control_proto::{
+        AttachRequest, CancelRequest, JobStatus, ListRequest, PruneRequest, StatusRequest, SubmitRequest,
+    };
     use sandy_fabric::{
         capauth::{CapAuthority, CapRights, CapScope},
         types::{ChannelId, PeerId},
