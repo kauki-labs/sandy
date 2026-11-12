@@ -572,7 +572,6 @@ mod tests {
             status: "JOB_STATUS_SUCCEEDED".into(),
             exit_code: Some(0),
             console_tail: "hi\n".into(),
-            result_envelope: None,
         })?;
         round_trip(&JobSummaries::from(&ListResponse {
             jobs: vec![JobSummary {
@@ -659,7 +658,6 @@ mod tests {
             status: "JOB_STATUS_FAILED".into(),
             exit_code: None,
             console_tail: String::new(),
-            result_envelope: None,
         })?;
         assert_eq!(
             status,

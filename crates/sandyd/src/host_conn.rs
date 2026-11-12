@@ -2027,7 +2027,17 @@ mod tests {
     async fn a_terminal_job_records_the_envelope_the_direct_classifier_gives() -> anyhow::Result<()> {
         use sandy::Status;
         // (name, booted, exit_code, timed_out, transport_error, JobStatus, envelope status, retryable)
-        let rows: [(&str, bool, Option<i32>, bool, Option<&str>, JobStatus, Status, bool); 5] = [
+        type Row<'a> = (
+            &'a str,
+            bool,
+            Option<i32>,
+            bool,
+            Option<&'a str>,
+            JobStatus,
+            Status,
+            bool,
+        );
+        let rows: [Row<'_>; 5] = [
             (
                 "exit 0",
                 true,
