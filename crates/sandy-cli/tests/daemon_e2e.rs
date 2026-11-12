@@ -213,6 +213,70 @@ fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::R
     Ok(())
 }
 
+/// A4 of #483: `daemon prune --keep-last N` deletes the oldest terminal jobs from a live sandyd's store, prints the
+/// `gc` report, and spares a job that is still pending.
+#[test]
+fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let manifest = manifest.to_str().context("manifest path is utf8")?;
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let submit = sandy(
+            &daemon,
+            &[
+                "daemon",
+                "submit",
+                manifest,
+                "--manifest-encoding",
+                "test/v1",
+                "--isolation-class",
+                "trusted",
+                "-o",
+                "json",
+            ],
+        )?;
+        assert_eq!(submit.status.code(), Some(0), "submit stderr: {}", stderr_of(&submit));
+        let json: serde_json::Value = serde_json::from_slice(&submit.stdout).context("parse submit json")?;
+        ids.push(json["job_id"].as_str().context("job_id")?.to_owned());
+    }
+    // The first three end Cancelled in submit order; the fourth stays pending.
+    for id in &ids[..3] {
+        let cancel = sandy(&daemon, &["daemon", "cancel", id])?;
+        assert_eq!(cancel.status.code(), Some(0), "cancel stderr: {}", stderr_of(&cancel));
+    }
+
+    let prune = sandy(&daemon, &["daemon", "prune", "--keep-last", "1", "-o", "json"])?;
+    assert_eq!(prune.status.code(), Some(0), "prune stderr: {}", stderr_of(&prune));
+    let report: serde_json::Value = serde_json::from_slice(&prune.stdout).context("parse prune json")?;
+    let mut evicted: Vec<&str> = report["evicted"]
+        .as_array()
+        .context("evicted array")?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    evicted.sort_unstable();
+    let mut oldest_two = vec![ids[0].as_str(), ids[1].as_str()];
+    oldest_two.sort_unstable();
+    assert_eq!(evicted, oldest_two, "the two oldest terminal jobs go: {report}");
+
+    let list = sandy(&daemon, &["daemon", "list", "-o", "json"])?;
+    let list_json: serde_json::Value = serde_json::from_slice(&list.stdout).context("parse list json")?;
+    let mut left: Vec<&str> = list_json
+        .as_array()
+        .context("list array")?
+        .iter()
+        .filter_map(|j| j["job_id"].as_str())
+        .collect();
+    left.sort_unstable();
+    let mut expected = vec![ids[2].as_str(), ids[3].as_str()];
+    expected.sort_unstable();
+    assert_eq!(left, expected, "the newest terminal job and the pending one stay");
+    Ok(())
+}
+
 #[test]
 fn submit_reads_the_manifest_from_stdin_when_the_path_is_a_dash() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;

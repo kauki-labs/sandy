@@ -585,8 +585,30 @@ impl JobStore {
     /// # Errors
     /// [`StoreError::Sqlite`] if the read or a delete fails; nothing is deleted then.
     pub fn prune_terminal(&self, keep_last: usize) -> Result<Vec<String>, StoreError> {
-        let _ = keep_last;
-        Ok(Vec::new())
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let evicted: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT job_id FROM jobs WHERE status IN (?1, ?2, ?3) ORDER BY created_at DESC, rowid DESC LIMIT -1 \
+                 OFFSET ?4",
+            )?;
+            let offset = i64::try_from(keep_last).unwrap_or(i64::MAX);
+            stmt.query_map(
+                (
+                    status_name(JobStatus::Succeeded),
+                    status_name(JobStatus::Failed),
+                    status_name(JobStatus::Cancelled),
+                    offset,
+                ),
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?
+        };
+        for id in &evicted {
+            tx.execute("DELETE FROM jobs WHERE job_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(evicted)
     }
 }
 
