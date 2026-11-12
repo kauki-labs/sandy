@@ -167,6 +167,16 @@ fn field_name_refusal(field: &str, names: &[&str]) -> Option<String> {
     None
 }
 
+/// The most `inputs`, and the most `outputs`, one Submit may declare (#807). Each is a path walked and sent over the
+/// data link, so an unbounded list is an unbounded walk before any transfer limit applies.
+pub(crate) const MAX_SUBMIT_TRANSFER_PATHS: usize = 256;
+
+/// Refuse a Submit that declares more inputs or outputs than `MAX_SUBMIT_TRANSFER_PATHS` (#807), before any side
+/// effect.
+fn submit_caps_refusal(_submit: &SubmitRequest) -> Option<String> {
+    None
+}
+
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
 /// any side effect: `cred_capabilities` with no `credential`, a credential name
 /// that is not a single file name, a credential on a daemon with no credential
@@ -481,6 +491,12 @@ pub async fn handle(
                 });
             }
 
+            if let Some(message) = submit_caps_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             // #481: a credential request this daemon cannot honor is refused
             // before placement and before any mint.
             if let Some(message) = credential_request_refusal(&submit, registry) {
@@ -2870,6 +2886,49 @@ mod tests {
                     error.message
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// #807: a Submit declaring more inputs or more outputs than the cap is refused naming the field and the cap,
+    /// before placement or any job; exactly the cap passes.
+    #[tokio::test]
+    async fn a_submit_over_the_input_or_output_cap_is_refused_naming_the_field() -> anyhow::Result<()> {
+        let cap = MAX_SUBMIT_TRANSFER_PATHS;
+        for (count, field, refused) in [
+            (cap + 1, "inputs", true),
+            (cap + 1, "outputs", true),
+            (cap, "inputs", false),
+            (cap, "outputs", false),
+        ] {
+            let mut request = submit_req_with_input(1);
+            if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                submit.inputs = Vec::new();
+                submit.outputs = Vec::new();
+                if field == "inputs" {
+                    submit.inputs = (0..count)
+                        .map(|i| sandy_control_proto::Input {
+                            host: "/src".to_owned(),
+                            name: format!("in{i}"),
+                            guest_path: None,
+                        })
+                        .collect();
+                } else {
+                    submit.outputs = (0..count)
+                        .map(|i| sandy_control_proto::Output {
+                            name: Some(format!("out{i}")),
+                            dest: "/out".to_owned(),
+                        })
+                        .collect();
+                }
+            }
+            let (store, registry) = (new_store(), new_registry());
+            let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+            let over_cap = matches!(
+                &response.result,
+                Some(control_response::Result::Error(e)) if e.message.contains(field) && e.message.contains("at most")
+            );
+            assert_eq!(over_cap, refused, "{count} {field}: got {response:?}");
         }
         Ok(())
     }
