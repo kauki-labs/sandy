@@ -2190,6 +2190,41 @@ mod tests {
         Ok(())
     }
 
+    /// A2 (#483, sandy-5e F3 on #828): `Status` carries the console twice, as `console_tail` and inside the envelope's
+    /// log tail, and the executor's own frame can be near the 1 MiB limit. The daemon bounds both to a tail, so even a
+    /// console of control characters (six bytes each as JSON) leaves a `Status` reply that fits one frame.
+    #[tokio::test]
+    async fn a_huge_console_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        let console = "\u{1}".repeat(900 * 1024);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                console,
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let detail = store.detail("job-1")?.context("job detail")?;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        let reply = sandy_control_proto::StatusResponse {
+            job_id: "job-1".to_owned(),
+            status: i32::from(detail.status),
+            exit_code: detail.exit_code,
+            console_tail: detail.console,
+            result_envelope: Some(envelope.into_bytes()),
+        };
+        assert!(
+            sandy_executor_proto::Message::encoded_len(&reply) < sandy_control_proto::MAX_FRAME_LEN as usize,
+            "the Status reply must fit one frame"
+        );
+        Ok(())
+    }
+
     /// A2 (#483): a job that is not terminal has no envelope, and one whose host disconnected gets a failed,
     /// retryable one, so every terminal path leaves exactly what a direct run would.
     #[tokio::test]
