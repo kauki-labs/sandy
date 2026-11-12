@@ -812,6 +812,65 @@ mod tests {
         Ok(())
     }
 
+    /// The credential is released when the result arrives, before the job settles. The host's console, which can
+    /// hold the staged token, must still be redacted when the job is stored after its outputs arrive.
+    #[tokio::test]
+    async fn a_token_in_the_console_of_a_job_awaiting_its_outputs_is_still_redacted() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_host_with(
+            &d,
+            "host-1",
+            Capabilities {
+                transfer: true,
+                ..capabilities(true)
+            },
+        )
+        .await?;
+        let mut request = submit_req(Some("gh-test"), Vec::new());
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.outputs = vec![sandy_control_proto::Output {
+                name: Some("result".to_owned()),
+                dest: "/out".to_owned(),
+            }];
+        }
+        let submitted = match submit(&d, request).await? {
+            control_response::Result::Submit(ok) => ok,
+            other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
+        };
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    transport_error: None,
+                    console: format!("env: GITHUB_TOKEN={TOKEN}\ndone\n"),
+                    outputs_follow: true,
+                })),
+            },
+        )
+        .await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        let job = d.registry.get(&submitted.job_id).context("the job is registered")?;
+        job.outputs.publish(crate::output_slot::OutputsState::Received(
+            crate::data_link_recv::Received { files: 0, bytes: 0 },
+        ));
+        wait_status(&d, &submitted.job_id, JobStatus::Succeeded).await?;
+
+        let detail = d.store.detail(&submitted.job_id)?.context("job detail")?;
+        assert!(!detail.console.contains(TOKEN), "console: {:?}", detail.console);
+        assert!(detail.console.contains("done"), "the rest of the console is kept");
+
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
     /// Acceptance 5: a revoke failure is surfaced in the daemon log, naming the
     /// job, and the staged file is still removed.
     #[tokio::test]
