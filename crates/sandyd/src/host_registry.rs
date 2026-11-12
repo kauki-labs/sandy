@@ -452,7 +452,13 @@ impl HostRegistry {
                         .capabilities
                         .supported_sandbox_kinds
                         .contains(&required_sandbox_kind)
-                    && (needs == PathNeeds::Anywhere || host.capabilities.shares_submitter_filesystem)
+                    && match needs {
+                        PathNeeds::Anywhere => true,
+                        PathNeeds::SharedFilesystem => host.capabilities.shares_submitter_filesystem,
+                        PathNeeds::SharedFilesystemOrTransfer => {
+                            host.capabilities.shares_submitter_filesystem || host.capabilities.transfer
+                        }
+                    }
             })
             .map(|(host_id, host)| PlacementCandidate {
                 host_id: host_id.clone(),

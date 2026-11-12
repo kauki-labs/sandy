@@ -461,6 +461,15 @@ pub async fn handle(
             // host (never a silent `Pending` forever, never a silent place-
             // anywhere).
             let require_local = submit_requires_local_dispatch(&submit);
+            // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
+            // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
+            let path_needs = if !submit.secrets.is_empty() || submit.credential.is_some() {
+                crate::host_registry::PathNeeds::SharedFilesystem
+            } else if !submit.inputs.is_empty() || !submit.outputs.is_empty() {
+                crate::host_registry::PathNeeds::SharedFilesystemOrTransfer
+            } else {
+                crate::host_registry::PathNeeds::Anywhere
+            };
             // Cached before `submit.manifest`/`manifest_encoding` are moved
             // out below: a partial move of one field makes rustc refuse any
             // later `&submit` borrow, even to read a different field.
@@ -470,10 +479,10 @@ pub async fn handle(
                 false
             } else {
                 host_registry
-                    .pick_host_for(
+                    .pick_host(
                         required_isolation_class.into(),
                         required_sandbox_kind.into(),
-                        require_local,
+                        path_needs,
                     )
                     .is_some()
             };
@@ -483,6 +492,12 @@ pub async fn handle(
                     .to_owned()
             } else if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
+                format!(
+                    "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
+                     `{path_field_name}` path, which is valid on the submitter's own filesystem or carried over the \
+                     data link by a host that declared transfer"
+                )
             } else if require_local {
                 format!(
                     "no registered host declares shares_submitter_filesystem; this Submit names a `{path_field_name}` \
@@ -569,10 +584,10 @@ pub async fn handle(
             // `send_dispatch` call happens after, once the job is durably
             // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry.pick_host_for(
+                let candidate = host_registry.pick_host(
                     required_isolation_class.into(),
                     required_sandbox_kind.into(),
-                    require_local,
+                    path_needs,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -620,13 +635,14 @@ pub async fn handle(
                             link_token,
                             forward_back: forward_back.to_string(),
                             required_isolation_class: required_isolation_class.into(),
-                            // Safe to forward unconditionally (#496): `candidate`
-                            // only exists because `pick_host_for` was called with
-                            // `require_local`, which already filtered on
+                            // Safe to forward unconditionally (#496, #807):
+                            // `candidate` only exists because `pick_host` was
+                            // called with `path_needs`, which filtered on
                             // `shares_submitter_filesystem` for a Submit that
-                            // actually carries any of these — a non-local pick
-                            // only ever happens when all three were empty to
-                            // begin with.
+                            // carries secrets or a credential, and on that or
+                            // `transfer` for inputs and outputs only — a host
+                            // that takes them without sharing the filesystem
+                            // got a data link above, which carries the files.
                             inputs: path_inputs.clone(),
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
@@ -664,8 +680,13 @@ pub async fn handle(
                 credential_placement_refusal()
             } else if require_local {
                 format!(
-                    "no registered host declaring shares_submitter_filesystem could be bound for this job's \
-                     `{path_field_name}` path"
+                    "no registered host declaring shares_submitter_filesystem{} could be bound for this job's \
+                     `{path_field_name}` path",
+                    if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
+                        " or transfer"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 "no registered host could be bound for this job's required isolation class and sandbox kind; it cannot \
