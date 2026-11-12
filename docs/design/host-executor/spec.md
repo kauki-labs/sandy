@@ -210,6 +210,12 @@ every knob below from environment variables — there is no CLI flag form.
    sandy-host-executor
    ```
 
+   `SANDY_HOST_TRANSFER=1` (or `true`/`yes`) makes the executor declare `transfer` at registration, so the
+   orchestrator places a job with `inputs` or `outputs` on it and moves them over the per-job data link
+   (decision 22). It is the operator's statement that the host has disk headroom and a temp-staging path, never
+   auto-detected. Unset, empty, `0`, `false` or `no` leaves it undeclared; any other value stops the executor at
+   start with an error naming the variable.
+
 3. **Submit and attach** (from the orchestrator host):
 
    ```

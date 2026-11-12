@@ -135,8 +135,8 @@ message Capabilities {
   // auto-detected. Default false, so a host-executor that predates this field
   // decodes as not accepting transfers. It never covers `secrets` or a
   // `credential`: those stay tied to `shares_submitter_filesystem` (decision 4).
-  // Declared on the wire first; the orchestrator does not place on it until the
-  // data link exists.
+  // The orchestrator places a Submit with `inputs` or `outputs` only (no
+  // `secrets` or `credential`) on a host that declares this true.
   bool transfer = 6;
   // Whether this host-executor's VM path can run a job behind the per-run
   // egress proxy (#360, #404), so it can enforce a `Dispatch.egress` policy.
@@ -216,7 +216,7 @@ message Dispatch {
   // in memory only, never logged, never written to the manifest, env or mounts.
   // Empty means the job has no data link, which is also how a Dispatch from a
   // sender that predates the field decodes. The orchestrator sets it only for a
-  // host that declared `transfer`; nothing sets it until the link exists.
+  // host that declared `transfer`.
   bytes data_link_token = 11;
   // The job's egress policy (`sandy run --allow`, #360). Absent means no policy:
   // the run is unchanged. Present, even with no rules, means the guest runs behind
