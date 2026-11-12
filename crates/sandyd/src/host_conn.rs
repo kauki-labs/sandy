@@ -1938,6 +1938,192 @@ mod tests {
         Ok(())
     }
 
+    /// A job registered and running, owing nothing: its result goes straight to the terminal record.
+    async fn running_job(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) -> anyhow::Result<()> {
+        store.insert_pending(job_id, b"m", "test/v1")?;
+        store.mark_running(job_id)?;
+        let job = crate::dispatch::mint_job_channel(job_id, job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert(job_id.to_owned(), job);
+        Ok(())
+    }
+
+    /// A2 (#483): a terminal job carries the same locked result envelope a direct run prints (INV-11): the status and
+    /// retryable flag `classify_outcome` gives the same physical facts, one row per `JobResult` shape. `JobStatus`
+    /// stays the two-valued lifecycle band it is today.
+    #[tokio::test]
+    async fn a_terminal_job_records_the_envelope_the_direct_classifier_gives() -> anyhow::Result<()> {
+        use sandy::Status;
+        // (name, booted, exit_code, timed_out, transport_error, JobStatus, envelope status, retryable)
+        let rows: [(&str, bool, Option<i32>, bool, Option<&str>, JobStatus, Status, bool); 5] = [
+            (
+                "exit 0",
+                true,
+                Some(0),
+                false,
+                None,
+                JobStatus::Succeeded,
+                Status::Succeeded,
+                false,
+            ),
+            (
+                "guest failure",
+                true,
+                Some(3),
+                false,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                false,
+            ),
+            (
+                "timeout",
+                true,
+                None,
+                true,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                false,
+            ),
+            (
+                "transport error",
+                true,
+                Some(0),
+                false,
+                Some("link lost"),
+                JobStatus::Failed,
+                Status::Failed,
+                true,
+            ),
+            (
+                "never booted",
+                false,
+                None,
+                false,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                true,
+            ),
+        ];
+        for (name, booted, exit_code, timed_out, transport_error, job_status, status, retryable) in rows {
+            let (store, job_registry) = (test_store(), test_job_registry());
+            running_job(&store, &job_registry, "job-1").await?;
+            let result = JobResult {
+                job_id: "job-1".to_owned(),
+                booted,
+                exit_code,
+                timed_out,
+                transport_error: transport_error.map(str::to_owned),
+                console: "hi\n".to_owned(),
+                outputs_follow: false,
+            };
+            record_job_result(
+                &store,
+                &job_registry,
+                &mut HashSet::from(["job-1".to_owned()]),
+                &mut HashSet::new(),
+                result,
+            )
+            .await;
+            assert_eq!(store.status("job-1")?, Some(job_status), "{name}: lifecycle status");
+            let envelope = store
+                .envelope("job-1")?
+                .with_context(|| format!("{name}: a terminal job must carry an envelope"))?;
+            assert_eq!(envelope.status, status, "{name}: envelope status");
+            assert_eq!(envelope.retryable, retryable, "{name}: retryable");
+            assert_eq!(envelope.job_id, "job-1", "{name}");
+            assert_eq!(envelope.result_schema_version, sandy::RESULT_SCHEMA_VERSION, "{name}");
+            assert_eq!(envelope.logs.tail, "hi\n", "{name}: the console is the log tail");
+        }
+        Ok(())
+    }
+
+    /// A2 (#483): the envelope's audit receipt is honest about what the daemon knows. `who` is the local-uid fallback
+    /// (`authenticated: false`, #413), and the egress boundary is `Unenforced` with a reason, never "applied", while no
+    /// executor reports an outcome (A2b).
+    #[tokio::test]
+    async fn the_envelope_receipt_does_not_claim_what_the_daemon_did_not_observe() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            result_for("job-1", 0, false),
+        )
+        .await;
+        let envelope = store.envelope("job-1")?.context("a terminal job carries an envelope")?;
+        let receipt = envelope.receipt.context("the envelope carries the audit receipt")?;
+        assert!(!receipt.host_observed.who.authenticated, "no verified caps yet (#413)");
+        assert_eq!(
+            receipt.host_observed.egress.status,
+            sandy::EgressEnforcement::Unenforced
+        );
+        assert!(
+            receipt
+                .host_observed
+                .egress
+                .reason
+                .is_some_and(|reason| reason.contains("not report")),
+            "the reason says the executor reported nothing"
+        );
+        assert_eq!(receipt.guest_reported.exit_code, Some(0));
+        Ok(())
+    }
+
+    /// A2 (#483): the envelope is final only once the outputs are settled: a receive that fails turns an exit-0 run
+    /// into a failed envelope, and one that succeeds keeps it succeeded.
+    #[tokio::test]
+    async fn the_envelope_of_a_job_owing_outputs_follows_the_receive() -> anyhow::Result<()> {
+        use sandy::Status;
+        for (received, want) in [(true, Status::Succeeded), (false, Status::Failed)] {
+            let (store, job_registry) = (test_store(), test_job_registry());
+            job_owing_outputs(&store, &job_registry, "job-1").await?;
+            let awaited = record_job_result(
+                &store,
+                &job_registry,
+                &mut HashSet::from(["job-1".to_owned()]),
+                &mut HashSet::new(),
+                result_for("job-1", 0, true),
+            )
+            .await
+            .context("owed")?;
+            assert!(
+                store.envelope("job-1")?.is_none(),
+                "no envelope before the outputs settle"
+            );
+            let job = job_registry.get("job-1").context("registered")?;
+            job.outputs.publish(if received {
+                crate::output_slot::OutputsState::Received(crate::data_link_recv::Received { files: 1, bytes: 3 })
+            } else {
+                crate::output_slot::OutputsState::Failed("the link closed".to_owned())
+            });
+            awaited.settle(&store, &job_registry, SOON).await;
+            let envelope = store.envelope("job-1")?.context("settled: an envelope")?;
+            assert_eq!(envelope.status, want, "received={received}");
+        }
+        Ok(())
+    }
+
+    /// A2 (#483): a job that is not terminal has no envelope, and one whose host disconnected gets a failed,
+    /// retryable one, so every terminal path leaves exactly what a direct run would.
+    #[tokio::test]
+    async fn only_a_terminal_job_has_an_envelope_and_a_disconnect_fails_it_retryably() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        assert!(store.envelope("job-1")?.is_none(), "a running job has no envelope");
+        assert!(store.envelope("ghost")?.is_none(), "an unknown job has none");
+        fail_disconnected_job(&store, &job_registry, "job-1").await;
+        let envelope = store.envelope("job-1")?.context("a failed job carries an envelope")?;
+        assert_eq!(envelope.status, sandy::Status::Failed);
+        assert!(envelope.retryable, "an infra fault is retryable");
+        Ok(())
+    }
+
     /// Outputs that never arrive do not hold the job forever.
     #[tokio::test]
     async fn outputs_that_never_arrive_fail_the_job_at_the_wait_limit() -> anyhow::Result<()> {

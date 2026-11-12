@@ -1113,6 +1113,7 @@ pub async fn handle(
                     status: i32::from(detail.status),
                     exit_code: detail.exit_code,
                     console_tail: detail.console,
+                    result_envelope: None,
                 }),
                 None => control_response::Result::Error(ControlError {
                     message: format!("no such job: {}", status_req.job_id),

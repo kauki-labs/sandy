@@ -255,6 +255,11 @@ message StatusResponse {
   // reports it back — the one place a cross-machine job's output is visible to
   // a caller that cannot reach the host. Empty while the job has reported none.
   string console_tail = 4;
+  // A terminal job's result envelope (INV-11), as the envelope's own JSON: the same locked `ResultEnvelope` a direct
+  // `sandy run` prints, built by the daemon from the host's report (A2 of #483). Unset while the job is PENDING or
+  // RUNNING, and for a job recorded before the daemon stored envelopes. Bytes, not a second proto copy, so the serde
+  // schema and its `result_schema_version` stay the one source of truth.
+  optional bytes result_envelope = 5;
 }
 
 message ListRequest {}

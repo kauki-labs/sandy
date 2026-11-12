@@ -482,6 +482,16 @@ impl JobStore {
         }
     }
 
+    /// The terminal result envelope the daemon recorded for `job_id` (A2 of #483), or `None` while the job is not
+    /// terminal, when no such job exists, or for a job recorded before envelopes were stored.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn envelope(&self, job_id: &str) -> Result<Option<sandy::ResultEnvelope>, StoreError> {
+        let _ = job_id;
+        Ok(None)
+    }
+
     /// Every job's id and current status, in no particular guaranteed order
     /// beyond SQLite's own default row order.
     ///
