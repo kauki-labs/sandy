@@ -1754,6 +1754,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
