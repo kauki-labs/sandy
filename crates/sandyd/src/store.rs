@@ -105,6 +105,42 @@ pub struct JobSummary {
     pub status: JobStatus,
 }
 
+/// What revoking a job's credential after a crash needs (#830): which trust root minted it, the provider's handle for
+/// it, when it expires, and where its token is staged. Never the token itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRecord {
+    /// The trust root the credential was minted from.
+    pub trust_root: String,
+    /// The provider's id for the credential (a [`sandy::CredentialHandle`]'s `id`).
+    pub handle_id: String,
+    /// When the token expires, in whole seconds since the Unix epoch.
+    pub expires_at_unix: u64,
+    /// The staged token file; its directory is the job's private `cred-*` dir.
+    pub token_path: std::path::PathBuf,
+}
+
+impl CredentialRecord {
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "trust_root": self.trust_root,
+            "handle_id": self.handle_id,
+            "expires_at_unix": self.expires_at_unix,
+            "token_path": self.token_path.to_string_lossy(),
+        })
+        .to_string()
+    }
+
+    fn from_json(raw: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        Some(Self {
+            trust_root: value.get("trust_root")?.as_str()?.to_owned(),
+            handle_id: value.get("handle_id")?.as_str()?.to_owned(),
+            expires_at_unix: value.get("expires_at_unix")?.as_u64()?,
+            token_path: value.get("token_path")?.as_str()?.into(),
+        })
+    }
+}
+
 /// A job's status plus the terminal detail a finished run reported back
 /// (#292): the guest exit code it classified the status from, and a bounded
 /// tail of the job's own console output.
@@ -251,6 +287,9 @@ impl JobStore {
         // terminal status, so a terminal row never lacks one unless it was recorded before this column existed
         // (NULL, read as no envelope, never fabricated).
         ensure_column(&conn, "envelope", "ALTER TABLE jobs ADD COLUMN envelope TEXT")?;
+        // The revocation record of the job's daemon-minted credential (#830), as JSON: NULL for a job with none, and
+        // again once its revoke succeeded. Never the token.
+        ensure_column(&conn, "credential", "ALTER TABLE jobs ADD COLUMN credential TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -619,8 +658,83 @@ impl JobStore {
     /// # Errors
     /// [`StoreError::Sqlite`] if the read or a write fails; no row changes then.
     pub fn recover_unfinished(&self, reason: &str) -> Result<Vec<String>, StoreError> {
-        let _ = reason;
-        Ok(Vec::new())
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let open: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT job_id FROM jobs WHERE status IN (?1, ?2)")?;
+            stmt.query_map(
+                (status_name(JobStatus::Pending), status_name(JobStatus::Running)),
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?
+        };
+        let now = now_unix();
+        for id in &open {
+            // The same envelope the daemon writes for any infrastructure failure; no host is named, since none is
+            // known after a restart. A failed serialization still ends the row, as `finish_with` does.
+            let envelope = serde_json::to_string(&crate::envelope::infra_fault(id, reason, None))
+                .inspect_err(|e| tracing::warn!(job_id = %id, error = %e, "could not serialize the recovery envelope"))
+                .ok();
+            tx.execute(
+                "UPDATE jobs SET status = ?1, envelope = ?2, updated_at = ?3 WHERE job_id = ?4",
+                (status_name(JobStatus::Failed), envelope, now, id),
+            )?;
+        }
+        tx.commit()?;
+        Ok(open)
+    }
+
+    /// Record `record` as the revocation state of `job_id`'s credential (#830), replacing any earlier one.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write fails.
+    pub fn set_credential(&self, job_id: &str, record: &CredentialRecord) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE jobs SET credential = ?1 WHERE job_id = ?2",
+            (record.to_json(), job_id),
+        )?;
+        Ok(())
+    }
+
+    /// Forget `job_id`'s credential record: its credential is revoked, or has expired. Idempotent.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write fails.
+    pub fn clear_credential(&self, job_id: &str) -> Result<(), StoreError> {
+        self.lock()
+            .execute("UPDATE jobs SET credential = NULL WHERE job_id = ?1", [job_id])?;
+        Ok(())
+    }
+
+    /// Every job's credential record that is still set, with its job id. A row whose record does not decode is
+    /// logged and left out (and stays in the column, for an operator to read).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn credential_records(&self) -> Result<Vec<(String, CredentialRecord)>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT job_id, credential FROM jobs WHERE credential IS NOT NULL")?;
+        let rows = stmt.query_map((), |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (job_id, raw) = row?;
+            match CredentialRecord::from_json(&raw) {
+                Some(record) => records.push((job_id, record)),
+                None => tracing::warn!(job_id, "a job's credential record does not decode; leaving it in place"),
+            }
+        }
+        Ok(records)
+    }
+
+    /// `job_id`'s credential record, if one is set.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn credential_record(&self, job_id: &str) -> Result<Option<CredentialRecord>, StoreError> {
+        Ok(self
+            .credential_records()?
+            .into_iter()
+            .find_map(|(id, record)| (id == job_id).then_some(record)))
     }
 }
 
