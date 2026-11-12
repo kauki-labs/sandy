@@ -197,6 +197,7 @@ async fn register_host(
                     supported_isolation_classes: classes.iter().map(|c| i32::from(*c)).collect(),
                     shares_submitter_filesystem: false,
                     transfer: false,
+                    egress_proxy: false,
                 }),
             })),
         },
@@ -245,6 +246,7 @@ fn submit(
                 cpu: None,
                 mem: None,
                 timeout_secs: None,
+                from_devshell: false,
                 service: None,
             })
             .context("encode the flake/v1 manifest")?,

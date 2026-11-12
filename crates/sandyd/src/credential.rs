@@ -479,6 +479,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -570,6 +571,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: credential.map(str::to_owned),
                 cred_capabilities,
+                egress: None,
             })),
         }
     }
@@ -766,6 +768,7 @@ mod tests {
             "host-1",
             Capabilities {
                 transfer: true,
+                egress_proxy: false,
                 ..capabilities(true)
             },
         )
@@ -822,6 +825,7 @@ mod tests {
             "host-1",
             Capabilities {
                 transfer: true,
+                egress_proxy: false,
                 ..capabilities(true)
             },
         )

@@ -993,6 +993,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -1048,6 +1049,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         registry.send_dispatch("remote-host", dispatch.clone()).await?;
 
@@ -1545,6 +1547,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         }
     }
 

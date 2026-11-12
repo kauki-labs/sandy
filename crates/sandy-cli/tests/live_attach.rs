@@ -160,6 +160,7 @@ fn trusted_process_capabilities() -> Capabilities {
         supported_isolation_classes: vec![IsolationClass::Trusted.into()],
         shares_submitter_filesystem: false,
         transfer: false,
+        egress_proxy: false,
     }
 }
 
@@ -187,6 +188,7 @@ async fn submit(
             secrets: Vec::new(),
             credential: None,
             cred_capabilities: Vec::new(),
+            egress: None,
         }),
     )
     .await

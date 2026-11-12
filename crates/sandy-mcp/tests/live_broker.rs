@@ -27,11 +27,11 @@
 //! `mint` in the call log must have its `revoke`, and no staged directory may remain.
 //!
 //! `SANDYD_BIN` and `BROKER_BIN` override the sibling binaries. Every wait is bounded, and the stack guard
-//! stops what the test started: only descendants of this test's own `sandyd`, matched by pid and start time, are
-//! ever killed (qemu, virtiofsd, the egress proxy). The daemon runs with `TMPDIR` set to a directory inside the
-//! test's own temp dir, so the staging base (`<TMPDIR>/sandy`, with the secret share, console log and sockets) is
-//! scanned for the canary and removed with that directory. Nothing outside it is ever deleted; a new `/tmp/sandy*`
-//! entry made by another session is only reported.
+//! stops what the test started: only descendants of this test's own `sandyd` and the members of its own process group,
+//! matched by pid and start time, are ever killed (qemu, virtiofsd, the egress proxy). The daemon runs with `TMPDIR`
+//! set to a directory inside the test's own temp dir, so the staging base (`<TMPDIR>/sandy`, with the secret share,
+//! console log and sockets) is scanned for the canary and removed with that directory. Nothing outside it is ever
+//! deleted; a new `/tmp/sandy*` entry made by another session is only reported.
 #![cfg(feature = "live")]
 #![cfg(target_os = "linux")]
 
@@ -55,8 +55,8 @@ use anyhow::{Context, Result, bail, ensure};
 use common::{
     mcp_client::{BIN, Mcp, SCRIPT, credential_file, run_script},
     procs::{
-        descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries,
-        stat_is_live,
+        descendants_in, files_holding, foreign_new_entries, group_members_in, is_vm_part, parse_pgrp, parse_stat,
+        run_dirs_left, sandy_entries, stat_is_live,
     },
 };
 use serde_json::{Value, json};
@@ -74,6 +74,10 @@ const SERVICE_COMMAND: &str = "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuse
 /// `sun_path` holds 107 plus the NUL. 38 leaves 2 bytes of margin.
 const MAX_TMP_BYTES: usize = 38;
 const STUB_ROOT: &str = "live";
+/// The TTL of the ephemeral environment of AT-5 (#812) and the grace the daemon gets past it: a boot (about 15 s), then
+/// the TTL from creation, then a pass every second.
+const TTL_SECS: u64 = 45;
+const TTL_GRACE_SECS: u64 = 30;
 const SERVICE_PORT: &str = "9000";
 const SERVICE_USER: &str = "nobody";
 
@@ -196,12 +200,53 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
     descendants_in(&table, root)
 }
 
-/// The descendants of `root` that are part of a VM: qemu, virtiofsd and the egress proxy.
-fn vm_parts(root: u32) -> Vec<(u32, u64)> {
-    descendants(root)
+/// Whether this test process leads its own process group, as it does under `cargo nextest`.
+fn leads_its_group() -> bool {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| parse_pgrp(&stat))
+        .is_some_and(|pgrp| pgrp == std::process::id())
+}
+
+/// The VM parts (qemu, virtiofsd, the egress proxy) in this test's own process group, as `(pid, start time)`. The
+/// daemon is started in the test's group, so this reaches a child that was re-parented or double-forked, which the
+/// parent walk in [`descendants`] cannot (#734). It is empty unless the test is the leader of its group, which `cargo
+/// nextest` makes it: under a plain `cargo test` the group is the shell's, and its members are not this test's. A
+/// process that calls `setsid` or `setpgid` leaves the group; `vm_parts_using` covers those by their command line.
+fn group_vm_parts() -> Vec<(u32, u64)> {
+    let own = std::process::id();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    if !leads_its_group() {
+        return Vec::new();
+    }
+    let table: Vec<(u32, u32, u64)> = proc
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            let (_, start) = parse_stat(&stat)?;
+            Some((pid, parse_pgrp(&stat)?, start))
+        })
+        .collect();
+    group_members_in(&table, own)
         .into_iter()
         .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
         .collect()
+}
+
+/// The processes of this daemon's tree that are part of a VM: qemu, virtiofsd and the egress proxy. Its descendants
+/// and the VM parts of the test's process group, so a re-parented one still counts.
+fn vm_parts(root: u32) -> Vec<(u32, u64)> {
+    let mut parts: Vec<(u32, u64)> = descendants(root)
+        .into_iter()
+        .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
+        .chain(group_vm_parts())
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    parts
 }
 
 /// `(pid, start time)` of every VM part whose command line names `base`: the test daemon's own `TMPDIR`, unique to
@@ -582,6 +627,9 @@ impl Stack {
             let _ = broker.wait();
         }
         let mut owned = descendants(self.sandyd.id());
+        // Also the VM parts of the test's process group, taken now with the descendants: a child that was re-parented
+        // is not a descendant any more, and is still in the group (#734).
+        owned.extend(group_vm_parts());
         // A daemon that already exited died during the run: its children were re-parented, and every "no VM left"
         // answer since was blind. The status is reaped here, so it is reported once, and the pid is never signalled
         // (it may belong to another process now). The walk finds nothing, so the VM parts are found by the staging
@@ -589,7 +637,9 @@ impl Stack {
         let already_exited = match self.sandyd.try_wait() {
             Ok(Some(status)) => {
                 findings.push(format!("sandyd had already exited during the run: {status}"));
-                owned = vm_parts_using(&self.tmp);
+                owned.extend(vm_parts_using(&self.tmp));
+                owned.sort_unstable();
+                owned.dedup();
                 true
             }
             _ => false,
@@ -781,6 +831,14 @@ fn ps_holds(needle: &str) -> Result<bool> {
 fn the_conformance_script_passes_against_the_real_stack_and_leaves_nothing() -> Result<()> {
     require_live()?;
     let stack = Stack::start()?;
+    eprintln!(
+        "process-group walk for re-parented VM parts: {}",
+        if leads_its_group() {
+            "on"
+        } else {
+            "off, the test does not lead its group"
+        }
+    );
     // A failure prints the daemon and broker logs first: the temp dir goes with the stack.
     let outcome = scenario(&stack).inspect_err(|_| {
         stack.dump_logs();
@@ -910,6 +968,50 @@ fn scenario(stack: &Stack) -> Result<()> {
     run_script(&mut mcp, &script)?;
     stack.check_session(mcp, "script session")?;
     stack.canary_leaks("after the script")?;
+
+    // AT-5 (#812): an ephemeral environment is deleted at its TTL with no delete call, and its VM and credential go
+    // with it. The TTL counts from creation and the driver passes every second, so the grace is a few seconds.
+    let mut mcp = stack.mcp()?;
+    let mut ttl_spawn = spawn_args("live-ttl", "ttl");
+    ttl_spawn["lifetime"] = json!({"kind": "ephemeral", "ttl_secs": TTL_SECS});
+    let (is_err, spawned) = mcp.call("spawn_environment", &ttl_spawn)?;
+    ensure!(!is_err, "AT-5: spawn with a short TTL failed: {spawned}");
+    let ttl_id = spawned["environment_id"].as_str().context("environment_id")?.to_owned();
+    let created = Instant::now();
+    wait_state(&mut mcp, &ttl_id, "deleted", TTL_SECS + TTL_GRACE_SECS)
+        .context("AT-5: the environment was not deleted by its TTL")?;
+    // The row's creation time is whole seconds, truncated, and `created` is taken after the spawn call returned, so the
+    // deletion can read up to a second or two early here; far earlier than that is a bug.
+    ensure!(
+        created.elapsed() + Duration::from_secs(2) >= Duration::from_secs(TTL_SECS),
+        "AT-5: deleted before its TTL: {:?}",
+        created.elapsed()
+    );
+    eprintln!("KPI ephemeral TTL {TTL_SECS} s: deleted after {:?}", created.elapsed());
+    stack.check_session(mcp, "ttl session")?;
+    stack.wait_no_vm(60)?;
+
+    // #815: ending a task deletes its environment through the delete path, VM and credential with it, and a repeat is a
+    // no-op. A second task's environment is not touched (the broker lists only the caller's, by task_ref).
+    let mut mcp = stack.mcp()?;
+    let (is_err, spawned) = mcp.call("spawn_environment", &spawn_args("live-task", "live-task"))?;
+    ensure!(!is_err, "end_task: spawn failed: {spawned}");
+    let task_id = spawned["environment_id"].as_str().context("environment_id")?.to_owned();
+    wait_state(&mut mcp, &task_id, "ready", PROVISION_SECS + 60)?;
+    let (is_err, ended) = mcp.call("end_task", &json!({"task_ref": "live-task"}))?;
+    ensure!(
+        !is_err && ended["ended"] == json!([task_id.clone()]),
+        "end_task: {ended}"
+    );
+    stack.wait_no_vm(120)?;
+    let gone = get_environment(&mut mcp, &task_id)?;
+    ensure!(gone["state"] == json!("deleted"), "end_task: the environment is {gone}");
+    let (is_err, repeat) = mcp.call("end_task", &json!({"task_ref": "live-task"}))?;
+    ensure!(
+        !is_err && repeat["ended"] == json!([]),
+        "end_task: a repeat must be a no-op: {repeat}"
+    );
+    stack.check_session(mcp, "end_task session")?;
 
     // After the run: no non-terminal environment through the API, no VM of ours, nothing new in /tmp/sandy-*.
     stack.wait_no_vm(120)?;

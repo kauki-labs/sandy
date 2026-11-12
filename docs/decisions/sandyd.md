@@ -1482,6 +1482,12 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   precedent. The bare `sandy daemon submit <manifest-file>` path needs no
   new flags — an operator writing `argv/v1` JSON by hand already has the
   object shape available.
+- A3 (#483): the positional of `daemon submit` is a manifest file with `--manifest-encoding`, else a TEMPLATE, sent as a
+  `flake/v1` manifest with kind `topology` (the executor adds its own system and hypervisor, so a submitter's host attr
+  never travels). A template that names an existing file or `-` is refused as a forgotten `--manifest-encoding`, and one
+  with a `#` is refused naming `--flake`. The plain flags apply to a template or `--flake` and are refused with a
+  manifest file. `--from-devshell` is a `flake/v1` field (`from_devshell`, absent when false); an executor that predates
+  it refuses the manifest naming the field.
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's
@@ -2214,7 +2220,14 @@ so the environment operations need an MCP surface beside the job operations.
 
 - `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`, `attach`) and environment tools
   (`spawn_environment`, `get_environment`, `link_environment`, `cancel_environment`,
-  `delete_environment`, `stop_environment`, `resume_environment`, `list_environments`).
+  `delete_environment`, `end_task`, `stop_environment`, `resume_environment`, `list_environments`).
+- **Ending a task (#815, owner decision).** Deleting an environment ends its task, and an ephemeral environment's TTL is
+  the backstop when the caller never does. `end_task(task_ref)` is the bookkeeping shortcut: the broker lists the caller's
+  own environments with that `task_ref` and deletes each through the same delete as `delete_environment`
+  (`POST /v1/tasks/end`). It is idempotent, a task with no environment is a no-op, an empty `task_ref` is refused (the list
+  filter reads it as "any"), and another client's environment with the same `task_ref` is never touched because only
+  the caller's own are listed. It is a broker route, not a sandyd call: sandyd has no client identity, so a daemon call
+  by `task_ref` alone could end another client's environments. There is no lease.
 - One tool call makes one API request. The server holds no state and has no dispatch logic.
 - The contract is `docs/api/broker.openapi.yaml`. `sandy-mcp` does not depend on
   `sandy-control-proto`. A test reads `Cargo.lock` and fails if the crate reaches it.
@@ -2298,6 +2311,11 @@ terminal envelope, so it would need a second record kind and a different reconci
 - Inputs are validated before any write: keys and names are 1 to 128 (profile 64, size 32) letters, digits, `-`, `_`
   or `.`; a profile that looks like a credential is refused; `task_ref` is at most 256 bytes without control
   characters; an ephemeral lifetime needs a TTL between 1 second and 7 days, a persistent one has none.
+- The driver reaps an ephemeral environment at `created_at + ttl_secs`, counted from creation whatever state it is in, by the store's
+  `delete`; the same pass then kills its box and revokes its credential as for any deleted row (#812). The deadline is read
+  from the stored row, so a restarted daemon reaps an expired row on its first pass. A persistent environment is never
+  reaped. The grace is the driver's pass interval (1 second). Ending a task has no signal in sandyd; `delete_environment`
+  is the explicit one, and what else ends a task is #815.
 - An ephemeral environment answers `UNSUPPORTED_FOR_LIFETIME` to stop and resume. `cancel` applies only while
   `Provisioning`; `delete` applies from every state and is idempotent.
 - The daemon opens the environment store in the same `0600` file as the job store. `SANDY_MAX_ENVIRONMENTS` caps

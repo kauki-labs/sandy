@@ -161,6 +161,7 @@ async fn submit_flake(
         cpu: None,
         mem: None,
         timeout_secs: None,
+        from_devshell: false,
         service: None,
     })
     .context("encode flake/v1 manifest")?;
@@ -177,6 +178,7 @@ async fn submit_flake(
             secrets: Vec::new(),
             credential: None,
             cred_capabilities: Vec::new(),
+            egress: None,
         }),
     )
     .await

@@ -461,6 +461,15 @@ pub async fn handle(
             // host (never a silent `Pending` forever, never a silent place-
             // anywhere).
             let require_local = submit_requires_local_dispatch(&submit);
+            // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
+            // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
+            let path_needs = if !submit.secrets.is_empty() || submit.credential.is_some() {
+                crate::host_registry::PathNeeds::SharedFilesystem
+            } else if !submit.inputs.is_empty() || !submit.outputs.is_empty() {
+                crate::host_registry::PathNeeds::SharedFilesystemOrTransfer
+            } else {
+                crate::host_registry::PathNeeds::Anywhere
+            };
             // Cached before `submit.manifest`/`manifest_encoding` are moved
             // out below: a partial move of one field makes rustc refuse any
             // later `&submit` borrow, even to read a different field.
@@ -470,10 +479,10 @@ pub async fn handle(
                 false
             } else {
                 host_registry
-                    .pick_host_for(
+                    .pick_host(
                         required_isolation_class.into(),
                         required_sandbox_kind.into(),
-                        require_local,
+                        path_needs,
                     )
                     .is_some()
             };
@@ -483,6 +492,12 @@ pub async fn handle(
                     .to_owned()
             } else if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
+                format!(
+                    "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
+                     `{path_field_name}` path, which is valid on the submitter's own filesystem or carried over the \
+                     data link by a host that declared transfer"
+                )
             } else if require_local {
                 format!(
                     "no registered host declares shares_submitter_filesystem; this Submit names a `{path_field_name}` \
@@ -569,10 +584,10 @@ pub async fn handle(
             // `send_dispatch` call happens after, once the job is durably
             // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry.pick_host_for(
+                let candidate = host_registry.pick_host(
                     required_isolation_class.into(),
                     required_sandbox_kind.into(),
-                    require_local,
+                    path_needs,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -620,17 +635,19 @@ pub async fn handle(
                             link_token,
                             forward_back: forward_back.to_string(),
                             required_isolation_class: required_isolation_class.into(),
-                            // Safe to forward unconditionally (#496): `candidate`
-                            // only exists because `pick_host_for` was called with
-                            // `require_local`, which already filtered on
+                            // Safe to forward unconditionally (#496, #807):
+                            // `candidate` only exists because `pick_host` was
+                            // called with `path_needs`, which filtered on
                             // `shares_submitter_filesystem` for a Submit that
-                            // actually carries any of these — a non-local pick
-                            // only ever happens when all three were empty to
-                            // begin with.
+                            // carries secrets or a credential, and on that or
+                            // `transfer` for inputs and outputs only — a host
+                            // that takes them without sharing the filesystem
+                            // got a data link above, which carries the files.
                             inputs: path_inputs.clone(),
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
                             data_link_token,
+                            egress: None,
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -663,8 +680,13 @@ pub async fn handle(
                 credential_placement_refusal()
             } else if require_local {
                 format!(
-                    "no registered host declaring shares_submitter_filesystem could be bound for this job's \
-                     `{path_field_name}` path"
+                    "no registered host declaring shares_submitter_filesystem{} could be bound for this job's \
+                     `{path_field_name}` path",
+                    if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
+                        " or transfer"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 "no registered host could be bound for this job's required isolation class and sandbox kind; it cannot \
@@ -1223,6 +1245,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -1286,6 +1309,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -2465,6 +2489,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2515,6 +2540,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2562,6 +2588,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2584,6 +2611,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -2665,6 +2693,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -2709,11 +2738,83 @@ mod tests {
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let capabilities = sandy_executor_proto::Capabilities {
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, _registry) = place_and_read(submit_req(1), capabilities, peer_ip).await?;
         assert!(dispatch.data_link_token.is_empty(), "no inputs or outputs: no token");
         assert!(job.data_link.is_none(), "no inputs or outputs: no data link bound");
+        Ok(())
+    }
+
+    /// #807: a host that declared `transfer` and not a shared filesystem takes a job with inputs: the data link
+    /// carries them, so the Dispatch names the inputs and a data link token.
+    #[tokio::test]
+    async fn a_transfer_host_without_a_shared_filesystem_takes_a_job_with_inputs() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: false,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (dispatch, job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        assert_eq!(dispatch.inputs.len(), 1);
+        assert_eq!(dispatch.data_link_token.len(), crate::link_auth::LINK_TOKEN_LEN);
+        assert!(job.data_link.is_some(), "the data link must be bound");
+        Ok(())
+    }
+
+    async fn refused_for(
+        request: ControlRequest,
+        capabilities: sandy_executor_proto::Capabilities,
+    ) -> anyhow::Result<String> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _rx = register_test_host(&host_registry, "remote-host", peer_ip, capabilities);
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(error)) => Ok(error.message),
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A `secrets` file is on the submitter's machine and `transfer` does not carry it: a transfer-only host still
+    /// refuses a Submit that names one (#496 holds for secrets).
+    #[tokio::test]
+    async fn a_transfer_only_host_is_refused_for_a_job_with_a_secret() -> anyhow::Result<()> {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.secrets = vec![sandy_control_proto::SecretRef {
+                name: "token".to_owned(),
+                host_path: "/etc/secret".to_owned(),
+            }];
+        }
+        let capabilities = sandy_executor_proto::Capabilities {
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let message = refused_for(request, capabilities).await?;
+        assert!(message.contains("shares_submitter_filesystem"), "got {message:?}");
+        Ok(())
+    }
+
+    /// A host with neither capability is refused for inputs, and the refusal names both ways to qualify.
+    #[tokio::test]
+    async fn a_host_with_neither_capability_is_refused_for_inputs_naming_both() -> anyhow::Result<()> {
+        let message = refused_for(submit_req_with_input(1), trusted_host_capabilities()).await?;
+        assert!(
+            message.contains("shares_submitter_filesystem") && message.contains("transfer"),
+            "got {message:?}"
+        );
         Ok(())
     }
 
@@ -2725,6 +2826,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: false,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
@@ -2741,6 +2843,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let request = req(
@@ -2758,6 +2861,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
         let (dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
@@ -2776,6 +2880,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
@@ -3114,6 +3219,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         };
         let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, untrusted_only);
 
@@ -3303,6 +3409,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         })
         .expect("a flake manifest encodes")
@@ -3339,6 +3446,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3351,6 +3459,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -3639,6 +3748,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3656,6 +3766,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3673,6 +3784,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3685,6 +3797,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -3881,6 +3994,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }

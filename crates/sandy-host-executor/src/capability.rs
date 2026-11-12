@@ -162,6 +162,7 @@ fn to_wire_capabilities(
             .collect(),
         shares_submitter_filesystem,
         transfer: false,
+        egress_proxy: false,
     }
 }
 

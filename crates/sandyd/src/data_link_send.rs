@@ -18,8 +18,8 @@ use std::{collections::HashSet, ffi::OsStr, io::Read, path::PathBuf, time::Durat
 
 use sandy_control_proto::{FrameError, write_frame};
 use sandy_executor_proto::{
-    DataLinkMessage, InputChunk, InputEnd, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, TransferError,
-    data_link_message::Op,
+    DataLinkMessage, DataLinkViolation, InputChunk, InputEnd, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_ENTRIES, TransferError, data_link_message::Op,
 };
 use sandy_fsutil::beneath::{self, Beneath, EntryKind};
 use tokio::io::AsyncWrite;
@@ -28,6 +28,10 @@ use tokio::io::AsyncWrite;
 /// accept task, for ever.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default [`SendLimits::read_timeout`]: one chunk is at most `MAX_CHUNK_BYTES`, so a read that takes this long is
+/// stalled, not slow.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The caps one send enforces. The default is the §22 pair; a test lowers them.
 #[derive(Debug, Clone, Copy)]
 pub struct SendLimits {
@@ -35,6 +39,9 @@ pub struct SendLimits {
     pub max_bytes: u64,
     /// The most entries the send counts: files plus the directories the receiver creates for their names.
     pub max_entries: usize,
+    /// The longest the writer waits for the reader thread's next chunk. A stalled source (an NFS or FUSE read) holds
+    /// that thread; this frees the link and the accept task (#769).
+    pub read_timeout: Duration,
 }
 
 impl Default for SendLimits {
@@ -42,6 +49,7 @@ impl Default for SendLimits {
         Self {
             max_bytes: MAX_TRANSFER_BYTES,
             max_entries: MAX_TRANSFER_ENTRIES,
+            read_timeout: READ_TIMEOUT,
         }
     }
 }
@@ -61,6 +69,9 @@ pub enum SendError {
     /// Writing to the link failed or timed out: the peer is gone or stopped reading.
     #[error("writing to the data link: {0}")]
     Link(#[from] FrameError),
+    /// The reader thread produced no chunk within [`SendLimits::read_timeout`]: a source read is stalled (#769).
+    #[error("reading an input stalled past the read timeout")]
+    ReadTimedOut,
     /// The write of one frame took longer than [`WRITE_TIMEOUT`].
     #[error("the data link did not accept a frame within the write timeout")]
     WriteTimedOut,
@@ -82,6 +93,12 @@ pub enum SendError {
     /// A declared input has an empty name, so its chunks cannot be named.
     #[error("a declared input has no name")]
     UnnamedInput,
+    /// Two declared inputs have one name: the receiver would end with `Clash` after bytes moved (#771).
+    #[error("two declared inputs have the same name")]
+    DuplicateName,
+    /// A name the receiver would refuse (too long, an absolute or `..` path, a NUL): refused at the source (#770).
+    #[error("an input name the receiver would refuse: {0}")]
+    InvalidName(#[source] DataLinkViolation),
     /// The transfer is past its byte cap.
     #[error("the transfer is past its byte cap")]
     TooManyBytes,
@@ -99,11 +116,13 @@ impl SendError {
     pub fn peer_reason(&self) -> &'static str {
         match self {
             Self::Link(_) | Self::WriteTimedOut | Self::Stopped => "the sender's link failed",
-            Self::Source(_) | Self::Read(_) => "an input could not be read",
+            Self::Source(_) | Self::Read(_) | Self::ReadTimedOut => "an input could not be read",
             Self::Symlink => "an input holds a symlink",
             Self::UnsupportedEntry => "an input holds an entry that is not a file or a directory",
             Self::EmptyInput => "a declared input holds no file",
             Self::UnnamedInput => "a declared input has no name",
+            Self::DuplicateName => "two declared inputs have the same name",
+            Self::InvalidName(_) => "an input name is not allowed",
             Self::TooManyBytes => "the transfer is past its byte cap",
             Self::TooManyEntries => "the transfer is past its entry cap",
         }
@@ -114,8 +133,9 @@ impl SendError {
 /// slow peer holds a few MiB, not a file.
 const QUEUE_DEPTH: usize = 4;
 
-/// Send `inputs` to `link`, then `InputEnd`. On a failure other than a dead link, the peer gets a `TransferError`
-/// first.
+/// Send `inputs` to `link`, then `InputEnd`. When the reader fails (a source it cannot read, a refused name, a cap),
+/// the peer gets a `TransferError` first. A dead link, a write timeout and a read timeout ([`SendError::ReadTimedOut`])
+/// end the send with no `TransferError`: the link is dropped and the peer sees it close.
 ///
 /// # Errors
 /// See [`SendError`].
@@ -130,15 +150,10 @@ pub async fn send_inputs(
         .collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(QUEUE_DEPTH);
     let reader = tokio::task::spawn_blocking(move || read_inputs(&inputs, limits, &tx));
-    while let Some(chunk) = rx.recv().await {
-        let message = DataLinkMessage {
-            op: Some(Op::InputChunk(chunk)),
-        };
-        if let Err(e) = write(link, &message).await {
-            // Dropping the receiver stops the reader at its next hand-over.
-            drop(rx);
-            return Err(e);
-        }
+    if let Err(e) = forward_chunks(link, &mut rx, limits.read_timeout).await {
+        // Dropping the receiver stops the reader at its next hand-over.
+        drop(rx);
+        return Err(e);
     }
     let sent = match reader.await {
         Ok(Ok(sent)) => sent,
@@ -162,6 +177,40 @@ pub async fn send_inputs(
     )
     .await?;
     Ok(sent)
+}
+
+/// Write every chunk the reader hands over, until it closes the channel. A chunk that does not arrive within
+/// `read_timeout` ends the send: the reader is stuck in a source read this task cannot interrupt.
+async fn forward_chunks(
+    link: &mut (impl AsyncWrite + Unpin),
+    rx: &mut tokio::sync::mpsc::Receiver<InputChunk>,
+    read_timeout: Duration,
+) -> Result<(), SendError> {
+    loop {
+        match tokio::time::timeout(read_timeout, rx.recv()).await {
+            Ok(Some(chunk)) => {
+                let message = DataLinkMessage {
+                    op: Some(Op::InputChunk(chunk)),
+                };
+                write(link, &message).await?;
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => return Err(SendError::ReadTimedOut),
+        }
+    }
+}
+
+/// The receiver's own name rule (`DataLinkMessage::validate`), applied to a name before any chunk carries it.
+fn validate_wire_name(name: &str) -> Result<(), SendError> {
+    DataLinkMessage {
+        op: Some(Op::InputChunk(InputChunk {
+            name: name.to_owned(),
+            offset: 0,
+            bytes: Vec::new(),
+        })),
+    }
+    .validate()
+    .map_err(SendError::InvalidName)
 }
 
 async fn write(link: &mut (impl AsyncWrite + Unpin), message: &DataLinkMessage) -> Result<(), SendError> {
@@ -194,10 +243,30 @@ fn read_inputs(
         entries: 0,
         dirs: HashSet::new(),
     };
-    for (name, path) in inputs {
+    let mut declared = HashSet::new();
+    for (name, _) in inputs {
         if name.is_empty() {
             return Err(SendError::UnnamedInput);
         }
+        if !declared.insert(name.as_str()) {
+            return Err(SendError::DuplicateName);
+        }
+        // The receiver's own rule, on every declared name before the first chunk goes out.
+        validate_wire_name(name)?;
+    }
+    // A name inside another declared name (`a` and `a/b`) is a file and a directory at once: the receiver ends with
+    // `Clash` after bytes moved.
+    for (name, _) in inputs {
+        let mut at = 0;
+        while let Some(i) = name[at..].find('/') {
+            at += i;
+            if declared.contains(&name[..at]) {
+                return Err(SendError::DuplicateName);
+            }
+            at += 1;
+        }
+    }
+    for (name, path) in inputs {
         let before = walk.sent.files;
         match beneath::open_file(path) {
             Ok(file) => walk.file(name, file)?,
@@ -214,6 +283,10 @@ impl Walk<'_> {
     /// Send every file below `dir`. An empty subdirectory has no wire form (#756) and is skipped.
     fn tree(&mut self, prefix: &str, dir: &Beneath) -> Result<(), SendError> {
         for entry in dir.entries()? {
+            // A walk over directories with no files hands nothing over, so it checks the writer itself.
+            if self.tx.is_closed() {
+                return Err(SendError::Stopped);
+            }
             let (name, kind) = entry?;
             let name = name.to_str().ok_or(SendError::UnsupportedEntry)?;
             let wire = format!("{prefix}/{name}");
@@ -238,6 +311,8 @@ impl Walk<'_> {
     /// Send one file as chunks in order from offset 0. A zero-byte file is one empty chunk, and no empty chunk
     /// follows data.
     fn file(&mut self, wire: &str, mut file: std::fs::File) -> Result<(), SendError> {
+        // Nested names are known only here; declared ones were checked up front.
+        validate_wire_name(wire)?;
         for (i, _) in wire.match_indices('/') {
             if self.dirs.insert(wire[..i].to_owned()) {
                 self.count_entry()?;
@@ -342,6 +417,189 @@ mod tests {
             out.push(message);
         }
         Ok((sent, out))
+    }
+
+    /// An input the sender refuses must be refused before anything is sent: no chunk reaches the link, and the peer
+    /// gets a `TransferError` (#770, #771).
+    async fn assert_refused_before_any_chunk(inputs: &[sandy_executor_proto::Input]) -> anyhow::Result<()> {
+        let (sent, messages) = frames(inputs, SendLimits::default()).await?;
+        assert!(sent.is_err(), "the send must be refused, got {sent:?}");
+        assert!(
+            !messages.iter().any(|m| matches!(m.op, Some(Op::InputChunk(_)))),
+            "a chunk was sent before the refusal"
+        );
+        assert!(
+            messages.iter().any(|m| matches!(m.op, Some(Op::TransferError(_)))),
+            "the peer was not told"
+        );
+        Ok(())
+    }
+
+    /// A name the receiver would refuse is refused at the source (#770): too long, a `..` or `.` component, an absolute
+    /// path, a NUL, an empty component.
+    #[tokio::test]
+    async fn a_declared_name_the_receiver_would_refuse_is_refused_at_the_source() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("f"), b"x")?;
+        let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
+        for name in [too_long.as_str(), "a/../b", "./a", "/abs", "a\0b", "a//b", "a/"] {
+            let declared = sandy_executor_proto::Input {
+                name: name.to_owned(),
+                ..input(source.path(), "f")
+            };
+            assert_refused_before_any_chunk(&[declared])
+                .await
+                .with_context(|| format!("name {name:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// A bad declared name later in the list is refused before the first input's chunks go out (#770): the up-front
+    /// check covers every declared name, not only the one being walked.
+    #[tokio::test]
+    async fn a_bad_second_declared_name_is_refused_before_the_first_input_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("good"), b"1")?;
+        write(&source.path().join("other"), b"2")?;
+        let bad = sandy_executor_proto::Input {
+            name: "a/../b".to_owned(),
+            ..input(source.path(), "other")
+        };
+        assert_refused_before_any_chunk(&[input(source.path(), "good"), bad]).await
+    }
+
+    /// Declared `a` and `a/b` clash on the receiver (a name is both a file and a directory) after bytes moved: refused
+    /// up front, in either order.
+    #[tokio::test]
+    async fn a_declared_name_inside_another_declared_name_is_refused_before_anything_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("one"), b"1")?;
+        write(&source.path().join("two"), b"2")?;
+        let outer = sandy_executor_proto::Input {
+            name: "a".to_owned(),
+            ..input(source.path(), "one")
+        };
+        let inner = sandy_executor_proto::Input {
+            name: "a/b".to_owned(),
+            ..input(source.path(), "two")
+        };
+        assert_refused_before_any_chunk(&[outer.clone(), inner.clone()]).await?;
+        assert_refused_before_any_chunk(&[inner, outer]).await
+    }
+
+    /// A file inside a tree gets a wire name `<input>/<path>`; one that is too long for the receiver is refused
+    /// before any of its own chunks, and the peer is told (#770). Files found earlier in the walk may already be out.
+    #[tokio::test]
+    async fn a_nested_file_whose_wire_name_is_too_long_is_refused_at_the_source() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("tree/short"), b"x")?;
+        write(&source.path().join("tree").join("f".repeat(200)), b"y")?;
+        // A declared name just under the cap: the file below it has a wire name over it.
+        let declared = sandy_executor_proto::Input {
+            name: "n".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES - 100),
+            ..input(source.path(), "tree")
+        };
+        let (sent, messages) = frames(&[declared], SendLimits::default()).await?;
+        assert!(sent.is_err(), "the send must be refused, got {sent:?}");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(&m.op, Some(Op::InputChunk(c)) if c.name.len() > sandy_executor_proto::MAX_CHUNK_NAME_BYTES)),
+            "a chunk with an over-long name was sent"
+        );
+        assert!(
+            messages.iter().any(|m| matches!(m.op, Some(Op::TransferError(_)))),
+            "the peer was not told"
+        );
+        Ok(())
+    }
+
+    /// Two declared inputs with one name make the receiver end with `Clash` after bytes moved. The sender refuses
+    /// them first (#771).
+    #[tokio::test]
+    async fn two_declared_inputs_with_one_name_are_refused_before_anything_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("one"), b"1")?;
+        write(&source.path().join("two"), b"2")?;
+        let first = sandy_executor_proto::Input {
+            name: "same".to_owned(),
+            ..input(source.path(), "one")
+        };
+        let second = sandy_executor_proto::Input {
+            name: "same".to_owned(),
+            ..input(source.path(), "two")
+        };
+        assert_refused_before_any_chunk(&[first, second]).await
+    }
+
+    /// A reader that hands over nothing (stuck in a source read) ends the send at the read timeout instead of holding
+    /// the link and the accept task (#769).
+    #[tokio::test]
+    async fn a_stalled_reader_ends_the_send_at_the_read_timeout() -> anyhow::Result<()> {
+        let (mut link, _peer) = tokio::io::duplex(64 * 1024);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_chunks(&mut link, &mut rx, Duration::from_millis(300)),
+        )
+        .await
+        .context("the send was not bounded by the read timeout")?;
+        assert!(matches!(ended, Err(SendError::ReadTimedOut)), "got {ended:?}");
+        Ok(())
+    }
+
+    /// A slow but alive reader (each chunk inside the timeout) is not cut off.
+    #[tokio::test]
+    async fn a_reader_that_keeps_handing_over_chunks_is_not_cut_off() -> anyhow::Result<()> {
+        let (mut link, mut peer) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        let feeder = tokio::spawn(async move {
+            for i in 0..4u64 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let chunk = InputChunk {
+                    name: "f".to_owned(),
+                    offset: i,
+                    bytes: vec![0],
+                };
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        forward_chunks(&mut link, &mut rx, Duration::from_millis(400))
+            .await
+            .context("a live reader must not time out")?;
+        feeder.await.context("feeder")?;
+        drop(link);
+        let mut frames = 0;
+        while read_frame::<DataLinkMessage>(&mut peer)
+            .await
+            .context("frame")?
+            .is_some()
+        {
+            frames += 1;
+        }
+        assert_eq!(frames, 4);
+        Ok(())
+    }
+
+    /// A walk over directories with no files never hands a chunk over, so it never learns the writer is gone: it
+    /// checks the channel itself (#769).
+    #[test]
+    fn a_walk_over_empty_directories_stops_when_the_writer_is_gone() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        for i in 0..20 {
+            std::fs::create_dir_all(source.path().join(format!("tree/d{i}/e"))).context("dirs")?;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        drop(rx);
+        let result = read_inputs(
+            &[("tree".to_owned(), source.path().join("tree"))],
+            SendLimits::default(),
+            &tx,
+        );
+        assert!(matches!(result, Err(SendError::Stopped)), "got {result:?}");
+        Ok(())
     }
 
     /// A tree with a multi-chunk file, nested directories and a zero-byte file arrives byte for byte through the

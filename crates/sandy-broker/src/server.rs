@@ -134,6 +134,7 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Respons
         (&Method::GET, ["v1", "jobs", id, "stream", ticket]) => {
             return attach::stream(Arc::clone(&state), client, id, ticket).await;
         }
+        (&Method::POST, ["v1", "tasks", "end"]) => environments::end_task(&state, client, req).await,
         (&Method::POST, ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
         _ => Err(NOT_FOUND),
     };
@@ -297,6 +298,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .collect(),
         credential: None,
         cred_capabilities: Vec::new(),
+        egress: None,
     };
     let control_response::Result::Submit(done) = rpc(state, control_request::Op::Submit(submit)).await? else {
         return Err(UNAVAILABLE);

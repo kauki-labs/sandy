@@ -517,6 +517,26 @@ pub enum HandleDispatchError {
     OutputStaging(#[source] std::io::Error),
 }
 
+impl HandleDispatchError {
+    /// The `JobResult` message that reports this failure for `job_id` (#762). A deadline or the total cap passing
+    /// during the input pull is a timeout; every other failure is a plain one, and a cancel keeps its own stable text
+    /// (sandyd already knows it cancelled).
+    #[must_use]
+    pub fn result_message(&self, job_id: String) -> sandy_executor_proto::HostExecutorMessage {
+        let mut message = crate::run::failure_result_message(job_id, self.to_string());
+        if matches!(
+            self,
+            Self::DataLink(
+                crate::input_stage::StageError::DeadlinePassed | crate::input_stage::StageError::TotalCapExceeded
+            )
+        ) && let Some(sandy_executor_proto::host_executor_message::Op::Result(result)) = &mut message.op
+        {
+            result.timed_out = true;
+        }
+        message
+    }
+}
+
 /// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
 #[derive(Debug)]
 pub struct Dispatched {
@@ -775,9 +795,9 @@ pub fn handle_dispatch(
                 &decoded.flake,
                 decoded.kind.as_deref(),
                 decoded.attr.as_deref(),
-                // `--from-devshell` over M2: non-goal (#332) — not worth
-                // forcing in without it falling out for free.
-                false,
+                // `--from-devshell` rides the manifest (A3, #483); an executor that predates the field refuses the
+                // manifest.
+                decoded.from_devshell,
                 // The macOS vfkit-prereq check: dead code on this host's
                 // Linux build target (`cfg!(target_os = "macos")` is false
                 // there), so a callback that never fires is correct, not a
@@ -856,6 +876,46 @@ pub fn handle_dispatch(
 
 #[cfg(test)]
 mod tests {
+
+    /// The `JobResult` a failed dispatch reports, as the orchestrator will read it.
+    fn reported(error: &HandleDispatchError) -> anyhow::Result<sandy_executor_proto::JobResult> {
+        match error.result_message("job-1".to_owned()).op {
+            Some(sandy_executor_proto::host_executor_message::Op::Result(result)) => Ok(result),
+            other => anyhow::bail!("expected a JobResult, got {other:?}"),
+        }
+    }
+
+    /// A deadline that passes during the input pull is a timeout, not a plain failure (#762).
+    #[test]
+    fn a_deadline_during_the_input_pull_is_reported_as_timed_out() -> anyhow::Result<()> {
+        use crate::input_stage::StageError;
+        for stage in [StageError::DeadlinePassed, StageError::TotalCapExceeded] {
+            let result = reported(&HandleDispatchError::DataLink(stage))?;
+            assert!(result.timed_out, "the job timed out during its input pull");
+            assert!(!result.booted, "it never booted");
+            assert!(result.transport_error.is_some(), "the reason is kept");
+            assert!(!result.outputs_follow);
+        }
+        Ok(())
+    }
+
+    /// A cancel during the pull keeps a stable text and is not a timeout: sandyd already knows it cancelled, and a
+    /// transfer failure must read differently (#762).
+    #[test]
+    fn a_cancel_during_the_input_pull_is_a_stable_non_timeout_failure() -> anyhow::Result<()> {
+        use crate::input_stage::StageError;
+        let cancelled = reported(&HandleDispatchError::DataLink(StageError::Cancelled))?;
+        assert!(!cancelled.timed_out);
+        assert!(!cancelled.booted);
+        assert_eq!(
+            cancelled.transport_error.as_deref(),
+            Some("staging the inputs from the data link: the job was cancelled while its inputs were being pulled")
+        );
+        let failed = reported(&HandleDispatchError::DataLink(StageError::Dial("x".to_owned())))?;
+        assert!(!failed.timed_out);
+        assert_ne!(failed.transport_error, cancelled.transport_error);
+        Ok(())
+    }
     use anyhow::Context;
 
     use super::*;
@@ -973,6 +1033,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         };
         let spec = ServiceSpec {
@@ -1039,6 +1100,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service,
         }
     }
@@ -1348,6 +1410,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         // A plain reaper (no bus/mount isolation): the exact host state this
         // gate exists to refuse an untrusted job on.
@@ -1397,6 +1460,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1438,6 +1502,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: data_token,
+            egress: None,
         })
     }
 
@@ -1587,6 +1652,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1631,6 +1697,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1657,6 +1724,58 @@ mod tests {
         Ok(())
     }
 
+    /// A `flake/v1` manifest that asks for `--from-devshell` reaches `resolve_flake_template` with the flag set (A3,
+    /// #483): combined with a `kind` the resolver refuses it before any `nix` call, which a dropped flag would not.
+    #[tokio::test]
+    async fn a_from_devshell_manifest_reaches_the_resolver_with_the_flag() -> anyhow::Result<()> {
+        let manifest =
+            sandy_guest_template::manifest::encode_flake_manifest(&sandy_guest_template::manifest::FlakeManifestV1 {
+                flake: ".".to_owned(),
+                kind: Some("topology".to_owned()),
+                attr: None,
+                command: Vec::new(),
+                history_lines: 5_000,
+                env: Vec::new(),
+                cpu: None,
+                mem: None,
+                timeout_secs: None,
+                from_devshell: true,
+                service: None,
+            })?;
+        let dispatch = sandy_executor_proto::Dispatch {
+            job_id: "job-1".to_string(),
+            manifest,
+            manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_string(),
+            backend: sandy_executor_proto::SandboxKind::Vm.into(),
+            link_token: vec![0u8; REMOTE_LINK_TOKEN_LEN],
+            forward_back: "127.0.0.1:9000".to_string(),
+            required_isolation_class: IsolationClass::Trusted.into(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            secrets: Vec::new(),
+            data_link_token: Vec::new(),
+            egress: None,
+        };
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let rt = tokio::runtime::Handle::current();
+        let err = handle_dispatch(
+            &dispatch,
+            containment,
+            PathBuf::from("/nonexistent/sandy-agent"),
+            rt,
+            true,
+            sandy_api::backend::RunControl::with_timeout_secs(60),
+            test_mesh_tls_config(),
+        )
+        .expect_err("--from-devshell with --kind is refused by the resolver");
+        assert!(
+            err.to_string()
+                .contains("--from-devshell cannot be combined with --kind"),
+            "the flag must reach the resolver: {err}"
+        );
+        Ok(())
+    }
+
     /// Untrusted is VM-only (#150): an untrusted `Vm` dispatch on a VM-capable
     /// host passes the isolation gate and reaches the `Vm` branch. Host
     /// containment is reaping-only here, because the hypervisor is the boundary
@@ -1676,6 +1795,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1737,6 +1857,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1791,6 +1912,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
