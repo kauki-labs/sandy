@@ -90,14 +90,35 @@ pub fn send_staged_outputs(
     link: &mut (impl AsyncWrite + Unpin),
     staging: &OutputStaging,
     rt: &tokio::runtime::Handle,
-    _control: &RunControl,
-    _total: Duration,
+    control: &RunControl,
+    total: Duration,
 ) -> bool {
-    match rt.block_on(send_outputs(link, staging.sources(), SendLimits::default())) {
-        Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "sent the staged outputs"),
-        Err(e) => tracing::warn!(error = %e, "sending the staged outputs failed"),
+    let ended = rt.block_on(async {
+        tokio::select! {
+            biased;
+            sent = send_outputs(link, staging.sources(), SendLimits::default()) => Ok(sent),
+            () = cancelled(control) => Err("the job was cancelled"),
+            () = tokio::time::sleep(total) => Err("the total time cap passed"),
+        }
+    });
+    match ended {
+        Ok(Ok(sent)) => tracing::info!(files = sent.files, bytes = sent.bytes, "sent the staged outputs"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "sending the staged outputs failed"),
+        // The send future is dropped: the link closes with the frames it had, and the orchestrator ends the transfer.
+        Err(why) => tracing::warn!(why, "stopped sending the staged outputs"),
     }
     true
+}
+
+/// How often the send looks at the run control.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// Resolves when the job is cancelled. The job's deadline is not a reason to stop: it can pass while the run's
+/// outputs, collected after it, are still going back.
+async fn cancelled(control: &RunControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(CANCEL_POLL).await;
+    }
 }
 
 #[cfg(test)]

@@ -2087,6 +2087,10 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - `outputs_follow` is true whenever the transfer was started, including when the send failed: a failed send must never
   read as "nothing follows", or a job with missing outputs is recorded as a success. A run that fails (`backend.run`
   returns an error) sends nothing and reports a failure with the flag clear: it has no outputs to wait for.
+- The send is bounded: `OUTPUT_SEND_TOTAL_SECS` (30 minutes, as the input pull) however slowly the peer reads, and it
+  stops at once on a cancel. The job's deadline is not a reason to stop. The host handles dispatches one at a time, so
+  a peer that read a frame every few seconds would otherwise hold the loop for days. A send cut short still reports
+  `outputs_follow`, and the orchestrator ends the transfer on the closed link.
 - Nothing receives them yet: the sandyd side (receive, a per-job rendezvous that holds the job non-terminal) is 6c-2.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
