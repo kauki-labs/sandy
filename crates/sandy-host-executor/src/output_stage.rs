@@ -12,7 +12,7 @@ use std::{io, path::Path};
 use sandy_api::backend::Output;
 use tokio::io::AsyncWrite;
 
-use crate::output_send::OutputSource;
+use crate::output_send::{OutputSource, SendLimits, send_outputs};
 
 /// The staging root of one dispatch's outputs, and what the run and the sender need from it. Dropping it removes the
 /// root and everything the run collected into it.
@@ -28,8 +28,33 @@ impl OutputStaging {
     ///
     /// # Errors
     /// The root could not be created.
-    pub fn new(_parent: &Path, _declared: &[sandy_executor_proto::Output]) -> io::Result<Self> {
-        Err(io::Error::other("not implemented"))
+    pub fn new(parent: &Path, declared: &[sandy_executor_proto::Output]) -> io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Explicit: `tempfile` applies only the umask default (0755) unless a mode is given, and the staged outputs are
+        // the job's own files.
+        let root = tempfile::Builder::new()
+            .prefix("sandy-outputs-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)?;
+        let mut run_outputs = Vec::with_capacity(declared.len());
+        let mut sources = Vec::with_capacity(declared.len());
+        for (position, output) in declared.iter().enumerate() {
+            let dest = root.path().join(position.to_string());
+            run_outputs.push(Output {
+                name: output.name.clone(),
+                dest: dest.clone(),
+            });
+            sources.push(OutputSource {
+                name: output.name.clone(),
+                root: dest,
+            });
+        }
+        Ok(Self {
+            root,
+            run_outputs,
+            sources,
+        })
     }
 
     /// The outputs for `RunSpec`: each declared output's name, with its destination inside the root.
@@ -58,11 +83,15 @@ impl OutputStaging {
 /// could not be read): the orchestrator is told a transfer error on the link when it can be, and a failed send must
 /// never read as "nothing follows" (#482).
 pub fn send_staged_outputs(
-    _link: &mut (impl AsyncWrite + Unpin),
-    _staging: &OutputStaging,
-    _rt: &tokio::runtime::Handle,
+    link: &mut (impl AsyncWrite + Unpin),
+    staging: &OutputStaging,
+    rt: &tokio::runtime::Handle,
 ) -> bool {
-    false
+    match rt.block_on(send_outputs(link, staging.sources(), SendLimits::default())) {
+        Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "sent the staged outputs"),
+        Err(e) => tracing::warn!(error = %e, "sending the staged outputs failed"),
+    }
+    true
 }
 
 #[cfg(test)]

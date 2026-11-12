@@ -50,6 +50,7 @@ use serde::Deserialize;
 use crate::{
     input_pull::PullLimits,
     input_stage::{INPUT_PULL_TOTAL_SECS, StagedInputs, dial_data_link, stage_remote_inputs},
+    output_stage::{OutputStaging, send_staged_outputs},
 };
 
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
@@ -511,6 +512,51 @@ pub enum HandleDispatchError {
     /// a cancel or a deadline during the pull, never a guest failure.
     #[error("staging the inputs from the data link: {0}")]
     DataLink(#[from] crate::input_stage::StageError),
+    /// The staging root for the job's outputs could not be created (#482). The job never ran.
+    #[error("staging the outputs: {0}")]
+    OutputStaging(#[source] std::io::Error),
+}
+
+/// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
+#[derive(Debug)]
+pub struct Dispatched {
+    /// The physical outcome of the run.
+    pub outcome: Outcome,
+    /// True when the outputs were sent over the data link (even if the send failed), so the orchestrator must wait
+    /// for them before it records the job as finished (#482).
+    pub outputs_follow: bool,
+}
+
+/// Plan where a remote job's outputs are collected: `None` for a local dispatch (no data link) or a job with no
+/// outputs, otherwise a private staging root.
+fn stage_outputs(
+    declared: &[sandy_executor_proto::Output],
+    staged: Option<&StagedInputs>,
+) -> Result<Option<OutputStaging>, HandleDispatchError> {
+    if staged.is_none() || declared.is_empty() {
+        return Ok(None);
+    }
+    OutputStaging::new(&std::env::temp_dir(), declared)
+        .map(Some)
+        .map_err(HandleDispatchError::OutputStaging)
+}
+
+/// After the run: send the staged outputs over the retained data link and say whether they follow. The staging root
+/// and the link go away when this returns, on every path.
+fn dispatched(
+    outcome: Outcome,
+    staged: Option<StagedInputs>,
+    staging: Option<OutputStaging>,
+    rt: &tokio::runtime::Handle,
+) -> Dispatched {
+    let outputs_follow = match (staged, &staging) {
+        (Some(mut staged), Some(staging)) => send_staged_outputs(&mut staged.link, staging, rt),
+        _ => false,
+    };
+    Dispatched {
+        outcome,
+        outputs_follow,
+    }
 }
 
 /// Pull the dispatch's inputs over the data link, if it has one (#482, sandyd.md decision 22). `None` when the token
@@ -590,7 +636,7 @@ pub fn handle_dispatch(
     vm_available: bool,
     control: RunControl,
     mesh_tls: sandy_fabric_local::mesh_link::MeshTlsIdentity,
-) -> Result<Outcome, HandleDispatchError> {
+) -> Result<Dispatched, HandleDispatchError> {
     let status = containment.status();
     let required = IsolationClass::try_from(dispatch.required_isolation_class).unwrap_or(IsolationClass::Unspecified);
     // An unknown or unset backend is checked as `Process`, the weaker kind, so
@@ -673,6 +719,8 @@ pub fn handle_dispatch(
                 &control,
             )?;
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
+            let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
+            let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
             let backend = ProcessBackend::with_containment(containment).with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -683,7 +731,7 @@ pub fn handle_dispatch(
                 template: &dispatch.job_id,
                 command: &decoded.command,
                 inputs: run_inputs,
-                outputs: &path_outputs,
+                outputs: run_outputs,
                 secrets: &path_secrets,
                 env: &process_run_env(&decoded.env),
                 cpu: decoded.cpu,
@@ -697,7 +745,8 @@ pub fn handle_dispatch(
                 secret_dir: None,
                 control: &control,
             };
-            Ok(backend.run(&spec)?)
+            let outcome = backend.run(&spec)?;
+            Ok(dispatched(outcome, staged, staging, &data_link_rt))
         }
         // Defense in depth (#332, mirroring `check_isolation_class`'s own
         // re-probe discipline): `vm_available` is the caller's own fresh
@@ -764,6 +813,8 @@ pub fn handle_dispatch(
                 &control,
             )?;
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
+            let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
+            let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
             let backend = QemuBackend::new().with_agent(AgentLaunch {
                 program: agent_program,
                 on_link,
@@ -774,7 +825,7 @@ pub fn handle_dispatch(
                 template: &template,
                 command: &decoded.command,
                 inputs: run_inputs,
-                outputs: &path_outputs,
+                outputs: run_outputs,
                 secrets: &path_secrets,
                 env: &env,
                 cpu: decoded.cpu,
@@ -790,7 +841,7 @@ pub fn handle_dispatch(
             // — held in scope here, across the call, not dropped before it.
             let outcome = backend.run(&spec)?;
             drop(_kept_topology_file);
-            Ok(outcome)
+            Ok(dispatched(outcome, staged, staging, &data_link_rt))
         }
         _ => Err(HandleDispatchError::UnsupportedBackend(dispatch.backend)),
     }
@@ -1385,7 +1436,7 @@ mod tests {
 
     /// `handle_dispatch` blocks (it is called from `spawn_blocking` in production), so a test that reaches the data
     /// link's `block_on` must run it on a blocking thread too.
-    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Outcome, HandleDispatchError>> {
+    async fn run_blocking(dispatch: Dispatch) -> anyhow::Result<Result<Dispatched, HandleDispatchError>> {
         let rt = tokio::runtime::Handle::current();
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         tokio::task::spawn_blocking(move || {

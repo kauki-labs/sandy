@@ -53,13 +53,19 @@ pub enum StageError {
     TotalCapExceeded,
 }
 
+/// A data link as the host holds it after the pull: readable and writable, so the outputs can go back over it.
+pub trait DataLink: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> DataLink for T {}
+
 /// The staged inputs. Owns the root and the data link: the link stays open through the run, because a data link
 /// claims once and slice 6 sends the outputs back over it.
 pub struct StagedInputs {
     /// The `Input` list for the run: `host` points into the staging root; name and guest path are as declared.
     pub inputs: Vec<Input>,
     _root: tempfile::TempDir,
-    _link: Box<dyn Send>,
+    /// The data link, still open: the outputs go back over it after the run (6c).
+    pub link: Box<dyn DataLink>,
 }
 
 /// Dial the orchestrator's mesh listener and claim the job's data link with `data_token`.
@@ -156,7 +162,7 @@ where
     Ok(StagedInputs {
         inputs,
         _root: root,
-        _link: Box::new(link),
+        link: Box::new(link),
     })
 }
 

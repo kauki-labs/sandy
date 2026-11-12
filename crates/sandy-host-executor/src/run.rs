@@ -500,17 +500,7 @@ where
 /// physical-outcome/classification split the backend seam draws).
 #[must_use]
 pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorMessage {
-    HostExecutorMessage {
-        op: Some(host_executor_message::Op::Result(JobResult {
-            job_id,
-            booted: outcome.booted,
-            exit_code: outcome.guest_exit,
-            timed_out: outcome.timed_out,
-            transport_error: outcome.transport_error,
-            console: outcome.console,
-            outputs_follow: false,
-        })),
-    }
+    outcome_result_message_with_outputs(job_id, outcome, false)
 }
 
 /// [`outcome_result_message`] with `JobResult.outputs_follow` set: the host has sent (or tried to send) the job's
@@ -520,9 +510,19 @@ pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorM
 pub fn outcome_result_message_with_outputs(
     job_id: String,
     outcome: Outcome,
-    _outputs_follow: bool,
+    outputs_follow: bool,
 ) -> HostExecutorMessage {
-    outcome_result_message(job_id, outcome)
+    HostExecutorMessage {
+        op: Some(host_executor_message::Op::Result(JobResult {
+            job_id,
+            booted: outcome.booted,
+            exit_code: outcome.guest_exit,
+            timed_out: outcome.timed_out,
+            transport_error: outcome.transport_error,
+            console: outcome.console,
+            outputs_follow,
+        })),
+    }
 }
 
 /// Build the `HostExecutorMessage::Result` for a dispatch that never reached a

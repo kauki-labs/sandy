@@ -2076,6 +2076,19 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The sender is not called yet: 6c stages the outputs under a host-local root, calls it after the run, and sets
   `JobResult.outputs_follow`.
 
+### Slice 6c-1: the host stages the outputs, sends them after the run, and sets `outputs_follow`
+
+- A dispatch with a data link and declared outputs gets a private `sandy-outputs-*` root under the host's temp
+  directory, and the backend collects output `i` into `<root>/<i>` instead of the submitter's path (`output_stage`).
+  `<root>/<i>` is not created: a named output whose staged root is a file is written at that path by the backend.
+- After `backend.run` returns, the staged trees go back over the retained data link (`output_send`, tagged with the
+  position `i`), and the root and the link are dropped. `handle_dispatch` returns `Dispatched { outcome, outputs_follow }`
+  and `main.rs` puts the flag on the `JobResult`.
+- `outputs_follow` is true whenever the transfer was started, including when the send failed: a failed send must never
+  read as "nothing follows", or a job with missing outputs is recorded as a success. A run that fails (`backend.run`
+  returns an error) sends nothing and reports a failure with the flag clear: it has no outputs to wait for.
+- Nothing receives them yet: the sandyd side (receive, a per-job rendezvous that holds the job non-terminal) is 6c-2.
+
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
 **Status:** accepted. **Upholds:** INV-1.
