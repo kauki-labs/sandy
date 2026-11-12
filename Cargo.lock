@@ -2630,6 +2630,7 @@ name = "sandy-host-executor"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "rustix",
  "sandy-api",
  "sandy-conn",
  "sandy-control-proto",
