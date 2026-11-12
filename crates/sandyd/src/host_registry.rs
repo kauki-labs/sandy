@@ -609,6 +609,7 @@ mod tests {
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -620,6 +621,7 @@ mod tests {
             supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -627,6 +629,7 @@ mod tests {
         Capabilities {
             shares_submitter_filesystem: true,
             transfer: false,
+            egress_proxy: false,
             ..capabilities()
         }
     }
@@ -644,6 +647,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         }
     }
 

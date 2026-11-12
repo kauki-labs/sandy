@@ -297,6 +297,7 @@ mod tests {
                     secrets: Vec::new(),
                     credential: None,
                     cred_capabilities: Vec::new(),
+                    egress: None,
                 })),
             },
         )
@@ -369,6 +370,7 @@ mod tests {
                     secrets: Vec::new(),
                     credential: None,
                     cred_capabilities: Vec::new(),
+                    egress: None,
                 })),
             },
         )
