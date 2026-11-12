@@ -2741,6 +2741,7 @@ mod tests {
             "a//b",
             "a/",
             "a\0b",
+            "",
         ] {
             for (request, field) in [
                 (submit_with_names(Some(bad), None), "inputs"),
@@ -2754,6 +2755,49 @@ mod tests {
                 assert!(
                     error.message.contains("is not a plain relative path") && error.message.contains(field),
                     "name {bad:?} in {field}: got {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #807 (sandy-86 on #822): two declared names that are equal, or one nested inside the other, are refused at
+    /// Submit, in `inputs` and in `outputs`, so a broker or MCP Submit fails before it mints a credential or places.
+    #[tokio::test]
+    async fn a_submit_with_duplicate_or_nested_names_is_refused_naming_the_field() -> anyhow::Result<()> {
+        for names in [["a", "a"], ["a", "a/b"], ["a/b", "a"]] {
+            for field in ["inputs", "outputs"] {
+                let mut request = submit_req_with_input(1);
+                if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                    if field == "inputs" {
+                        submit.inputs = names
+                            .iter()
+                            .map(|name| sandy_control_proto::Input {
+                                host: "/src".to_owned(),
+                                name: (*name).to_owned(),
+                                guest_path: None,
+                            })
+                            .collect();
+                    } else {
+                        submit.inputs = Vec::new();
+                        submit.outputs = names
+                            .iter()
+                            .map(|name| sandy_control_proto::Output {
+                                name: Some((*name).to_owned()),
+                                dest: "/out".to_owned(),
+                            })
+                            .collect();
+                    }
+                }
+                let (store, registry) = (new_store(), new_registry());
+                let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+                let Some(control_response::Result::Error(error)) = response.result else {
+                    anyhow::bail!("{names:?} in {field}: expected a refusal, got {response:?}");
+                };
+                assert!(
+                    error.message.contains("clash") && error.message.contains(field),
+                    "{names:?} in {field}: got {:?}",
                     error.message
                 );
             }
