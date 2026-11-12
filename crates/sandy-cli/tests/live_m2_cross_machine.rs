@@ -418,6 +418,7 @@ async fn cross_machine_sandboxes_exchange_a_peer_message_through_the_hub() -> an
             control,
             test_mesh_tls(),
         )
+        .map(|dispatched| dispatched.outcome)
     })
     .await
     .context("the dispatch-handling task panicked")?

@@ -400,6 +400,7 @@ async fn real_attach_round_trips_proves_session_fork_and_survives_detach_reattac
             control,
             test_mesh_tls(),
         )
+        .map(|dispatched| dispatched.outcome)
     });
 
     // 4. Attach from the SAME (submitting) session: post-capable.
@@ -627,6 +628,7 @@ async fn the_real_cli_binary_attaches_delivers_output_and_exits_on_job_completio
                 control,
                 test_mesh_tls(),
             )
+            .map(|dispatched| dispatched.outcome)
         })
         .await
         .context("the dispatch-handling task panicked")?
@@ -826,6 +828,7 @@ async fn a_separate_attach_process_gets_post_rights_via_the_persisted_token() ->
                 control,
                 test_mesh_tls(),
             )
+            .map(|dispatched| dispatched.outcome)
         })
         .await
         .context("the dispatch-handling task panicked")?
