@@ -67,6 +67,7 @@ fn each_control_request_op_round_trips(#[case] op: control_request::Op) -> Resul
     status: i32::from(JobStatus::Running),
     exit_code: Some(0),
     console_tail: "hi\n".to_owned(),
+    result_envelope: None,
 }))]
 #[case(control_response::Result::List(ListResponse {
     jobs: vec![JobSummary {

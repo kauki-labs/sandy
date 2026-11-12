@@ -8,6 +8,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use sandy::OutputStatus;
 use sandy_conn::{Conn, PeerAddr};
 use sandy_control_proto::{FrameError, JobStatus, read_frame, write_frame};
 use sandy_executor_proto::{
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::{
     credential::Redaction,
     dispatch::JobRegistry,
+    envelope::RunFacts,
     host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
     store::{JobStore, Transition},
 };
@@ -510,6 +512,11 @@ async fn record_job_result(
 ) -> Option<AwaitedOutputs> {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
+    let facts = RunFacts {
+        booted: result.booted,
+        timed_out: result.timed_out,
+        transport_error: result.transport_error.clone(),
+    };
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
     // A result for a job this connection never ran is not recorded either: it
@@ -542,9 +549,29 @@ async fn record_job_result(
                 "{}\n[sandy: the job is not registered, so its outputs cannot be checked]",
                 result.console
             );
-            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                JobStatus::Failed,
+                exit_code,
+                console,
+                &facts,
+                OutputStatus::RequiredMissing,
+            )
+            .await;
         } else {
-            finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                status,
+                exit_code,
+                result.console,
+                &facts,
+                OutputStatus::Complete,
+            )
+            .await;
         }
         return None;
     };
@@ -566,6 +593,7 @@ async fn record_job_result(
                 status,
                 exit_code,
                 console,
+                facts,
             });
         }
         if status == JobStatus::Succeeded {
@@ -578,12 +606,32 @@ async fn record_job_result(
                 "{}\n[sandy: the host reported no outputs for a job that declares outputs]",
                 result.console
             );
-            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                JobStatus::Failed,
+                exit_code,
+                console,
+                &facts,
+                OutputStatus::RequiredMissing,
+            )
+            .await;
             return None;
         }
     }
     in_flight.remove(&job_id);
-    finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+    finish_job(
+        store,
+        job_registry,
+        &job_id,
+        status,
+        exit_code,
+        result.console,
+        &facts,
+        OutputStatus::Complete,
+    )
+    .await;
     None
 }
 
@@ -599,6 +647,10 @@ fn redact_console(credentials: Option<&crate::credential::JobCredentials>, job_i
 }
 
 /// Move `job_id` to its terminal `status`, off the connection task, and end its credential and its outputs slot.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the terminal record: the lifecycle status, its envelope facts and where it ran"
+)]
 async fn finish_job(
     store: &Arc<JobStore>,
     job_registry: &JobRegistry,
@@ -606,14 +658,25 @@ async fn finish_job(
     status: JobStatus,
     exit_code: Option<i32>,
     console: String,
+    facts: &RunFacts,
+    outputs: OutputStatus,
 ) {
     let store = Arc::clone(store);
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
+    let facts = facts.clone();
+    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
-        store.finish(&jid, status, exit_code, &console)
+        let console = crate::envelope::tail(&console, crate::envelope::MAX_CONSOLE_BYTES).to_owned();
+        // The envelope carries the same redacted console, and its message (the executor's own words) is redacted
+        // the same way, so neither holds the token.
+        let mut envelope =
+            crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        let message = redact_console(credentials.as_deref(), &jid, envelope.message);
+        envelope.message = crate::envelope::tail(&message, crate::envelope::MAX_MESSAGE_BYTES).to_owned();
+        store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;
     match transition {
@@ -652,6 +715,8 @@ pub(crate) struct AwaitedOutputs {
     status: JobStatus,
     exit_code: Option<i32>,
     console: String,
+    /// The run's own physical facts, for the envelope built once the outputs settle.
+    facts: RunFacts,
 }
 
 impl AwaitedOutputs {
@@ -673,7 +738,7 @@ impl AwaitedOutputs {
             Some(job) => job.outputs.wait(within).await,
             None => crate::output_slot::OutputsState::Failed("the job is no longer registered".to_owned()),
         };
-        let (status, console) = match state {
+        let (status, console, outputs) = match state {
             crate::output_slot::OutputsState::Received(received) => {
                 tracing::info!(
                     job_id = self.job_id,
@@ -681,7 +746,7 @@ impl AwaitedOutputs {
                     bytes = received.bytes,
                     "the job's outputs are in place"
                 );
-                (self.status, self.console)
+                (self.status, self.console, OutputStatus::Complete)
             }
             crate::output_slot::OutputsState::Failed(reason) => {
                 tracing::warn!(
@@ -695,12 +760,25 @@ impl AwaitedOutputs {
                         "{}\n[sandy: the job's outputs were not received: {reason}]",
                         self.console
                     ),
+                    OutputStatus::RequiredMissing,
                 )
             }
             // `wait` never returns a pending slot.
-            crate::output_slot::OutputsState::Pending => (JobStatus::Failed, self.console),
+            crate::output_slot::OutputsState::Pending => {
+                (JobStatus::Failed, self.console, OutputStatus::RequiredMissing)
+            }
         };
-        finish_job(store, job_registry, &self.job_id, status, self.exit_code, console).await;
+        finish_job(
+            store,
+            job_registry,
+            &self.job_id,
+            status,
+            self.exit_code,
+            console,
+            &self.facts,
+            outputs,
+        )
+        .await;
         self.job_id
     }
 }
@@ -712,13 +790,11 @@ impl AwaitedOutputs {
 async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) {
     let store = Arc::clone(store);
     let jid = job_id.to_owned();
+    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
     let transition = tokio::task::spawn_blocking(move || {
-        store.finish(
-            &jid,
-            JobStatus::Failed,
-            None,
-            "host-executor disconnected before reporting a result",
-        )
+        let reason = "host-executor disconnected before reporting a result";
+        let envelope = crate::envelope::infra_fault(&jid, reason, host_id.as_deref());
+        store.finish_with(&jid, JobStatus::Failed, None, reason, Some(&envelope))
     })
     .await;
     match transition {
@@ -1935,6 +2011,237 @@ mod tests {
             .publish(crate::output_slot::OutputsState::Failed("the link closed".to_owned()));
         awaited.settle(&store, &job_registry, SOON).await;
         assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        Ok(())
+    }
+
+    /// A job registered and running, owing nothing: its result goes straight to the terminal record.
+    async fn running_job(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) -> anyhow::Result<()> {
+        store.insert_pending(job_id, b"m", "test/v1")?;
+        store.mark_running(job_id)?;
+        let job = crate::dispatch::mint_job_channel(job_id, job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert(job_id.to_owned(), job);
+        Ok(())
+    }
+
+    /// A2 (#483): a terminal job carries the same locked result envelope a direct run prints (INV-11): the status and
+    /// retryable flag `classify_outcome` gives the same physical facts, one row per `JobResult` shape. `JobStatus`
+    /// stays the two-valued lifecycle band it is today.
+    #[tokio::test]
+    async fn a_terminal_job_records_the_envelope_the_direct_classifier_gives() -> anyhow::Result<()> {
+        use sandy::Status;
+        // (name, booted, exit_code, timed_out, transport_error, JobStatus, envelope status, retryable)
+        type Row<'a> = (
+            &'a str,
+            bool,
+            Option<i32>,
+            bool,
+            Option<&'a str>,
+            JobStatus,
+            Status,
+            bool,
+        );
+        let rows: [Row<'_>; 5] = [
+            (
+                "exit 0",
+                true,
+                Some(0),
+                false,
+                None,
+                JobStatus::Succeeded,
+                Status::Succeeded,
+                false,
+            ),
+            (
+                "guest failure",
+                true,
+                Some(3),
+                false,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                false,
+            ),
+            (
+                "timeout",
+                true,
+                None,
+                true,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                false,
+            ),
+            (
+                "transport error",
+                true,
+                Some(0),
+                false,
+                Some("link lost"),
+                JobStatus::Failed,
+                Status::Failed,
+                true,
+            ),
+            (
+                "never booted",
+                false,
+                None,
+                false,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                true,
+            ),
+        ];
+        for (name, booted, exit_code, timed_out, transport_error, job_status, status, retryable) in rows {
+            let (store, job_registry) = (test_store(), test_job_registry());
+            running_job(&store, &job_registry, "job-1").await?;
+            let result = JobResult {
+                job_id: "job-1".to_owned(),
+                booted,
+                exit_code,
+                timed_out,
+                transport_error: transport_error.map(str::to_owned),
+                console: "hi\n".to_owned(),
+                outputs_follow: false,
+            };
+            record_job_result(
+                &store,
+                &job_registry,
+                &mut HashSet::from(["job-1".to_owned()]),
+                &mut HashSet::new(),
+                result,
+            )
+            .await;
+            assert_eq!(store.status("job-1")?, Some(job_status), "{name}: lifecycle status");
+            let envelope = store
+                .envelope("job-1")?
+                .with_context(|| format!("{name}: a terminal job must carry an envelope"))?;
+            assert_eq!(envelope.status, status, "{name}: envelope status");
+            assert_eq!(envelope.retryable, retryable, "{name}: retryable");
+            assert_eq!(envelope.job_id, "job-1", "{name}");
+            assert_eq!(envelope.result_schema_version, sandy::RESULT_SCHEMA_VERSION, "{name}");
+            assert_eq!(envelope.logs.tail, "hi\n", "{name}: the console is the log tail");
+        }
+        Ok(())
+    }
+
+    /// A2 (#483): the envelope's audit receipt is honest about what the daemon knows. `who` is the local-uid fallback
+    /// (`authenticated: false`, #413), and the egress boundary is `Unenforced` with a reason, never "applied", while no
+    /// executor reports an outcome (A2b).
+    #[tokio::test]
+    async fn the_envelope_receipt_does_not_claim_what_the_daemon_did_not_observe() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            result_for("job-1", 0, false),
+        )
+        .await;
+        let envelope = store.envelope("job-1")?.context("a terminal job carries an envelope")?;
+        let receipt = envelope.receipt.context("the envelope carries the audit receipt")?;
+        assert!(!receipt.host_observed.who.authenticated, "no verified caps yet (#413)");
+        assert_eq!(
+            receipt.host_observed.egress.status,
+            sandy::EgressEnforcement::Unenforced
+        );
+        assert!(
+            receipt
+                .host_observed
+                .egress
+                .reason
+                .is_some_and(|reason| reason.contains("not report")),
+            "the reason says the executor reported nothing"
+        );
+        assert_eq!(receipt.guest_reported.exit_code, Some(0));
+        Ok(())
+    }
+
+    /// A2 (#483): the envelope is final only once the outputs are settled: a receive that fails turns an exit-0 run
+    /// into a failed envelope, and one that succeeds keeps it succeeded.
+    #[tokio::test]
+    async fn the_envelope_of_a_job_owing_outputs_follows_the_receive() -> anyhow::Result<()> {
+        use sandy::Status;
+        for (received, want) in [(true, Status::Succeeded), (false, Status::Failed)] {
+            let (store, job_registry) = (test_store(), test_job_registry());
+            job_owing_outputs(&store, &job_registry, "job-1").await?;
+            let awaited = record_job_result(
+                &store,
+                &job_registry,
+                &mut HashSet::from(["job-1".to_owned()]),
+                &mut HashSet::new(),
+                result_for("job-1", 0, true),
+            )
+            .await
+            .context("owed")?;
+            assert!(
+                store.envelope("job-1")?.is_none(),
+                "no envelope before the outputs settle"
+            );
+            let job = job_registry.get("job-1").context("registered")?;
+            job.outputs.publish(if received {
+                crate::output_slot::OutputsState::Received(crate::data_link_recv::Received { files: 1, bytes: 3 })
+            } else {
+                crate::output_slot::OutputsState::Failed("the link closed".to_owned())
+            });
+            awaited.settle(&store, &job_registry, SOON).await;
+            let envelope = store.envelope("job-1")?.context("settled: an envelope")?;
+            assert_eq!(envelope.status, want, "received={received}");
+        }
+        Ok(())
+    }
+
+    /// A2 (#483, sandy-5e F3 on #828): `Status` carries the console twice, as `console_tail` and inside the envelope's
+    /// log tail, and the executor's own frame can be near the 1 MiB limit. The daemon bounds both to a tail, so even a
+    /// console of control characters (six bytes each as JSON) leaves a `Status` reply that fits one frame.
+    #[tokio::test]
+    async fn a_huge_console_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        let console = "\u{1}".repeat(900 * 1024);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                console,
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let detail = store.detail("job-1")?.context("job detail")?;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        let reply = sandy_control_proto::StatusResponse {
+            job_id: "job-1".to_owned(),
+            status: i32::from(detail.status),
+            exit_code: detail.exit_code,
+            console_tail: detail.console,
+            result_envelope: Some(envelope.into_bytes()),
+        };
+        assert!(
+            sandy_executor_proto::Message::encoded_len(&reply) < sandy_control_proto::MAX_FRAME_LEN as usize,
+            "the Status reply must fit one frame"
+        );
+        Ok(())
+    }
+
+    /// A2 (#483): a job that is not terminal has no envelope, and one whose host disconnected gets a failed,
+    /// retryable one, so every terminal path leaves exactly what a direct run would.
+    #[tokio::test]
+    async fn only_a_terminal_job_has_an_envelope_and_a_disconnect_fails_it_retryably() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        running_job(&store, &job_registry, "job-1").await?;
+        assert!(store.envelope("job-1")?.is_none(), "a running job has no envelope");
+        assert!(store.envelope("ghost")?.is_none(), "an unknown job has none");
+        fail_disconnected_job(&store, &job_registry, "job-1").await;
+        let envelope = store.envelope("job-1")?.context("a failed job carries an envelope")?;
+        assert_eq!(envelope.status, sandy::Status::Failed);
+        assert!(envelope.retryable, "an infra fault is retryable");
         Ok(())
     }
 

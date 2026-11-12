@@ -38,6 +38,15 @@ pub enum StoreError {
         /// The unrecognised stored value.
         raw: String,
     },
+    /// A stored result envelope does not decode: a row this store wrote should never hold one. Fails the one read
+    /// that touches it, never silently reports no envelope.
+    #[error("job store: job {job_id:?} has an unreadable stored result envelope: {reason}")]
+    CorruptEnvelope {
+        /// The job whose row is corrupt.
+        job_id: String,
+        /// Why it does not decode.
+        reason: String,
+    },
     /// Could not chmod the store file (CF-M-7).
     #[error("job store: {0}")]
     Io(#[from] std::io::Error),
@@ -56,7 +65,7 @@ pub enum CancelOutcome {
     AlreadyTerminal(JobStatus),
 }
 
-/// What a lifecycle transition ([`JobStore::mark_running`]/[`JobStore::finish`])
+/// What a lifecycle transition ([`JobStore::mark_running`]/`JobStore::finish_with`)
 /// did to a job row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
@@ -238,6 +247,10 @@ impl JobStore {
         // backfilled or guessed at for a job submitted before this column
         // existed.
         ensure_column(&conn, "archive", "ALTER TABLE jobs ADD COLUMN archive BLOB")?;
+        // The terminal result envelope (A2 of #483), as the envelope's own JSON: written in the same statement as the
+        // terminal status, so a terminal row never lacks one unless it was recorded before this column existed
+        // (NULL, read as no envelope, never fabricated).
+        ensure_column(&conn, "envelope", "ALTER TABLE jobs ADD COLUMN envelope TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -330,7 +343,7 @@ impl JobStore {
     }
 
     /// Persist `job_id`'s archived transcript (#340 item 4), overwriting
-    /// whatever was there before. Not status-gated like [`JobStore::finish`]:
+    /// whatever was there before. Not status-gated like `JobStore::finish_with`:
     /// the agent's one-shot archive post can arrive before OR after the
     /// terminal status update reaches this store (they travel over
     /// independent paths — the channel vs. `host_conn`'s own result
@@ -390,9 +403,11 @@ impl JobStore {
         if !matches!(status, JobStatus::Pending | JobStatus::Running) {
             return Ok(CancelOutcome::AlreadyTerminal(status));
         }
+        // The cancelled envelope goes in the same statement, so a cancelled row never lacks one (A2 of #483).
+        let envelope = serde_json::to_string(&crate::envelope::cancelled(job_id)).ok();
         conn.execute(
-            "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE job_id = ?3",
-            (status_name(JobStatus::Cancelled), now_unix(), job_id),
+            "UPDATE jobs SET status = ?1, envelope = ?2, updated_at = ?3 WHERE job_id = ?4",
+            (status_name(JobStatus::Cancelled), envelope, now_unix(), job_id),
         )?;
         Ok(CancelOutcome::Cancelled)
     }
@@ -421,7 +436,8 @@ impl JobStore {
         Ok(Transition::Applied)
     }
 
-    /// Record a terminal result for `job_id`: its final `status`, the guest
+    /// Record a terminal result for `job_id` with no result envelope (the daemon's own terminal paths use
+    /// `finish_with` and record one): its final `status`, the guest
     /// `exit_code` (if any), and a bounded `console` tail (#292). Applies only
     /// from `Pending` or `Running`; refused from any terminal state, so a
     /// result arriving after a cancel (decision 12: a cancel cannot retract an
@@ -439,6 +455,29 @@ impl JobStore {
         exit_code: Option<i32>,
         console: &str,
     ) -> Result<Transition, StoreError> {
+        self.finish_with(job_id, status, exit_code, console, None)
+    }
+
+    /// `finish` that also stores the terminal result `envelope` (A2 of #483) in the same statement, so the
+    /// status and its envelope never disagree after a crash.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read or write fails.
+    pub fn finish_with(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        exit_code: Option<i32>,
+        console: &str,
+        envelope: Option<&sandy::ResultEnvelope>,
+    ) -> Result<Transition, StoreError> {
+        // An envelope that does not serialize must not strand the job `Running`: record the terminal status without it
+        // and say so, rather than refuse the transition.
+        let envelope_json = envelope.and_then(|envelope| {
+            serde_json::to_string(envelope)
+                .inspect_err(|e| tracing::warn!(job_id, error = %e, "could not serialize the job's result envelope"))
+                .ok()
+        });
         let conn = self.lock();
         let Some(current) = query_status(&conn, job_id)? else {
             return Ok(Transition::NotFound);
@@ -447,8 +486,16 @@ impl JobStore {
             return Ok(Transition::Refused(current));
         }
         conn.execute(
-            "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, updated_at = ?4 WHERE job_id = ?5",
-            (status_name(status), exit_code, console, now_unix(), job_id),
+            "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, envelope = ?4, updated_at = ?5 WHERE job_id = \
+             ?6",
+            (
+                status_name(status),
+                exit_code,
+                console,
+                envelope_json,
+                now_unix(),
+                job_id,
+            ),
         )?;
         Ok(Transition::Applied)
     }
@@ -477,6 +524,37 @@ impl JobStore {
                 exit_code,
                 console,
             })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The terminal result envelope the daemon recorded for `job_id` (A2 of #483), or `None` while the job is not
+    /// terminal, when no such job exists, or for a job recorded before envelopes were stored.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn envelope(&self, job_id: &str) -> Result<Option<sandy::ResultEnvelope>, StoreError> {
+        self.envelope_json(job_id)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| StoreError::CorruptEnvelope {
+                    job_id: job_id.to_owned(),
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    /// The stored envelope's JSON as written, for a reply that forwards it without decoding and re-encoding it.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn envelope_json(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock();
+        match conn.query_row("SELECT envelope FROM jobs WHERE job_id = ?1", [job_id], |row| {
+            row.get::<_, Option<String>>(0)
+        }) {
+            Ok(json) => Ok(json),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -735,6 +813,29 @@ mod tests {
                 console: "hi\n".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    /// A2 (#483, sandy-5e on #828): a cancelled job records the cancelled envelope in the cancel's own statement, from
+    /// `Pending` and from `Running`, so no terminal row lacks one. The direct `kill` writes the same shape.
+    #[test]
+    fn a_cancelled_job_records_a_cancelled_envelope() -> anyhow::Result<()> {
+        use anyhow::Context;
+        for running in [false, true] {
+            let store = JobStore::open_in_memory()?;
+            store.insert_pending("job-1", b"m", "test/v1")?;
+            if running {
+                store.mark_running("job-1")?;
+            }
+            assert_eq!(store.cancel("job-1")?, CancelOutcome::Cancelled);
+            let envelope = store
+                .envelope("job-1")?
+                .with_context(|| format!("running={running}: a cancelled job must carry an envelope"))?;
+            assert_eq!(envelope.status, sandy::Status::Cancelled, "running={running}");
+            assert!(!envelope.retryable, "a cancel is not retried by the platform");
+            assert_eq!(envelope.job_id, "job-1");
+            assert_eq!(envelope.exit_code, None);
+        }
         Ok(())
     }
 

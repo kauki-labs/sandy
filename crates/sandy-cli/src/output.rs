@@ -1267,6 +1267,7 @@ mod tests {
             status: JobStatus::Running as i32,
             exit_code: None,
             console_tail: String::new(),
+            result_envelope: None,
         };
         let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
         assert!(
@@ -1293,6 +1294,7 @@ mod tests {
             status: JobStatus::Succeeded as i32,
             exit_code: Some(0),
             console_tail: "hi\n".to_string(),
+            result_envelope: None,
         };
 
         let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
@@ -1317,6 +1319,7 @@ mod tests {
             status: 99,
             exit_code: None,
             console_tail: String::new(),
+            result_envelope: None,
         };
         let plain = format_status(&response, OutputFormat::Plain).context("format status plain")?;
         assert!(plain.contains("JOB_STATUS_UNSPECIFIED"), "got: {plain}");
