@@ -172,6 +172,19 @@ pub async fn send_inputs(
     Ok(sent)
 }
 
+/// The receiver's own name rule (`DataLinkMessage::validate`), applied to a name before any chunk carries it.
+fn validate_wire_name(name: &str) -> Result<(), SendError> {
+    DataLinkMessage {
+        op: Some(Op::InputChunk(InputChunk {
+            name: name.to_owned(),
+            offset: 0,
+            bytes: Vec::new(),
+        })),
+    }
+    .validate()
+    .map_err(SendError::InvalidName)
+}
+
 async fn write(link: &mut (impl AsyncWrite + Unpin), message: &DataLinkMessage) -> Result<(), SendError> {
     match tokio::time::timeout(WRITE_TIMEOUT, write_frame(link, message)).await {
         Ok(written) => Ok(written?),
@@ -209,6 +222,20 @@ fn read_inputs(
         }
         if !declared.insert(name.as_str()) {
             return Err(SendError::DuplicateName);
+        }
+        // The receiver's own rule, on every declared name before the first chunk goes out.
+        validate_wire_name(name)?;
+    }
+    // A name inside another declared name (`a` and `a/b`) is a file and a directory at once: the receiver ends with
+    // `Clash` after bytes moved.
+    for (name, _) in inputs {
+        let mut at = 0;
+        while let Some(i) = name[at..].find('/') {
+            at += i;
+            if declared.contains(&name[..at]) {
+                return Err(SendError::DuplicateName);
+            }
+            at += 1;
         }
     }
     for (name, path) in inputs {
@@ -252,16 +279,8 @@ impl Walk<'_> {
     /// Send one file as chunks in order from offset 0. A zero-byte file is one empty chunk, and no empty chunk
     /// follows data.
     fn file(&mut self, wire: &str, mut file: std::fs::File) -> Result<(), SendError> {
-        // The receiver's own check, on the name before any chunk carries it.
-        DataLinkMessage {
-            op: Some(Op::InputChunk(InputChunk {
-                name: wire.to_owned(),
-                offset: 0,
-                bytes: Vec::new(),
-            })),
-        }
-        .validate()
-        .map_err(SendError::InvalidName)?;
+        // Nested names are known only here; declared ones were checked up front.
+        validate_wire_name(wire)?;
         for (i, _) in wire.match_indices('/') {
             if self.dirs.insert(wire[..i].to_owned()) {
                 self.count_entry()?;
