@@ -133,8 +133,9 @@ impl SendError {
 /// slow peer holds a few MiB, not a file.
 const QUEUE_DEPTH: usize = 4;
 
-/// Send `inputs` to `link`, then `InputEnd`. On a failure other than a dead link, the peer gets a `TransferError`
-/// first.
+/// Send `inputs` to `link`, then `InputEnd`. When the reader fails (a source it cannot read, a refused name, a cap),
+/// the peer gets a `TransferError` first. A dead link, a write timeout and a read timeout ([`SendError::ReadTimedOut`])
+/// end the send with no `TransferError`: the link is dropped and the peer sees it close.
 ///
 /// # Errors
 /// See [`SendError`].
