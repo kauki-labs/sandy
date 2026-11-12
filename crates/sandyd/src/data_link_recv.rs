@@ -29,7 +29,7 @@ use sandy_executor_proto::{
     DataLinkMessage, DataLinkViolation, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, OutputChunk, TransferError,
     data_link_message::Op,
 };
-use sandy_fsutil::beneath::Beneath;
+use sandy_fsutil::beneath::{Beneath, EntryKind};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
 /// The default longest gap between frames.
@@ -271,6 +271,8 @@ struct Receive<'a> {
     temp_seq: u64,
     /// The identity of each file this receive completed, so a rename onto one of them is caught (#787).
     completed_ids: std::sync::Arc<std::sync::Mutex<HashSet<sandy_fsutil::FileId>>>,
+    /// The directories whose stale temp files this receive has already swept (#782).
+    swept: HashSet<EntryKey>,
 }
 
 /// The file being received: written under a temp name in its final directory, renamed into place on completion,
@@ -378,13 +380,66 @@ fn commit(current: &InFlight, completed: &std::sync::Mutex<HashSet<sandy_fsutil:
     Ok(())
 }
 
+/// The most directory entries one sweep looks at: a destination with a huge directory must not stall a receive.
+const MAX_SWEEP_ENTRIES: usize = 10_000;
+
+/// Remove the `.sandy-recv-<pid>-<n>` regular files in `dir` that a process that is gone left behind (a crash or a kill
+/// skips the cleanup). This process's own temp files are never touched: another job's receive in this daemon may be
+/// writing one in the same directory. A live process's are left, a pid reused by a live process keeps its leftover, and
+/// a directory, a symlink or a name that is not a temp name is not a candidate. Best effort: nothing here fails a
+/// receive.
+fn sweep_stale_temps(dir: &Beneath) {
+    let Ok(entries) = dir.entries() else {
+        return;
+    };
+    let own = std::process::id();
+    let stale: Vec<OsString> = entries
+        .take(MAX_SWEEP_ENTRIES)
+        .filter_map(Result::ok)
+        .filter(|(_, kind)| *kind == EntryKind::File)
+        .filter_map(|(name, _)| {
+            let pid = name.to_str().and_then(temp_name_pid)?;
+            (pid != own && !process_is_alive(pid)).then_some(name)
+        })
+        .collect();
+    for name in stale {
+        let _ = dir.remove_file(&name);
+    }
+}
+
+/// The pid in a `.sandy-recv-<pid>-<n>` name, or `None` for any other name.
+fn temp_name_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(".sandy-recv-")?;
+    let (pid, counter) = rest.split_once('-')?;
+    counter.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether a process with this pid exists. A pid that cannot be signalled for lack of permission still exists.
+fn process_is_alive(pid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process};
+
+    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return true;
+    };
+    !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH))
+}
+
 /// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
 /// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
 /// including when the receive that asked for it is gone by the time this ends.
-fn open_temp(root: &Path, parts: &[String], mut seq: u64) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
+fn open_temp(
+    root: &Path,
+    parts: &[String],
+    mut seq: u64,
+    sweep: bool,
+) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
     let mut dir = Beneath::create_dir_at(root)?;
     for part in parts {
         dir = dir.create_dir(OsStr::new(part))?;
+    }
+    if sweep {
+        sweep_stale_temps(&dir);
     }
     // `seq` runs across the whole receive so names stay unique; the retry bound is per call.
     for _ in 0..MAX_TEMP_NAME_TRIES {
@@ -414,6 +469,7 @@ impl<'a> Receive<'a> {
             current: None,
             temp_seq: 0,
             completed_ids: std::sync::Arc::default(),
+            swept: HashSet::new(),
         }
     }
 
@@ -489,7 +545,9 @@ impl<'a> Receive<'a> {
         }
         self.count_entry()?;
         let seq = self.temp_seq;
-        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq))
+        // `prefix` is now the file's directory below its root: the first file there sweeps it.
+        let sweep = self.swept.insert(entry_key(key.0, &prefix));
+        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq, sweep))
             .await
             .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
         self.temp_seq = seq;
@@ -1048,7 +1106,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 1000).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(dest.path(), &[], 1000, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1006, "the first free name after the stale ones");
         drop(cleanup);
         Ok(())
@@ -1062,7 +1120,7 @@ mod tests {
         for n in 1..=1000 {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
-        let Err(error) = open_temp(dest.path(), &[], 0) else {
+        let Err(error) = open_temp(dest.path(), &[], 0, false) else {
             anyhow::bail!("every name the search may try is taken, it must fail");
         };
         assert!(
@@ -1081,7 +1139,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 0).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(dest.path(), &[], 0, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1000);
         drop(cleanup);
         Ok(())
