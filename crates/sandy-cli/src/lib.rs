@@ -26,4 +26,5 @@ pub mod output;
 pub mod plan;
 pub mod profiles;
 pub mod signals;
+pub mod submit;
 pub mod supervisor;

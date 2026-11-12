@@ -64,6 +64,11 @@ pub struct FlakeManifestV1 {
     /// passes, instead of ending when the command exits. `None` is an ordinary job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<ServiceSpec>,
+    /// `--from-devshell` (#326): synthesize the guest from `devShells.<system>.<attr>`. Not serialized when false, so
+    /// a manifest without it stays byte-identical; an executor that does not know the field refuses the manifest
+    /// naming it (`deny_unknown_fields`), never drops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_devshell: bool,
 }
 
 /// How a service runs and when it counts as Ready (#589).
@@ -262,6 +267,7 @@ mod tests {
             cpu: Some(4),
             mem: Some(2_048),
             timeout_secs: Some(120),
+            from_devshell: false,
             service: Some(example_service()),
         };
         let bytes = encode_flake_manifest(&manifest)?;
@@ -297,6 +303,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service: Some(service),
         })
     }
@@ -454,6 +461,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service: None,
         };
         let json = String::from_utf8(encode_flake_manifest(&manifest)?).expect("JSON is UTF-8");
@@ -532,6 +540,7 @@ mod tests {
             cpu: None,
             mem: None,
             timeout_secs: None,
+            from_devshell: false,
             service: None,
         };
         let bytes = encode_flake_manifest(&manifest)?;

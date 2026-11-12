@@ -207,8 +207,8 @@ impl From<IsolationClassArg> for sandy_control_proto::IsolationClass {
 enum DaemonOp {
     /// Submit a job manifest to `sandyd`, printing the assigned job id.
     Submit {
-        /// Path to the manifest file, or `-` for stdin. Mutually exclusive
-        /// with `--flake`.
+        /// Path to the manifest file or `-` for stdin (with `--manifest-encoding`), or a TEMPLATE: a flake reference
+        /// booted as `--flake REF --kind topology` (without it). Mutually exclusive with `--flake`.
         #[arg(required_unless_present = "flake", conflicts_with = "flake")]
         manifest: Option<String>,
         /// This job's required isolation class (#381). Required — `sandyd`
@@ -216,10 +216,10 @@ enum DaemonOp {
         #[arg(long, value_enum)]
         isolation_class: IsolationClassArg,
         /// Names the encoding of `manifest`'s bytes (e.g. a future
-        /// `sandy.orchestrator.v1.JobManifest`). Required with `manifest` —
-        /// never a silent default interpretation of unknown bytes — and
-        /// refused with `--flake`, which encodes its own `flake/v1` tag.
-        #[arg(long, required_unless_present = "flake", conflicts_with = "flake")]
+        /// `sandy.orchestrator.v1.JobManifest`). It marks the positional as a manifest file, never a
+        /// silent default interpretation of unknown bytes; without it the positional is a TEMPLATE. Refused with
+        /// `--flake`, which encodes its own `flake/v1` tag.
+        #[arg(long, conflicts_with = "flake")]
         manifest_encoding: Option<String>,
         /// Dispatch an arbitrary flake with no sandy awareness at all as a
         /// VM job (#332), mirroring `sandy run --flake`'s own shape: encodes
@@ -236,32 +236,36 @@ enum DaemonOp {
         /// `topology` | `nixos-module` | `nixos-configuration`.
         #[arg(long, requires = "flake")]
         kind: Option<String>,
+        /// Best-effort (#326): synthesize the guest from `devShells.<system>.default` (or `--attr`), as `sandy run
+        /// --flake REF --from-devshell`. Always opt-in; needs `--flake`.
+        #[arg(long, requires = "flake", conflicts_with_all = ["kind", "manifest"])]
+        from_devshell: bool,
         /// The scrollback/transcript line bound for the job's interactive
         /// session (epic #340): both the live reattach history and the
         /// archived transcript delivered back once the job ends are capped
         /// to this many lines.
-        #[arg(long, requires = "flake", default_value_t = sandy_guest_template::manifest::default_history_lines())]
-        history_lines: u32,
-        /// `--env KEY=VALUE` for the job (repeatable, only meaningful with
-        /// `--flake`; manifest-parity #480).
-        #[arg(long = "env", requires = "flake")]
+        #[arg(long)]
+        history_lines: Option<u32>,
+        /// `--env KEY=VALUE` for the job (repeatable, only with a TEMPLATE
+        /// or `--flake`; manifest-parity #480).
+        #[arg(long = "env")]
         env: Vec<String>,
-        /// Optional vCPU count (only meaningful with `--flake`;
+        /// Optional vCPU count (only with a TEMPLATE or `--flake`;
         /// manifest-parity #480).
-        #[arg(long, requires = "flake")]
+        #[arg(long)]
         cpu: Option<u32>,
-        /// Optional memory budget in MiB (only meaningful with `--flake`;
+        /// Optional memory budget in MiB (only with a TEMPLATE or `--flake`;
         /// manifest-parity #480).
-        #[arg(long, requires = "flake")]
+        #[arg(long)]
         mem: Option<u32>,
         /// Optional wall-clock timeout in seconds, clamped to the executing
-        /// host's own ceiling (only meaningful with `--flake`;
+        /// host's own ceiling (only with a TEMPLATE or `--flake`;
         /// manifest-parity #480).
-        #[arg(long, requires = "flake")]
+        #[arg(long)]
         timeout: Option<u32>,
-        /// The trailing `-- CMD ARGS...` guest command (only meaningful with
-        /// `--flake`; empty means "boot the template's default command").
-        #[arg(last = true, requires = "flake")]
+        /// The trailing `-- CMD ARGS...` guest command (only with a TEMPLATE
+        /// or `--flake`; empty means "boot the template's default command").
+        #[arg(last = true)]
         command: Vec<String>,
         /// Path to a file holding a capability this submitter already holds
         /// (decision C-at-Submit, #226), as base64 text — the exact encoding
@@ -864,28 +868,85 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Vec::new()
     };
 
-    // CodeRabbit on this PR, same bar as `--cap-file` above: a malformed
-    // `--env` value is a pure client-side input error and must be refused
-    // the same way regardless of whether sandyd is reachable, not get a
-    // different exit band (`InfraFault` vs `InvalidPlan`) depending on
-    // daemon state.
-    let flake_env = if let DaemonOp::Submit {
-        env, flake: Some(_), ..
+    // A TEMPLATE or `--flake` becomes a `flake/v1` manifest here, before any connection (CodeRabbit on this PR, same
+    // bar as `--cap-file` above): a malformed `--env` value, a positional that is a forgotten manifest, or a plain flag
+    // given with a manifest file is a pure client-side input error and must be refused the same way whether or not
+    // sandyd is reachable, not get a different exit band (`InfraFault` vs `InvalidPlan`) depending on daemon state.
+    let flake_submit = if let DaemonOp::Submit {
+        manifest,
+        manifest_encoding,
+        flake,
+        attr,
+        kind,
+        from_devshell,
+        history_lines,
+        env,
+        cpu,
+        mem,
+        timeout,
+        command,
+        ..
     } = &op
     {
-        match env
-            .iter()
-            .map(|raw| sandy_cli::plan::parse_env(raw))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(env) => env,
-            Err(e) => {
+        let template = match (flake, manifest) {
+            (None, Some(positional)) => {
+                match sandy_cli::submit::classify_positional(positional, manifest_encoding.as_deref(), |p| {
+                    std::path::Path::new(p).is_file()
+                }) {
+                    Ok(sandy_cli::submit::Positional::Template(t)) => Some(t.to_owned()),
+                    Ok(sandy_cli::submit::Positional::Manifest(_)) => None,
+                    Err(e) => {
+                        eprintln!("sandy: {e}");
+                        return ProcessExit::InvalidPlan.code();
+                    }
+                }
+            }
+            _ => None,
+        };
+        let plain = sandy_cli::submit::PlainFlags {
+            history_lines: history_lines.unwrap_or_else(sandy_guest_template::manifest::default_history_lines),
+            env: env.clone(),
+            cpu: *cpu,
+            mem: *mem,
+            timeout: *timeout,
+            command: command.clone(),
+        };
+        let built = match (flake, template) {
+            (Some(flake), _) => Some(sandy_cli::submit::flake_manifest(
+                flake.clone(),
+                kind.clone(),
+                attr.clone(),
+                *from_devshell,
+                plain,
+            )),
+            (None, Some(template)) => Some(sandy_cli::submit::template_manifest(&template, plain)),
+            (None, None) => None,
+        };
+        match built {
+            Some(Ok(manifest)) => Some(manifest),
+            Some(Err(e)) => {
                 eprintln!("sandy: {e}");
                 return ProcessExit::InvalidPlan.code();
             }
+            None => {
+                if history_lines.is_some()
+                    || !env.is_empty()
+                    || cpu.is_some()
+                    || mem.is_some()
+                    || timeout.is_some()
+                    || !command.is_empty()
+                {
+                    eprintln!(
+                        "sandy: --history-lines, --env, --cpu, --mem, --timeout and a trailing command only apply to \
+                         a template or --flake, not to a manifest file"
+                    );
+                    return ProcessExit::InvalidPlan.code();
+                }
+                None
+            }
         }
     } else {
-        Vec::new()
+        None
     };
 
     // A bad `--cred-capability` is the caller's input error (exit 2), not a
@@ -1031,45 +1092,21 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             manifest,
             isolation_class,
             manifest_encoding,
-            flake,
-            attr,
-            kind,
-            history_lines,
-            env: _,
-            cpu,
-            mem,
-            timeout,
-            command,
-            cap_files: _,
-            inputs: _,
-            outputs: _,
-            secrets: _,
             credential,
             cred_capability,
+            ..
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
             // set here.
-            let (bytes, encoding) = if let Some(flake) = flake {
-                let manifest = sandy_guest_template::manifest::FlakeManifestV1 {
-                    flake,
-                    kind,
-                    attr,
-                    command,
-                    history_lines,
-                    env: flake_env,
-                    cpu,
-                    mem,
-                    timeout_secs: timeout,
-                    service: None,
-                };
+            let (bytes, encoding) = if let Some(manifest) = flake_submit {
                 match sandy_guest_template::manifest::encode_flake_manifest(&manifest) {
                     Ok(bytes) => (
                         bytes,
                         sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1.to_owned(),
                     ),
                     Err(e) => {
-                        eprintln!("sandy: could not encode the --flake manifest: {e}");
+                        eprintln!("sandy: could not encode the flake manifest: {e}");
                         return ProcessExit::InfraFault.code();
                     }
                 }
@@ -1077,7 +1114,8 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 // `required_unless_present = "flake"` guarantees `manifest`
                 // is `Some` whenever `flake` is `None`.
                 let manifest = manifest.expect("manifest is required unless --flake is given");
-                let encoding = manifest_encoding.expect("manifest_encoding is required unless --flake is given");
+                let encoding =
+                    manifest_encoding.expect("a positional without a manifest encoding was classified as a template");
                 let bytes = match read_manifest(&manifest) {
                     Ok(bytes) => bytes,
                     Err(e) => {
