@@ -196,7 +196,7 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
     descendants_in(&table, root)
 }
 
-/// Whether this test process leads its own process group, as it does under \`cargo nextest\`.
+/// Whether this test process leads its own process group, as it does under `cargo nextest`.
 fn leads_its_group() -> bool {
     std::fs::read_to_string("/proc/self/stat")
         .ok()
