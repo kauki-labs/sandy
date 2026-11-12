@@ -19,8 +19,15 @@ use std::sync::Arc;
 use sandy_conn::{Conn, Listener, PeerAddr};
 use sandy_executor_proto::decode_remote_link_prefix;
 use sandy_fabric_local::link::serve_agent_link;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{dispatch::JobRegistry, link_auth::LinkKind, spawn_gated_accept};
+use crate::{
+    data_link_recv::{ReceiveError, receive_outputs},
+    dispatch::JobRegistry,
+    link_auth::LinkKind,
+    output_slot::OutputsState,
+    spawn_gated_accept,
+};
 
 /// How long a freshly accepted connection has to deliver its full run-id +
 /// token prefix before it's closed. Without a deadline here, a peer that
@@ -157,25 +164,132 @@ async fn serve_one_remote_link(mut conn: Box<dyn Conn>, peer: PeerAddr, registry
                 tracing::warn!(error = %e, job_id, "mesh accept loop: the agent link faulted");
             }
         }
-        // Slice 5c sends the inputs and closes. Slice 6 keeps the link open for the outputs coming back.
+        // Slice 5c sends the inputs; slice 6c-2 then keeps the link open for the outputs coming back.
         LinkKind::Data => {
             let mut conn = conn;
-            match crate::data_link_send::send_inputs(
-                &mut conn,
-                &job.data_inputs,
-                crate::data_link_send::SendLimits::default(),
-            )
-            .await
-            {
-                Ok(sent) => tracing::info!(
-                    job_id,
-                    files = sent.files,
-                    bytes = sent.bytes,
-                    "mesh accept loop: inputs sent"
-                ),
-                Err(e) => tracing::warn!(error = %e, job_id, "mesh accept loop: the input send failed"),
-            }
+            serve_data_link(&job, &mut conn, crate::data_link_recv::ReceiveLimits::default()).await;
         }
+    }
+}
+
+/// Serve a claimed data link: send the job's inputs, then, when the job declares outputs, receive them and publish
+/// how that came out to the job's [`crate::output_slot::OutputsSlot`].
+///
+/// The host sends the outputs after the job ran, which can be hours after the link opened, so the receive's idle and
+/// total clocks start at the first byte, not here. Until then the wait is bounded by the slot: the result relay
+/// publishes a failure when the job ends or its outputs are overdue, and the serve gives up with it.
+async fn serve_data_link(
+    job: &crate::dispatch::JobChannel,
+    conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    limits: crate::data_link_recv::ReceiveLimits,
+) {
+    let owed = !job.data_outputs.is_empty();
+    match crate::data_link_send::send_inputs(conn, &job.data_inputs, crate::data_link_send::SendLimits::default()).await
+    {
+        Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "mesh accept loop: inputs sent"),
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh accept loop: the input send failed");
+            if owed {
+                job.outputs
+                    .publish(OutputsState::Failed("the inputs could not be sent".to_owned()));
+            }
+            return;
+        }
+    }
+    if !owed {
+        return;
+    }
+    // A receive dropped here (the job ended) removes the file it had in flight.
+    let outcome = tokio::select! {
+        biased;
+        () = job.outputs.decided() => return,
+        outcome = receive_after_first_byte(conn, &job.data_outputs, limits) => outcome,
+    };
+    match outcome {
+        Ok(received) => {
+            tracing::info!(
+                files = received.files,
+                bytes = received.bytes,
+                "mesh accept loop: outputs received"
+            );
+            job.outputs.publish(OutputsState::Received(received));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh accept loop: the output receive failed");
+            job.outputs.publish(OutputsState::Failed(e.peer_reason().to_owned()));
+        }
+    }
+}
+
+/// Wait for the first byte of the outputs without a time limit, then run the receive with its limits from there.
+async fn receive_after_first_byte(
+    conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    outputs: &[sandy_executor_proto::Output],
+    limits: crate::data_link_recv::ReceiveLimits,
+) -> Result<crate::data_link_recv::Received, ReceiveError> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut first = [0u8; 1];
+    match conn.read(&mut first).await {
+        Ok(1) => {}
+        Ok(_) => return Err(ReceiveError::Truncated),
+        Err(e) => return Err(ReceiveError::Frame(sandy_control_proto::FrameError::Io(e))),
+    }
+    receive_outputs(
+        &mut Replay {
+            first: Some(first[0]),
+            inner: conn,
+        },
+        outputs,
+        limits,
+    )
+    .await
+}
+
+/// A link that yields one byte already read, then reads on from the link.
+struct Replay<'a, C> {
+    first: Option<u8>,
+    inner: &'a mut C,
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for Replay<'_, C> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(byte) = self.first.take() {
+            if buf.remaining() > 0 {
+                buf.put_slice(&[byte]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.first = Some(byte);
+        }
+        std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for Replay<'_, C> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -999,6 +1113,359 @@ mod tests {
         );
 
         accept_loop.abort();
+        Ok(())
+    }
+
+    /// A job that declares one output named `out`, written under `dest`.
+    async fn job_with_output(dest: &std::path::Path) -> anyhow::Result<crate::dispatch::JobChannel> {
+        let registry = JobRegistry::new().context("registry")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.data_outputs = vec![sandy_executor_proto::Output {
+            name: Some("out".to_owned()),
+            dest: dest.to_string_lossy().into_owned(),
+        }];
+        Ok(job)
+    }
+
+    fn out_chunk(name: &str, bytes: &[u8]) -> sandy_executor_proto::DataLinkMessage {
+        sandy_executor_proto::DataLinkMessage {
+            op: Some(sandy_executor_proto::data_link_message::Op::OutputChunk(
+                sandy_executor_proto::OutputChunk {
+                    name: name.to_owned(),
+                    bytes: bytes.to_vec(),
+                    output_index: 0,
+                },
+            )),
+        }
+    }
+
+    fn out_end() -> sandy_executor_proto::DataLinkMessage {
+        sandy_executor_proto::DataLinkMessage {
+            op: Some(sandy_executor_proto::data_link_message::Op::OutputEnd(
+                sandy_executor_proto::OutputEnd {},
+            )),
+        }
+    }
+
+    /// Read the inputs half of the link (here just `InputEnd`) as the executor does before it sends anything back.
+    async fn read_inputs_half(peer: &mut tokio::io::DuplexStream) -> anyhow::Result<()> {
+        use sandy_control_proto::read_frame;
+        use sandy_executor_proto::{DataLinkMessage, data_link_message::Op};
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame::<DataLinkMessage>(peer))
+                .await
+                .context("timed out reading the inputs half")?
+                .context("read a frame")?
+                .context("the link closed before InputEnd")?;
+            if matches!(message.op, Some(Op::InputEnd(_))) {
+                return Ok(());
+            }
+        }
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// #482 slice 6c-2: after the inputs, a job that declares outputs gets them over the same link; the outputs land
+    /// under their destination and the job's slot says so.
+    #[tokio::test]
+    async fn a_data_link_receives_the_jobs_outputs_after_the_inputs() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+
+        read_inputs_half(&mut peer).await?;
+        write_frame(&mut peer, &out_chunk("out/a.txt", b"hello")).await?;
+        write_frame(&mut peer, &out_end()).await?;
+
+        let state = job.outputs.wait(WAIT).await;
+        assert_eq!(
+            state,
+            crate::output_slot::OutputsState::Received(crate::data_link_recv::Received { files: 1, bytes: 5 })
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("a.txt")).context("the output file")?,
+            b"hello"
+        );
+        tokio::time::timeout(WAIT, serving).await??;
+        Ok(())
+    }
+
+    /// The same, through the real accept path and the real sender of the host-executor (slice 6b), so the two halves
+    /// agree on names and positions.
+    #[tokio::test]
+    async fn the_real_sender_into_the_accept_path_delivers_the_outputs() -> anyhow::Result<()> {
+        use sandy_host_executor::output_send::{OutputSource, SendLimits as HostSendLimits, send_outputs};
+        let (staged, dest) = (
+            tempfile::tempdir().context("staged")?,
+            tempfile::tempdir().context("dest")?,
+        );
+        std::fs::create_dir(staged.path().join("0")).context("staged dir")?;
+        std::fs::write(staged.path().join("0/r.txt"), b"result").context("staged file")?;
+        let listener = listen(&loopback(0)).await.context("listen")?;
+        let addr = listener.local_addr().context("local_addr")?;
+        let (agent, data) = (marker_token("out-agent"), marker_token("out-data"));
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = job_with_output(dest.path()).await?;
+        job.remote_link = Some(RemoteLink::with_token(addr.ip(), agent));
+        job.data_link = Some(RemoteLink::with_token(addr.ip(), data));
+        registry.insert("job-1".to_owned(), job);
+        let accepting = accept_n(listener, &registry, 1);
+
+        let mut conn = connect(&loopback(addr.port())).await.context("connect data")?;
+        let prefix = encode_remote_link_prefix("job-1", &data).context("encode prefix")?;
+        tokio::io::AsyncWriteExt::write_all(&mut conn, &prefix)
+            .await
+            .context("prefix")?;
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        // The inputs half first, as the executor's pull does.
+        loop {
+            let message = sandy_control_proto::read_frame::<sandy_executor_proto::DataLinkMessage>(&mut reader)
+                .await?
+                .context("closed before InputEnd")?;
+            if matches!(
+                message.op,
+                Some(sandy_executor_proto::data_link_message::Op::InputEnd(_))
+            ) {
+                break;
+            }
+        }
+        let sources = [OutputSource {
+            name: Some("out".to_owned()),
+            root: staged.path().join("0"),
+        }];
+        send_outputs(&mut writer, &sources, HostSendLimits::default())
+            .await
+            .context("send outputs")?;
+
+        let job = registry.get("job-1").context("registered")?;
+        assert!(
+            matches!(job.outputs.wait(WAIT).await, crate::output_slot::OutputsState::Received(r) if r.files == 1),
+            "the outputs must arrive"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("r.txt")).context("the output file")?,
+            b"result"
+        );
+        tokio::time::timeout(WAIT, accepting).await??;
+        Ok(())
+    }
+
+    /// An empty transfer (a named output that produced nothing) ends with `OutputEnd` alone and is accepted.
+    #[tokio::test]
+    async fn an_empty_output_transfer_is_received() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        write_frame(&mut peer, &out_end()).await?;
+        assert_eq!(
+            job.outputs.wait(WAIT).await,
+            crate::output_slot::OutputsState::Received(crate::data_link_recv::Received { files: 0, bytes: 0 })
+        );
+        tokio::time::timeout(WAIT, serving).await??;
+        Ok(())
+    }
+
+    /// A transfer that breaks a rule fails the slot, so the job is not recorded as a success.
+    #[tokio::test]
+    async fn a_broken_output_transfer_fails_the_slot() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        // A chunk under a name that is not the declared output's.
+        write_frame(&mut peer, &out_chunk("other/a.txt", b"x")).await?;
+        assert!(matches!(
+            job.outputs.wait(WAIT).await,
+            crate::output_slot::OutputsState::Failed(_)
+        ));
+        tokio::time::timeout(WAIT, serving).await??;
+        Ok(())
+    }
+
+    /// A link that closes before `OutputEnd` fails the slot.
+    #[tokio::test]
+    async fn a_link_that_closes_before_the_outputs_fails_the_slot() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        drop(peer);
+        assert!(matches!(
+            job.outputs.wait(WAIT).await,
+            crate::output_slot::OutputsState::Failed(_)
+        ));
+        tokio::time::timeout(WAIT, serving).await??;
+        Ok(())
+    }
+
+    /// The receive clocks start at the first frame, not at dispatch: a job runs for as long as it runs before the
+    /// outputs are sent (sandy-86's note on #803), and the idle limit is for a stalled sender.
+    #[tokio::test]
+    async fn outputs_that_start_later_than_the_idle_limit_after_the_link_opens_are_received() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let limits = crate::data_link_recv::ReceiveLimits {
+            idle: std::time::Duration::from_millis(500),
+            total: std::time::Duration::from_millis(1000),
+            ..crate::data_link_recv::ReceiveLimits::default()
+        };
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, limits).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        write_frame(&mut peer, &out_chunk("out/a.txt", b"late")).await?;
+        write_frame(&mut peer, &out_end()).await?;
+        assert!(matches!(
+            job.outputs.wait(WAIT).await,
+            crate::output_slot::OutputsState::Received(_)
+        ));
+        tokio::time::timeout(WAIT, serving).await??;
+        Ok(())
+    }
+
+    /// Once the first frame is in, the limits apply: a sender that stalls mid-transfer fails the slot at the idle
+    /// limit.
+    #[tokio::test]
+    async fn a_sender_that_stalls_after_its_first_frame_fails_at_the_idle_limit() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
+        let limits = crate::data_link_recv::ReceiveLimits {
+            idle: std::time::Duration::from_millis(500),
+            ..crate::data_link_recv::ReceiveLimits::default()
+        };
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = std::sync::Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, limits).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        write_frame(&mut peer, &out_chunk("out/a.txt", b"partial")).await?;
+        // `peer` stays open and silent.
+        assert!(matches!(
+            job.outputs.wait(WAIT).await,
+            crate::output_slot::OutputsState::Failed(_)
+        ));
+        tokio::time::timeout(WAIT, serving).await??;
+        drop(peer);
+        Ok(())
+    }
+
+    /// A job that declares no outputs gets its inputs and the link is released without waiting on the peer.
+    #[tokio::test]
+    async fn a_job_without_outputs_releases_the_link_after_the_inputs() -> anyhow::Result<()> {
+        let registry = JobRegistry::new().context("registry")?;
+        let job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn(async move {
+            serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await;
+            job
+        });
+        read_inputs_half(&mut peer).await?;
+        // `peer` stays open: nothing is owed, so the serve must not wait for it.
+        let job = tokio::time::timeout(WAIT, serving).await??;
+        assert_eq!(
+            job.outputs.wait(std::time::Duration::from_millis(50)).await,
+            crate::output_slot::OutputsState::Failed("the outputs did not arrive in time".to_owned())
+        );
+        drop(peer);
+        Ok(())
+    }
+
+    /// The job ending (cancel, a failure result, an executor that went away) while the link is silent releases the
+    /// serve: it does not wait on a link the job no longer needs.
+    #[tokio::test]
+    async fn a_job_that_ends_while_the_link_is_silent_releases_the_serve() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = job_with_output(dest.path()).await?;
+        job.remote_link = Some(RemoteLink::with_token(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            marker_token("end-agent"),
+        ));
+        registry.insert("job-1".to_owned(), job);
+        let job = registry.get("job-1").context("registered")?;
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        registry.invalidate_remote_link("job-1");
+        tokio::time::timeout(WAIT, serving).await??;
+        assert!(matches!(job.outputs.wait(WAIT).await, OutputsState::Failed(_)));
+        drop(peer);
+        Ok(())
+    }
+
+    /// The job ending mid-receive drops the receive, and the file it had in flight goes with it.
+    #[tokio::test]
+    async fn a_job_that_ends_mid_receive_leaves_no_partial_file() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        write_frame(&mut peer, &out_chunk("out/a.txt", b"partial")).await?;
+        // The receive is mid-file once its temp file exists: only then does ending the job exercise the cleanup.
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::fs::read_dir(dest.path()).context("read dest")?.next().is_none() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the receive never opened its temp file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        job.outputs.publish(OutputsState::Failed("the job ended".to_owned()));
+        tokio::time::timeout(WAIT, serving).await??;
+        // The unlink runs on the blocking pool, so wait for it.
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let left: Vec<_> = std::fs::read_dir(dest.path())
+                .context("read dest")?
+                .collect::<Result<_, _>>()?;
+            if left.is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "nothing may be left in the destination, found {left:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(peer);
         Ok(())
     }
 }

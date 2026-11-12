@@ -33,6 +33,7 @@ pub mod mesh_accept;
 pub mod mesh_config;
 pub mod operator;
 pub mod operator_values;
+pub mod output_slot;
 pub mod peer_cred;
 pub mod profiles;
 pub mod store;
