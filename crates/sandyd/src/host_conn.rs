@@ -669,8 +669,12 @@ async fn finish_job(
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
-        // The envelope carries the same redacted console, so it never holds the token either.
-        let envelope = crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        let console = crate::envelope::tail(&console, crate::envelope::MAX_CONSOLE_BYTES).to_owned();
+        // The envelope carries the same redacted console, and its message (the executor's own words) is redacted
+        // the same way, so neither holds the token.
+        let mut envelope =
+            crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        envelope.message = redact_console(credentials.as_deref(), &jid, envelope.message);
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;

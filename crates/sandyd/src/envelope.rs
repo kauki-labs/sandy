@@ -5,6 +5,26 @@
 
 use std::time::SystemTime;
 
+/// The most bytes of console the daemon keeps for a job, in the row and in its envelope's log tail: the tail (the
+/// end is what diagnoses a run). The executor sends at most about this much; the cap holds a hostile or buggy one to
+/// it, so a `Status` reply (the console twice, one of them JSON-escaped at up to six bytes per byte) fits one frame.
+pub(crate) const MAX_CONSOLE_BYTES: usize = 64 * 1024;
+
+/// The most bytes of the envelope's `message` the daemon keeps.
+const MAX_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// `text` cut to its last `max` bytes, on a character boundary.
+pub(crate) fn tail(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 use sandy::{
     AuditReceipt, EgressEnforcement, EgressReceipt, GuestReported, HostObserved, Location, OutputStatus,
     ResultEnvelope, Timing, What, Who, build_envelope, classify_backend_error, classify_outcome,
@@ -100,10 +120,29 @@ pub(crate) fn from_run(
         None,
         classification,
         exit_code,
-        message,
-        console,
+        tail(&message, MAX_MESSAGE_BYTES).to_owned(),
+        tail(&console, MAX_CONSOLE_BYTES).to_owned(),
         Vec::new(),
         Some(receipt(job_id, exit_code, host_id)),
+    )
+}
+
+/// The envelope for a job cancelled before a terminal guest result: the shape the direct `kill` writes (status
+/// `Cancelled`, not retryable, no exit, no receipt: no backend run was observed).
+pub(crate) fn cancelled(job_id: &str) -> ResultEnvelope {
+    build_envelope(
+        job_id,
+        None,
+        sandy::Classification {
+            status: sandy::Status::Cancelled,
+            retryable: false,
+            process_exit: sandy::ProcessExit::TaskFailure,
+        },
+        None,
+        "cancelled".to_owned(),
+        String::new(),
+        Vec::new(),
+        None,
     )
 }
 

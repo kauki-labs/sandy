@@ -65,7 +65,7 @@ pub enum CancelOutcome {
     AlreadyTerminal(JobStatus),
 }
 
-/// What a lifecycle transition ([`JobStore::mark_running`]/[`JobStore::finish`])
+/// What a lifecycle transition ([`JobStore::mark_running`]/`JobStore::finish_with`)
 /// did to a job row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
@@ -343,7 +343,7 @@ impl JobStore {
     }
 
     /// Persist `job_id`'s archived transcript (#340 item 4), overwriting
-    /// whatever was there before. Not status-gated like [`JobStore::finish`]:
+    /// whatever was there before. Not status-gated like `JobStore::finish_with`:
     /// the agent's one-shot archive post can arrive before OR after the
     /// terminal status update reaches this store (they travel over
     /// independent paths — the channel vs. `host_conn`'s own result
@@ -403,9 +403,11 @@ impl JobStore {
         if !matches!(status, JobStatus::Pending | JobStatus::Running) {
             return Ok(CancelOutcome::AlreadyTerminal(status));
         }
+        // The cancelled envelope goes in the same statement, so a cancelled row never lacks one (A2 of #483).
+        let envelope = serde_json::to_string(&crate::envelope::cancelled(job_id)).ok();
         conn.execute(
-            "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE job_id = ?3",
-            (status_name(JobStatus::Cancelled), now_unix(), job_id),
+            "UPDATE jobs SET status = ?1, envelope = ?2, updated_at = ?3 WHERE job_id = ?4",
+            (status_name(JobStatus::Cancelled), envelope, now_unix(), job_id),
         )?;
         Ok(CancelOutcome::Cancelled)
     }
@@ -445,7 +447,8 @@ impl JobStore {
     /// [`StoreError::Sqlite`] if the read or write fails;
     /// [`StoreError::CorruptStatus`] if the stored status string is not a
     /// recognised [`JobStatus`].
-    pub fn finish(
+    #[cfg(test)]
+    pub(crate) fn finish(
         &self,
         job_id: &str,
         status: JobStatus,
@@ -455,11 +458,11 @@ impl JobStore {
         self.finish_with(job_id, status, exit_code, console, None)
     }
 
-    /// [`Self::finish`] that also stores the terminal result `envelope` (A2 of #483) in the same statement, so the
+    /// `finish` that also stores the terminal result `envelope` (A2 of #483) in the same statement, so the
     /// status and its envelope never disagree after a crash.
     ///
     /// # Errors
-    /// As [`Self::finish`]; [`StoreError::CorruptEnvelope`] if the envelope does not serialize.
+    /// [`StoreError::Sqlite`] if the read or write fails.
     pub fn finish_with(
         &self,
         job_id: &str,
@@ -468,14 +471,13 @@ impl JobStore {
         console: &str,
         envelope: Option<&sandy::ResultEnvelope>,
     ) -> Result<Transition, StoreError> {
-        let envelope_json =
-            envelope
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| StoreError::CorruptEnvelope {
-                    job_id: job_id.to_owned(),
-                    reason: e.to_string(),
-                })?;
+        // An envelope that does not serialize must not strand the job `Running`: record the terminal status without it
+        // and say so, rather than refuse the transition.
+        let envelope_json = envelope.and_then(|envelope| {
+            serde_json::to_string(envelope)
+                .inspect_err(|e| tracing::warn!(job_id, error = %e, "could not serialize the job's result envelope"))
+                .ok()
+        });
         let conn = self.lock();
         let Some(current) = query_status(&conn, job_id)? else {
             return Ok(Transition::NotFound);
