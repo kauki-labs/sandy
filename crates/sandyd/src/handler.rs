@@ -2778,6 +2778,157 @@ mod tests {
         Ok(())
     }
 
+    /// A Submit naming `egress` (`sandy daemon submit --allow`, A1 of #483). `None` is no policy; `Some(&[])` is a
+    /// policy with no rules (deny all). A rule is `(host, port)`; the port is the wire's `u32`.
+    fn submit_req_with_egress(id: u64, egress: Option<&[(&str, u32)]>) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                egress: egress.map(|rules| sandy_control_proto::EgressPolicy {
+                    rules: rules
+                        .iter()
+                        .map(|(host, port)| sandy_control_proto::EgressRule {
+                            host: (*host).to_owned(),
+                            port: *port,
+                        })
+                        .collect(),
+                }),
+                ..match submit_req(id).op {
+                    Some(control_request::Op::Submit(submit)) => submit,
+                    _ => unreachable!("submit_req builds a Submit"),
+                }
+            }),
+        )
+    }
+
+    fn egress_host(egress_proxy: bool) -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            egress_proxy,
+            ..trusted_host_capabilities()
+        }
+    }
+
+    /// A1 (#483): the policy a Submit names reaches the host's `Dispatch` as the same list, and an absent policy stays
+    /// absent, an empty one stays empty (a deny-all proxy is not "no policy").
+    #[tokio::test]
+    async fn an_egress_policy_reaches_the_dispatch_unchanged() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        type Rows<'a> = Vec<(&'a str, Option<&'a [(&'a str, u32)]>)>;
+        let rows: Rows<'_> = vec![
+            ("none", None),
+            ("empty", Some(&[])),
+            ("one", Some(&[("example.com", 443)])),
+            ("two", Some(&[("example.com", 443), ("10.0.0.5", 8080)])),
+        ];
+        for (name, egress) in rows {
+            let (dispatch, _job, _registry) =
+                place_and_read(submit_req_with_egress(1, egress), egress_host(true), peer_ip).await?;
+            let want = egress.map(|rules| sandy_executor_proto::EgressPolicy {
+                rules: rules
+                    .iter()
+                    .map(|(host, port)| sandy_executor_proto::EgressRule {
+                        host: (*host).to_owned(),
+                        port: *port,
+                    })
+                    .collect(),
+            });
+            assert_eq!(dispatch.egress, want, "{name}");
+        }
+        Ok(())
+    }
+
+    /// A1 (#483): an executor that does not know `egress` drops the field silently, so a policy is placed only on a
+    /// host that declared `egress_proxy`. With none, the Submit is refused naming the capability, with no trace.
+    #[tokio::test]
+    async fn an_egress_policy_with_no_capable_host_is_refused_naming_the_capability() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "old-host", peer_ip, egress_host(false));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_with_egress(1, Some(&[("example.com", 443)])),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(
+                    e.message.contains("egress_proxy"),
+                    "must name the capability: {}",
+                    e.message
+                );
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "nothing was dispatched");
+        Ok(())
+    }
+
+    /// A1 (#483): with no remote placement reachable at all, a policy is refused too: the local run applies no
+    /// boundary, so it must not run the job unfiltered.
+    #[tokio::test]
+    async fn an_egress_policy_with_no_remote_placement_is_refused() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            submit_req_with_egress(1, Some(&[])),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Error(_))),
+            "a policy with nowhere to enforce it must be refused, got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
+    /// A1 (#483): the broker and MCP submit too, so the daemon re-validates the rules the CLI already parsed: a rule
+    /// needs a host and a TCP port in 1..=65535 (the wire carries a `u32`).
+    #[tokio::test]
+    async fn a_malformed_egress_rule_is_refused_at_submit() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let bad: [(&str, &[(&str, u32)]); 4] = [
+            ("empty host", &[("", 443)]),
+            ("port zero", &[("example.com", 0)]),
+            ("port above u16", &[("example.com", 65_536)]),
+            ("second rule bad", &[("example.com", 443), ("example.org", 0)]),
+        ];
+        for (name, rules) in bad {
+            let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+            let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, egress_host(true));
+            let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+            let response = handle(
+                &store,
+                &registry,
+                &host_registry,
+                Some(forward_back),
+                test_session(),
+                submit_req_with_egress(1, Some(rules)),
+            )
+            .await?;
+            match response.result {
+                Some(control_response::Result::Error(e)) => {
+                    assert!(
+                        e.message.contains("egress"),
+                        "{name}: must name the field: {}",
+                        e.message
+                    );
+                }
+                other => anyhow::bail!("{name}: expected a refusal, got {other:?}"),
+            }
+            assert!(dispatch_rx.try_recv().is_err(), "{name}: nothing was dispatched");
+        }
+        Ok(())
+    }
+
     /// #482: the handler-minted data link is bound to the placed host's IP,
     /// carries the token the Dispatch sent, and differs from the agent
     /// link's token; a stream from any other peer is refused.
