@@ -517,6 +517,14 @@ pub enum HandleDispatchError {
     OutputStaging(#[source] std::io::Error),
 }
 
+impl HandleDispatchError {
+    /// The `JobResult` message that reports this failure for `job_id` (#762).
+    #[must_use]
+    pub fn result_message(&self, job_id: String) -> sandy_executor_proto::HostExecutorMessage {
+        crate::run::failure_result_message(job_id, self.to_string())
+    }
+}
+
 /// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
 #[derive(Debug)]
 pub struct Dispatched {
@@ -856,6 +864,46 @@ pub fn handle_dispatch(
 
 #[cfg(test)]
 mod tests {
+
+    /// The `JobResult` a failed dispatch reports, as the orchestrator will read it.
+    fn reported(error: &HandleDispatchError) -> anyhow::Result<sandy_executor_proto::JobResult> {
+        match error.result_message("job-1".to_owned()).op {
+            Some(sandy_executor_proto::host_executor_message::Op::Result(result)) => Ok(result),
+            other => anyhow::bail!("expected a JobResult, got {other:?}"),
+        }
+    }
+
+    /// A deadline that passes during the input pull is a timeout, not a plain failure (#762).
+    #[test]
+    fn a_deadline_during_the_input_pull_is_reported_as_timed_out() -> anyhow::Result<()> {
+        use crate::input_stage::StageError;
+        for stage in [StageError::DeadlinePassed, StageError::TotalCapExceeded] {
+            let result = reported(&HandleDispatchError::DataLink(stage))?;
+            assert!(result.timed_out, "the job timed out during its input pull");
+            assert!(!result.booted, "it never booted");
+            assert!(result.transport_error.is_some(), "the reason is kept");
+            assert!(!result.outputs_follow);
+        }
+        Ok(())
+    }
+
+    /// A cancel during the pull keeps a stable text and is not a timeout: sandyd already knows it cancelled, and a
+    /// transfer failure must read differently (#762).
+    #[test]
+    fn a_cancel_during_the_input_pull_is_a_stable_non_timeout_failure() -> anyhow::Result<()> {
+        use crate::input_stage::StageError;
+        let cancelled = reported(&HandleDispatchError::DataLink(StageError::Cancelled))?;
+        assert!(!cancelled.timed_out);
+        assert!(!cancelled.booted);
+        assert_eq!(
+            cancelled.transport_error.as_deref(),
+            Some("the job was cancelled while its inputs were being pulled")
+        );
+        let failed = reported(&HandleDispatchError::DataLink(StageError::Dial("x".to_owned())))?;
+        assert!(!failed.timed_out);
+        assert_ne!(failed.transport_error, cancelled.transport_error);
+        Ok(())
+    }
     use anyhow::Context;
 
     use super::*;
