@@ -343,6 +343,9 @@ impl Drop for UnlinkOnDrop {
     }
 }
 
+/// How many temp names one `open_temp` call tries before it gives up on a destination full of stale ones.
+const MAX_TEMP_NAME_TRIES: u32 = 1000;
+
 /// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
 /// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
 /// including when the receive that asked for it is gone by the time this ends.
@@ -351,16 +354,20 @@ fn open_temp(root: &Path, parts: &[String], mut seq: u64) -> Result<(Cleanup, st
     for part in parts {
         dir = dir.create_dir(OsStr::new(part))?;
     }
-    loop {
+    // `seq` runs across the whole receive so names stay unique; the retry bound is per call.
+    for _ in 0..MAX_TEMP_NAME_TRIES {
         seq += 1;
         let temp = OsString::from(format!(".sandy-recv-{}-{seq}", std::process::id()));
         match dir.create_new_file(&temp) {
             Ok(file) => return Ok((Cleanup::new(dir, temp), file, seq)),
             // A stale name from a crashed receive: try the next one.
-            Err(sandy_fsutil::FsError::Unsafe { .. }) if seq < 1000 => {}
+            Err(sandy_fsutil::FsError::Unsafe { .. }) => {}
             Err(e) => return Err(e.into()),
         }
     }
+    Err(ReceiveError::Write(
+        "too many stale temp files in the destination".to_owned(),
+    ))
 }
 
 impl<'a> Receive<'a> {
@@ -406,7 +413,12 @@ impl<'a> Receive<'a> {
         let Some(mut current) = self.current.take() else {
             return Ok(());
         };
-        current.file.flush().await.map_err(ReceiveError::Io)?;
+        if let Err(e) = current.file.flush().await {
+            // `finish_file` took the file out of `receive.current`, so the error path cannot discard it: do it here,
+            // before the error returns and the peer is told (decision 22).
+            current.discard().await;
+            return Err(ReceiveError::Io(e));
+        }
         let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
             let renamed = match current.cleanup.0.as_ref() {
                 Some((dir, temp)) => dir.rename(temp, &current.name),
@@ -952,6 +964,100 @@ mod tests {
             }
         }
         anyhow::bail!("no file was ever in flight")
+    }
+
+    /// A flush that fails ends the receive with the file already removed: the error path tells the peer only after the
+    /// unlink is done (decision 22), and it cannot await a file that `finish_file` has already taken. With the pool's
+    /// only thread occupied, a drop-time unlink stays queued, so the file is still there when the error returns.
+    #[test]
+    fn a_failed_flush_removes_the_file_before_the_error_returns() -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let rt = runtime_with_one_blocking_thread()?;
+        let dest = tempfile::tempdir().context("dest")?;
+        rt.block_on(async {
+            let dir = Beneath::open_dir(dest.path()).context("open dest")?;
+            let temp = OsString::from(".sandy-recv-flush-test");
+            drop(dir.create_new_file(&temp).context("create temp")?);
+            // A read-only descriptor: the buffered write is accepted and fails when it reaches the file.
+            let read_only = std::fs::File::open(dest.path().join(&temp)).context("reopen")?;
+            let mut file = tokio::fs::File::from_std(read_only);
+            file.write_all(b"x").await.context("buffer a write")?;
+            let mut receive = Receive::new(&[], quick());
+            receive.current = Some(InFlight {
+                key: (0, "f".to_owned()),
+                name: OsString::from("f"),
+                file,
+                cleanup: Cleanup::new(dir, temp.clone()),
+            });
+
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = release.send(());
+            });
+
+            let finished = receive.finish_file().await;
+            let still_there = dest.path().join(&temp).exists();
+            releaser.join().map_err(|_| anyhow::anyhow!("releaser panicked"))?;
+            blocker.await.context("blocker")?;
+            assert!(matches!(finished, Err(ReceiveError::Io(_))), "got {finished:?}");
+            assert!(!still_there, "the file was still on disk when the flush error returned");
+            Ok(())
+        })
+    }
+
+    /// The temp-name retry counts collisions per file, not across the receive: after more than 1,000 files, one stale
+    /// `.sandy-recv-*` name must not fail a transfer when the next name is free.
+    #[test]
+    fn a_stale_temp_name_does_not_fail_a_receive_that_has_written_many_files() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let pid = std::process::id();
+        for n in 1001..=1005 {
+            std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
+        }
+        let (cleanup, _file, seq) =
+            open_temp(dest.path(), &[], 1000).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+        assert_eq!(seq, 1006, "the first free name after the stale ones");
+        drop(cleanup);
+        Ok(())
+    }
+
+    /// A flood of stale names still ends the search: the retry is bounded, not endless.
+    #[test]
+    fn a_flood_of_stale_temp_names_ends_the_search() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let pid = std::process::id();
+        for n in 1..=1000 {
+            std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
+        }
+        let Err(error) = open_temp(dest.path(), &[], 0) else {
+            anyhow::bail!("every name the search may try is taken, it must fail");
+        };
+        assert!(
+            error.to_string().contains("too many stale temp files"),
+            "wrong error: {error}"
+        );
+        Ok(())
+    }
+
+    /// The bound is exactly 1,000 name attempts per call: with 999 names taken the 1000th is found.
+    #[test]
+    fn the_thousandth_temp_name_is_still_tried() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let pid = std::process::id();
+        for n in 1..=999 {
+            std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
+        }
+        let (cleanup, _file, seq) =
+            open_temp(dest.path(), &[], 0).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+        assert_eq!(seq, 1000);
+        drop(cleanup);
+        Ok(())
     }
 
     /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
