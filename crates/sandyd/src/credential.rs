@@ -857,6 +857,7 @@ mod tests {
                     transport_error: None,
                     console: format!("env: GITHUB_TOKEN={TOKEN}\ndone\n"),
                     outputs_follow: true,
+                    egress: None,
                 })),
             },
         )
@@ -901,6 +902,7 @@ mod tests {
                     transport_error: Some(format!("agent link failed: GITHUB_TOKEN={TOKEN}")),
                     console: String::new(),
                     outputs_follow: false,
+                    egress: None,
                 })),
             },
         )
@@ -952,6 +954,7 @@ mod tests {
                     transport_error: Some(format!("{TOKEN}{filler}")),
                     console: String::new(),
                     outputs_follow: false,
+                    egress: None,
                 })),
             },
         )
@@ -1377,6 +1380,7 @@ mod tests {
                     transport_error: None,
                     console: format!("env: GITHUB_TOKEN={TOKEN}\ndone\n"),
                     outputs_follow: false,
+                    egress: None,
                 })),
             },
         )
