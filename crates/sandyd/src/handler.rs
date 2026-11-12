@@ -120,6 +120,34 @@ fn credential_placement_refusal() -> String {
         .to_owned()
 }
 
+/// Refuse a Submit that names an input or an output the data link would refuse (#807, #764), before placement or any
+/// job: the same rule the sender and the receiver apply (`DataLinkMessage::validate`), so a name that cannot cross the
+/// mesh, or that would leave the staging root, fails here with the field named, not on a host after a transfer began.
+/// An output with no name is the catch-all and has no name to check.
+fn transfer_name_refusal(submit: &SubmitRequest) -> Option<String> {
+    let inputs = submit.inputs.iter().map(|input| ("inputs", input.name.as_str()));
+    let outputs = submit
+        .outputs
+        .iter()
+        .filter_map(|output| output.name.as_deref())
+        .map(|name| ("outputs", name));
+    inputs.chain(outputs).find_map(|(field, name)| {
+        let probe = sandy_executor_proto::DataLinkMessage {
+            op: Some(sandy_executor_proto::data_link_message::Op::InputChunk(
+                sandy_executor_proto::InputChunk {
+                    name: name.to_owned(),
+                    offset: 0,
+                    bytes: Vec::new(),
+                },
+            )),
+        };
+        probe
+            .validate()
+            .err()
+            .map(|e| format!("{field}: the name {name:?} is not a plain relative path the data link accepts: {e}"))
+    })
+}
+
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
 /// any side effect: `cred_capabilities` with no `credential`, a credential name
 /// that is not a single file name, a credential on a daemon with no credential
@@ -437,6 +465,12 @@ pub async fn handle(
             // #481: a credential request this daemon cannot honor is refused
             // before placement and before any mint.
             if let Some(message) = credential_request_refusal(&submit, registry) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
+            if let Some(message) = transfer_name_refusal(&submit) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(ControlError { message })),
