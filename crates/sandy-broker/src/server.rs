@@ -297,6 +297,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .collect(),
         credential: None,
         cred_capabilities: Vec::new(),
+        egress: None,
     };
     let control_response::Result::Submit(done) = rpc(state, control_request::Op::Submit(submit)).await? else {
         return Err(UNAVAILABLE);

@@ -173,6 +173,7 @@ async fn submit(
             secrets: Vec::new(),
             credential: None,
             cred_capabilities: Vec::new(),
+            egress: None,
         }),
     )
     .await

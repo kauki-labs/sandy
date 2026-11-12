@@ -27,6 +27,7 @@ use sandy_control_proto::{
     secrets: vec![],
     credential: None,
     cred_capabilities: Vec::new(),
+    egress: None,
 }))]
 #[case(control_request::Op::Cancel(CancelRequest { job_id: "job-1".to_owned(), attach_token: Some(vec![1, 2, 3]) }))]
 #[case(control_request::Op::Attach(AttachRequest {

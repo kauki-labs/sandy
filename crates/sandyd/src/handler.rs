@@ -631,6 +631,7 @@ pub async fn handle(
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
                             data_link_token,
+                            egress: None,
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -1223,6 +1224,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -1286,6 +1288,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -2465,6 +2468,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2515,6 +2519,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2562,6 +2567,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
 
@@ -2584,6 +2590,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -2665,6 +2672,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -2709,6 +2717,7 @@ mod tests {
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let capabilities = sandy_executor_proto::Capabilities {
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, _registry) = place_and_read(submit_req(1), capabilities, peer_ip).await?;
@@ -2725,6 +2734,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: false,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
@@ -2741,6 +2751,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let request = req(
@@ -2758,6 +2769,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         );
         let (dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
@@ -2776,6 +2788,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: true,
+            egress_proxy: false,
             ..trusted_host_capabilities()
         };
         let (dispatch, job, registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
@@ -3114,6 +3127,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         };
         let mut dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, untrusted_only);
 
@@ -3339,6 +3353,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3351,6 +3366,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -3639,6 +3655,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3656,6 +3673,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3673,6 +3691,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }
@@ -3685,6 +3704,7 @@ mod tests {
             supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
             shares_submitter_filesystem: false,
             transfer: false,
+            egress_proxy: false,
         }
     }
 
@@ -3881,6 +3901,7 @@ mod tests {
                 secrets: Vec::new(),
                 credential: None,
                 cred_capabilities: Vec::new(),
+                egress: None,
             }),
         )
     }

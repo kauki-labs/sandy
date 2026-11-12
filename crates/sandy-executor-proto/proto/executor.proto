@@ -138,6 +138,13 @@ message Capabilities {
   // Declared on the wire first; the orchestrator does not place on it until the
   // data link exists.
   bool transfer = 6;
+  // Whether this host-executor's VM path can run a job behind the per-run
+  // egress proxy (#360, #404), so it can enforce a `Dispatch.egress` policy.
+  // A host that predates this field decodes false, and an executor drops an
+  // unknown field silently, so the orchestrator places a job with an egress
+  // policy only on a host that declared this. Never auto-detected. Wire only
+  // for now: nothing declares or reads it yet.
+  bool egress_proxy = 7;
 }
 
 // Declares this host's identity and what it can run.
@@ -211,6 +218,25 @@ message Dispatch {
   // sender that predates the field decodes. The orchestrator sets it only for a
   // host that declared `transfer`; nothing sets it until the link exists.
   bytes data_link_token = 11;
+  // The job's egress policy (`sandy run --allow`, #360). Absent means no policy:
+  // the run is unchanged. Present, even with no rules, means the guest runs behind
+  // the per-run egress proxy with exactly these destinations (an empty list
+  // denies all), the same `Some(AllowList)` the direct path builds. A message
+  // field, not a bare `repeated`, so absent and empty stay different on the wire.
+  // The orchestrator sets it only for a host that declared `egress_proxy`, and the
+  // executor refuses a policy on a path that cannot enforce it. Wire only for now:
+  // nothing sets or reads it yet.
+  EgressPolicy egress = 12;
+}
+
+// A job's egress allow-list: the only destinations the guest may reach.
+message EgressPolicy {
+  repeated EgressRule rules = 1;
+}
+
+message EgressRule {
+  string host = 1;
+  uint32 port = 2;
 }
 
 // Mirrors `sandy.control.v1.Input` (sandy-control-proto) — kept as a

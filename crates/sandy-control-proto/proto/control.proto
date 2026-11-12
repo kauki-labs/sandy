@@ -143,6 +143,22 @@ message SubmitRequest {
   // (`read-code`, `write-code`, `read-pr`, `write-pr`); empty means
   // `read-code`. Refused without `credential`.
   repeated string cred_capabilities = 9;
+  // The job's egress policy (`sandy run --allow`, #360). Absent means no policy.
+  // Present, even with no rules, means the guest runs behind the per-run egress
+  // proxy with exactly these destinations (an empty list denies all). A message
+  // field, not a bare `repeated`, so absent and empty stay different on the wire.
+  // Wire only for now: nothing sets or reads it yet.
+  EgressPolicy egress = 10;
+}
+
+// A job's egress allow-list: the only destinations the guest may reach.
+message EgressPolicy {
+  repeated EgressRule rules = 1;
+}
+
+message EgressRule {
+  string host = 1;
+  uint32 port = 2;
 }
 
 // Mirrors `sandy_api::backend::Input`. A host path exposed read-only in the

@@ -1348,6 +1348,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         // A plain reaper (no bus/mount isolation): the exact host state this
         // gate exists to refuse an untrusted job on.
@@ -1397,6 +1398,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1438,6 +1440,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: data_token,
+            egress: None,
         })
     }
 
@@ -1587,6 +1590,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1631,6 +1635,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1676,6 +1681,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1737,6 +1743,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();
@@ -1791,6 +1798,7 @@ mod tests {
             outputs: Vec::new(),
             secrets: Vec::new(),
             data_link_token: Vec::new(),
+            egress: None,
         };
         let containment = Box::new(sandy_test_support::FakeContainment::available());
         let rt = tokio::runtime::Handle::current();

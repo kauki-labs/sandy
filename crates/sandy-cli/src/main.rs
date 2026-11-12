@@ -1097,6 +1097,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 secrets: submit_secrets,
                 credential,
                 cred_capabilities: cred_capability,
+                egress: None,
             })
         }
         DaemonOp::Cancel { job_id } => {
