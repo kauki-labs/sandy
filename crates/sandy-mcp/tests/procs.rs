@@ -11,9 +11,16 @@ use common::procs::{
     parse_stat, run_dirs_left, sandy_entries, staging_base, stat_is_live,
 };
 
-/// A `/proc/<pid>/stat` line: pid, comm, state, ppid and 17 more fields up to the start time (field 22).
+/// A `/proc/<pid>/stat` line: pid, comm, state, ppid, process group and 16 more fields up to the start time (field 22).
+fn stat_line_in_group(comm: &str, ppid: u32, pgrp: u32, start: u64) -> String {
+    format!(
+        "4242 ({comm}) S {ppid} {pgrp} 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 50 18446744073709551615"
+    )
+}
+
+/// A line in group 1.
 fn stat_line(comm: &str, ppid: u32, start: u64) -> String {
-    format!("4242 ({comm}) S {ppid} 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 50 18446744073709551615")
+    stat_line_in_group(comm, ppid, 1, start)
 }
 
 #[test]
@@ -98,12 +105,14 @@ fn the_descendant_walk_ends_on_a_cyclic_table_and_never_lists_the_root() {
 /// The process group id is field 5 of `/proc/<pid>/stat`: the third after the command name.
 #[test]
 fn the_process_group_is_read_from_the_stat_line() {
-    // stat_line puts ppid at field 4 and the group (pgrp) at field 5, which `stat_line` fixes at 1.
-    assert_eq!(parse_pgrp(&stat_line("qemu-system-x86", 7, 9)), Some(1));
-    let tricky = stat_line("a) S (b", 7, 9);
+    assert_eq!(
+        parse_pgrp(&stat_line_in_group("qemu-system-x86", 7, 31337, 9)),
+        Some(31337)
+    );
+    let tricky = stat_line_in_group("a) S (b", 7, 31337, 9);
     assert_eq!(
         parse_pgrp(&tricky),
-        Some(1),
+        Some(31337),
         "a `)` in the command name does not shift the fields"
     );
     assert_eq!(parse_pgrp(""), None);

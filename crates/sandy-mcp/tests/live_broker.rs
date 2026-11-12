@@ -41,7 +41,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
     net::TcpListener,
-    os::unix::{fs::PermissionsExt, process::CommandExt as _},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -196,14 +196,27 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
     descendants_in(&table, root)
 }
 
-/// `(pid, start time)` of every process in the process group `pgid`, from `/proc`, `pgid` itself included. The test
-/// starts `sandyd` as the leader of its own group, so this reaches a child that was re-parented or double-forked,
-/// which the parent walk in [`descendants`] cannot (#734). A process that calls `setsid` or `setpgid` leaves the
-/// group; `vm_parts_using` covers those by their command line.
-fn group_members(pgid: u32) -> Vec<(u32, u64)> {
+/// Whether this test process leads its own process group, as it does under \`cargo nextest\`.
+fn leads_its_group() -> bool {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| parse_pgrp(&stat))
+        .is_some_and(|pgrp| pgrp == std::process::id())
+}
+
+/// The VM parts (qemu, virtiofsd, the egress proxy) in this test's own process group, as `(pid, start time)`. The
+/// daemon is started in the test's group, so this reaches a child that was re-parented or double-forked, which the
+/// parent walk in [`descendants`] cannot (#734). It is empty unless the test is the leader of its group, which `cargo
+/// nextest` makes it: under a plain `cargo test` the group is the shell's, and its members are not this test's. A
+/// process that calls `setsid` or `setpgid` leaves the group; `vm_parts_using` covers those by their command line.
+fn group_vm_parts() -> Vec<(u32, u64)> {
+    let own = std::process::id();
     let Ok(proc) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
+    if !leads_its_group() {
+        return Vec::new();
+    }
     let table: Vec<(u32, u32, u64)> = proc
         .flatten()
         .filter_map(|e| {
@@ -213,16 +226,19 @@ fn group_members(pgid: u32) -> Vec<(u32, u64)> {
             Some((pid, parse_pgrp(&stat)?, start))
         })
         .collect();
-    group_members_in(&table, pgid)
+    group_members_in(&table, own)
+        .into_iter()
+        .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
+        .collect()
 }
 
 /// The processes of this daemon's tree that are part of a VM: qemu, virtiofsd and the egress proxy. Its descendants
-/// and the members of its process group, so a re-parented one still counts.
+/// and the VM parts of the test's process group, so a re-parented one still counts.
 fn vm_parts(root: u32) -> Vec<(u32, u64)> {
     let mut parts: Vec<(u32, u64)> = descendants(root)
         .into_iter()
-        .chain(group_members(root))
         .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
+        .chain(group_vm_parts())
         .collect();
     parts.sort_unstable();
     parts.dedup();
@@ -386,8 +402,6 @@ impl Stack {
             .env("SANDY_ENV_PROVISION_TIMEOUT_SECS", PROVISION_SECS.to_string())
             .stdout(Stdio::from(std::fs::File::create(dir.path().join("sandyd.out"))?))
             .stderr(Stdio::from(std::fs::File::create(dir.path().join("sandyd.log"))?))
-            // Its own process group: teardown finds a re-parented child of the daemon by the group (#734).
-            .process_group(0)
             .spawn()
             .context("spawn sandyd")?;
         // From here the guard owns the daemon, so a failed start still stops it.
@@ -608,15 +622,10 @@ impl Stack {
             let _ = broker.kill();
             let _ = broker.wait();
         }
-        let sandyd_pid = self.sandyd.id();
-        let mut owned = descendants(sandyd_pid);
-        // Also the members of the daemon's process group: a child that was re-parented before this walk is not a
-        // descendant any more, and is still in the group (#734).
-        owned.extend(
-            group_members(sandyd_pid)
-                .into_iter()
-                .filter(|(pid, _)| *pid != sandyd_pid),
-        );
+        let mut owned = descendants(self.sandyd.id());
+        // Also the VM parts of the test's process group, taken now with the descendants: a child that was re-parented
+        // is not a descendant any more, and is still in the group (#734).
+        owned.extend(group_vm_parts());
         // A daemon that already exited died during the run: its children were re-parented, and every "no VM left"
         // answer since was blind. The status is reaped here, so it is reported once, and the pid is never signalled
         // (it may belong to another process now). The walk finds nothing, so the VM parts are found by the staging
@@ -624,12 +633,7 @@ impl Stack {
         let already_exited = match self.sandyd.try_wait() {
             Ok(Some(status)) => {
                 findings.push(format!("sandyd had already exited during the run: {status}"));
-                owned = vm_parts_using(&self.tmp);
-                owned.extend(
-                    group_members(sandyd_pid)
-                        .into_iter()
-                        .filter(|(pid, _)| *pid != sandyd_pid),
-                );
+                owned.extend(vm_parts_using(&self.tmp));
                 owned.sort_unstable();
                 owned.dedup();
                 true
@@ -823,6 +827,14 @@ fn ps_holds(needle: &str) -> Result<bool> {
 fn the_conformance_script_passes_against_the_real_stack_and_leaves_nothing() -> Result<()> {
     require_live()?;
     let stack = Stack::start()?;
+    eprintln!(
+        "process-group walk for re-parented VM parts: {}",
+        if leads_its_group() {
+            "on"
+        } else {
+            "off, the test does not lead its group"
+        }
+    );
     // A failure prints the daemon and broker logs first: the temp dir goes with the stack.
     let outcome = scenario(&stack).inspect_err(|_| {
         stack.dump_logs();
