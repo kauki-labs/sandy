@@ -949,8 +949,11 @@ pub async fn handle(
             // Whether this job's archive needs redacting is decided now, not when the
             // archive arrives: it can arrive after a terminal path released the credential.
             let credentialed = job_credential.is_some();
-            if let (Some(bracket), Some(credentials)) = (job_credential, registry.credentials()) {
-                credentials.adopt(&job_id, bracket);
+            if let (Some(bracket), Some(credentials), Some((trust_root, _))) =
+                (job_credential, registry.credentials(), &credential_request)
+            {
+                let (credentials, job_id, trust_root) = (Arc::clone(credentials), job_id.clone(), trust_root.clone());
+                tokio::task::spawn_blocking(move || credentials.adopt(&job_id, &trust_root, bracket)).await?;
             }
 
             // Best-effort: the job is already durably submitted, so a faulted write here is logged, not a

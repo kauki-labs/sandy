@@ -22,6 +22,8 @@ use std::{
 
 use sandy::{CredentialBracket, DirFingerprint, Scope, SharedProvider, StagingTarget};
 
+use crate::store::JobStore;
+
 /// The secret name the job sees the token under: the same name `sandy run
 /// --credential` injects.
 pub const CREDENTIAL_SECRET_NAME: &str = "GITHUB_TOKEN";
@@ -87,6 +89,17 @@ pub enum Redaction {
     Unavailable,
 }
 
+/// What [`JobCredentials::recover`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Jobs whose credential was revoked and whose staged file is gone.
+    pub revoked: Vec<String>,
+    /// Jobs whose credential had already expired: nothing to revoke, the record was dropped.
+    pub expired: Vec<String>,
+    /// Jobs whose revoke failed: the record stays, and the next start tries again.
+    pub failed: Vec<String>,
+}
+
 /// The daemon's credential configuration and the brackets of its live jobs.
 pub struct JobCredentials {
     resolver: Arc<dyn CredentialResolver>,
@@ -98,6 +111,8 @@ pub struct JobCredentials {
     call_timeout: Duration,
     /// Slots for releases running at once ([`MAX_CONCURRENT_RELEASES`]).
     release_slots: Arc<tokio::sync::Semaphore>,
+    /// Where each live credential's revocation record is kept, so a restarted daemon can revoke it (#830).
+    store: Option<Arc<JobStore>>,
     live: Mutex<HashMap<String, CredentialBracket>>,
 }
 
@@ -112,8 +127,17 @@ impl JobCredentials {
             staging_base: None,
             call_timeout: DAEMON_CALL_TIMEOUT,
             release_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RELEASES)),
+            store: None,
             live: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep each live credential's revocation record in `store` (#830): written when a job adopts its credential,
+    /// cleared once the revoke succeeds, read by [`JobCredentials::recover`] after a restart.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<JobStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Stage per-job dirs under `base` instead of the sandy staging base.
@@ -207,8 +231,11 @@ impl JobCredentials {
         )
     }
 
-    /// Hold `bracket` as `job_id`'s live credential until [`JobCredentials::release`].
-    pub fn adopt(&self, job_id: &str, bracket: CredentialBracket) {
+    /// Hold `bracket`, minted from trust root `trust_root`, as `job_id`'s live credential until
+    /// [`JobCredentials::release`]. Blocking when a store is set (it records the revocation state): call it from a
+    /// blocking task.
+    pub fn adopt(&self, job_id: &str, trust_root: &str, bracket: CredentialBracket) {
+        let _ = trust_root;
         let previous = self.lock_live().insert(job_id.to_owned(), bracket);
         if previous.is_some() {
             // Job ids are fresh UUIDs; a second adopt is a caller bug. The
@@ -265,6 +292,13 @@ impl JobCredentials {
             }
             Err(_) => teardown(),
         }
+    }
+
+    /// Revoke the credentials a previous daemon left behind and forget their records (#830). Blocking: run it on a
+    /// blocking task, after the control socket is bound.
+    #[must_use]
+    pub fn recover(&self) -> RecoveryReport {
+        RecoveryReport::default()
     }
 
     fn create_dir(&self) -> Result<sandy_fsutil::OwnedDir, sandy_fsutil::FsError> {
@@ -458,11 +492,14 @@ mod tests {
         let tmp = tempfile::tempdir().context("tempdir")?;
         let staging = tmp.path().join("staging");
         let provider = Arc::new(provider);
+        let store = Arc::new(open_store(tmp.path())?);
         let credentials = configure(
-            JobCredentials::new(Arc::new(FakeResolver(Arc::clone(&provider)))).with_staging_base(staging.clone()),
+            JobCredentials::new(Arc::new(FakeResolver(Arc::clone(&provider))))
+                .with_staging_base(staging.clone())
+                .with_store(Arc::clone(&store)),
         );
         Ok(Daemon {
-            store: Arc::new(open_store(tmp.path())?),
+            store,
             registry: Arc::new(JobRegistry::new()?.with_credentials(credentials)),
             hosts: Arc::new(HostRegistry::default()),
             provider,
@@ -1008,6 +1045,136 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        Ok(())
+    }
+
+    /// A restarted daemon: fresh credential state over the same store, resolver and staging base, as a new process
+    /// would have after a crash.
+    fn restarted<P: Observed>(d: &Daemon<P>) -> JobCredentials {
+        JobCredentials::new(Arc::new(FakeResolver(Arc::clone(&d.provider))))
+            .with_staging_base(d.staging.clone())
+            .with_store(Arc::clone(&d.store))
+            .with_call_timeout(WAIT)
+    }
+
+    async fn recover(credentials: JobCredentials) -> anyhow::Result<RecoveryReport> {
+        Ok(tokio::task::spawn_blocking(move || credentials.recover()).await?)
+    }
+
+    /// #830: a daemon that died holding a job's credential revokes it at the next start: once, with the staged file
+    /// and its dir removed and the record forgotten. A second start finds nothing.
+    #[tokio::test]
+    async fn a_restarted_daemon_revokes_the_credential_of_a_job_it_lost() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+        let record = d
+            .store
+            .credential_record(&submitted.job_id)?
+            .context("a live credential has a record before any crash")?;
+        assert_eq!(record.trust_root, "gh-test");
+        assert_eq!(record.token_path, path);
+        assert!(d.provider.revoked().is_empty(), "nothing is revoked while the job runs");
+
+        let report = recover(restarted(&d)).await?;
+
+        assert_eq!(report.revoked, [submitted.job_id.clone()]);
+        assert_eq!(d.provider.revoked().len(), 1, "revoked exactly once");
+        assert!(!path.exists(), "the staged token file is removed");
+        assert!(
+            !path.parent().is_some_and(std::path::Path::exists),
+            "the job's dir is removed"
+        );
+        assert_eq!(
+            d.store.credential_record(&submitted.job_id)?,
+            None,
+            "the record is forgotten"
+        );
+
+        let again = recover(restarted(&d)).await?;
+        assert_eq!(again, RecoveryReport::default(), "a second start finds nothing");
+        assert_eq!(d.provider.revoked().len(), 1);
+        Ok(())
+    }
+
+    /// #830: the normal path forgets the record too, so a clean run leaves nothing for the next start to revoke.
+    #[tokio::test]
+    async fn a_released_credential_leaves_no_record() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+        assert!(d.store.credential_record(&submitted.job_id)?.is_some());
+
+        cancel(&d, &submitted).await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        let deadline = Instant::now() + WAIT;
+        while d.store.credential_record(&submitted.job_id)?.is_some() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(d.store.credential_record(&submitted.job_id)?, None);
+        assert_eq!(recover(restarted(&d)).await?, RecoveryReport::default());
+        Ok(())
+    }
+
+    /// #830: a provider that fails the revoke at recovery is reported, the record stays for the next start, and the
+    /// staged token is still removed: nothing is silently dropped and the daemon still starts.
+    #[tokio::test]
+    async fn a_failing_revoke_at_recovery_keeps_the_record() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN).with_failing_revoke())?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+
+        let report = recover(restarted(&d)).await?;
+
+        assert_eq!(report.failed, [submitted.job_id.clone()]);
+        assert!(report.revoked.is_empty());
+        assert!(
+            d.store.credential_record(&submitted.job_id)?.is_some(),
+            "the record stays so the next start retries"
+        );
+        assert!(
+            !path.exists(),
+            "the staged token is removed even when the revoke failed"
+        );
+        Ok(())
+    }
+
+    /// #830: a record whose token has already expired needs no provider call (a GitHub revoke authenticates with
+    /// the token, which is dead): it is dropped and reported as expired.
+    #[tokio::test]
+    async fn an_expired_record_is_dropped_without_a_provider_call() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        d.store.insert_pending("old-job", b"m", "test/v1")?;
+        d.store.set_credential(
+            "old-job",
+            &crate::store::CredentialRecord {
+                trust_root: "gh-test".to_owned(),
+                handle_id: "h-old".to_owned(),
+                expires_at_unix: 1,
+                token_path: d.staging.join("cred-gone").join(CREDENTIAL_SECRET_NAME),
+            },
+        )?;
+
+        let report = recover(restarted(&d)).await?;
+
+        assert_eq!(report.expired, ["old-job"]);
+        assert!(d.provider.revoked().is_empty(), "an expired token is not revoked");
+        assert_eq!(d.store.credential_record("old-job")?, None);
         Ok(())
     }
 
