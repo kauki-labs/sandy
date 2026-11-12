@@ -2091,8 +2091,7 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   stops at once on a cancel. The job's deadline is not a reason to stop. The host handles dispatches one at a time, so
   a peer that read a frame every few seconds would otherwise hold the loop for days. A send cut short still reports
   `outputs_follow`, and the orchestrator ends the transfer on the closed link.
-- Nothing receives them yet: the sandyd side (receive, a per-job rendezvous that holds the job non-terminal) is 6c-2.
-||||||| parent of af328a72 (feat(sandyd): receive a job's outputs over the data link and record the job once they are in place (refs #482))
+- The sandyd side (the receive and the per-job rendezvous that holds the job non-terminal) is slice 6c-2, below.
 
 ### Slice 6c-2: the sandyd side of the output transfer
 
