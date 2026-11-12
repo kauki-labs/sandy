@@ -185,14 +185,18 @@ async fn forward_chunks(
     rx: &mut tokio::sync::mpsc::Receiver<InputChunk>,
     read_timeout: Duration,
 ) -> Result<(), SendError> {
-    let _ = read_timeout;
-    while let Some(chunk) = rx.recv().await {
-        let message = DataLinkMessage {
-            op: Some(Op::InputChunk(chunk)),
-        };
-        write(link, &message).await?;
+    loop {
+        match tokio::time::timeout(read_timeout, rx.recv()).await {
+            Ok(Some(chunk)) => {
+                let message = DataLinkMessage {
+                    op: Some(Op::InputChunk(chunk)),
+                };
+                write(link, &message).await?;
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => return Err(SendError::ReadTimedOut),
+        }
     }
-    Ok(())
 }
 
 /// The receiver's own name rule (`DataLinkMessage::validate`), applied to a name before any chunk carries it.
@@ -278,6 +282,10 @@ impl Walk<'_> {
     /// Send every file below `dir`. An empty subdirectory has no wire form (#756) and is skipped.
     fn tree(&mut self, prefix: &str, dir: &Beneath) -> Result<(), SendError> {
         for entry in dir.entries()? {
+            // A walk over directories with no files hands nothing over, so it checks the writer itself.
+            if self.tx.is_closed() {
+                return Err(SendError::Stopped);
+            }
             let (name, kind) = entry?;
             let name = name.to_str().ok_or(SendError::UnsupportedEntry)?;
             let wire = format!("{prefix}/{name}");

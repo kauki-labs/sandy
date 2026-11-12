@@ -184,8 +184,18 @@ async fn serve_data_link(
     limits: crate::data_link_recv::ReceiveLimits,
 ) {
     let owed = !job.data_outputs.is_empty();
-    match crate::data_link_send::send_inputs(conn, &job.data_inputs, crate::data_link_send::SendLimits::default()).await
-    {
+    // The job ending (a cancel, an invalidated link, a result) decides the slot, so it also stops the send: dropping
+    // the send closes the reader's channel and the link, and a stalled peer cannot hold this task to the write timeout
+    // (#772). The slot is published for a job that owes no outputs too.
+    let sent = tokio::select! {
+        biased;
+        () = job.outputs.decided() => {
+            tracing::info!("mesh accept loop: the job ended during the input send; stopping it");
+            return;
+        }
+        sent = crate::data_link_send::send_inputs(conn, &job.data_inputs, crate::data_link_send::SendLimits::default()) => sent,
+    };
+    match sent {
         Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "mesh accept loop: inputs sent"),
         Err(e) => {
             tracing::warn!(error = %e, "mesh accept loop: the input send failed");
