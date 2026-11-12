@@ -56,6 +56,13 @@ pub struct FileId {
     pub ino: u64,
 }
 
+/// A device or inode number as the `u64` of a [`FileId`], keeping its bits: a negative `i32` device (a major number of
+/// 128 or more on macOS) becomes the same `u64` the standard library's `MetadataExt::dev` gives, not an error.
+#[allow(dead_code, reason = "file_id switches to it in the next commit")]
+fn wrap_u64(_value: i128) -> u64 {
+    0
+}
+
 /// A directory opened without following a symlink, to read or write beneath.
 #[derive(Debug)]
 pub struct Beneath {
@@ -835,5 +842,18 @@ mod tests {
         assert_ne!(link, target, "a symlink is not followed: it has its own id");
         assert!(matches!(held.file_id(name("a/b")), Err(FsError::Unsafe { .. })));
         Ok(())
+    }
+
+    /// A device number keeps its bits when it becomes a `u64`: a negative `i32` is its two's complement, as
+    /// `MetadataExt::dev` reports it, and a `u64` is itself.
+    #[test]
+    fn wrap_u64_keeps_the_bits_of_a_device_number() {
+        assert_eq!(wrap_u64(5), 5);
+        assert_eq!(wrap_u64(i128::from(u64::MAX)), u64::MAX);
+        assert_eq!(wrap_u64(-1), u64::MAX);
+        assert_eq!(
+            wrap_u64(i128::from(i32::MIN)),
+            u64::from_ne_bytes(i64::from(i32::MIN).to_ne_bytes())
+        );
     }
 }

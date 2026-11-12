@@ -372,9 +372,7 @@ fn commit(current: &InFlight, completed: &std::sync::Mutex<HashSet<sandy_fsutil:
         return Err(ReceiveError::Alias);
     }
     dir.rename(temp, &current.name)?;
-    if let Some(id) = mine {
-        completed.lock().map_err(|_| poisoned())?.insert(id);
-    }
+    let _ = mine; // red: the completed file's identity is not recorded yet
     Ok(())
 }
 
@@ -1128,6 +1126,48 @@ mod tests {
             "the completed file must not be replaced"
         );
         assert!(!dest.path().join(&temp).exists(), "the temp file is removed");
+        Ok(())
+    }
+
+    /// A finished-looking file in flight: a temp file written in `dest`, held the way the receive holds one.
+    async fn in_flight(dest: &Path, name: &str, temp: &str, body: &[u8]) -> anyhow::Result<InFlight> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = Beneath::open_dir(dest).context("open dest")?;
+        let temp = OsString::from(temp);
+        let mut file = tokio::fs::File::from_std(dir.create_new_file(&temp).context("temp file")?);
+        file.write_all(body).await.context("write")?;
+        Ok(InFlight {
+            key: (0, name.to_owned()),
+            name: OsString::from(name),
+            file,
+            cleanup: Cleanup::new(dir, temp),
+        })
+    }
+
+    /// The record side of the check: a file the receive completes is remembered by identity, so a later file whose
+    /// target is another name of it is refused. `a` is finished for real, a hard link `b` is made to it, and finishing
+    /// `b` must be an `Alias`. Without the receive recording `a`'s id, the second rename goes through on any
+    /// filesystem.
+    #[tokio::test]
+    async fn a_completed_file_is_remembered_so_a_hard_link_to_it_is_refused() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let mut receive = Receive::new(&[], quick());
+
+        receive.current = Some(in_flight(dest.path(), "a", ".sandy-recv-t1", b"first").await?);
+        receive.finish_file().await.context("finish a")?;
+        std::fs::hard_link(dest.path().join("a"), dest.path().join("b")).context("hard link")?;
+
+        receive.current = Some(in_flight(dest.path(), "b", ".sandy-recv-t2", b"second").await?);
+        let finished = receive.finish_file().await;
+        assert!(matches!(finished, Err(ReceiveError::Alias)), "got {finished:?}");
+        assert_eq!(std::fs::read(dest.path().join("a")).context("read a")?, b"first");
+        assert_eq!(
+            std::fs::read(dest.path().join("b")).context("read b")?,
+            b"first",
+            "b is a hard link to a and must not have been replaced"
+        );
+        assert!(!dest.path().join(".sandy-recv-t2").exists(), "the temp file is removed");
         Ok(())
     }
 
