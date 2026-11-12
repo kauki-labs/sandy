@@ -139,6 +139,7 @@ fn to_wire_capabilities(
     status: &ContainmentStatus,
     vm_available: bool,
     shares_submitter_filesystem: bool,
+    egress_proxy: bool,
 ) -> sandy_executor_proto::Capabilities {
     let process_kind = match capabilities.kind {
         SandboxKind::Process => sandy_executor_proto::SandboxKind::Process,
@@ -162,7 +163,8 @@ fn to_wire_capabilities(
             .collect(),
         shares_submitter_filesystem,
         transfer: false,
-        egress_proxy: false,
+        // Declared only with VM capability: a process job has no egress boundary to apply a policy with.
+        egress_proxy: vm_available && egress_proxy,
     }
 }
 
@@ -183,6 +185,18 @@ fn shares_submitter_filesystem_from_env() -> bool {
 /// this crate's lints forbid `unsafe_code`, so a test never does that here —
 /// see `sandy::nix::topology`'s own doc on the same constraint).
 fn shares_submitter_filesystem_from(value: Option<&str>) -> bool {
+    declared(value)
+}
+
+/// Whether the operator declared that this host's VM path can run a job behind the egress proxy
+/// (`SANDY_HOST_EGRESS_PROXY=1`, A1 of #483): the proxy binary and its guest agent are deployed. Never
+/// auto-detected, and the fail-closed default is `false`, so no job with an egress policy is placed here.
+fn egress_proxy_from(value: Option<&str>) -> bool {
+    declared(value)
+}
+
+/// An operator declaration: `1`, `true` or `yes`, case-insensitive; anything else, or unset, is not declared.
+fn declared(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes"
@@ -206,6 +220,7 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
         &status,
         detect_vm_capability(),
         shares_submitter_filesystem_from_env(),
+        egress_proxy_from(std::env::var("SANDY_HOST_EGRESS_PROXY").ok().as_deref()),
     ))
 }
 
@@ -448,7 +463,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, false, false);
+        let wire = to_wire_capabilities(capabilities, &status, false, false, false);
         assert_eq!(
             wire.supported_isolation_classes,
             vec![i32::from(IsolationClass::Trusted)]
@@ -476,7 +491,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, true, false);
+        let wire = to_wire_capabilities(capabilities, &status, true, false, false);
         assert_eq!(
             wire.supported_sandbox_kinds,
             vec![
@@ -517,8 +532,37 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, false, true);
+        let wire = to_wire_capabilities(capabilities, &status, false, true, false);
         assert!(wire.shares_submitter_filesystem);
+    }
+
+    /// A1 (#483): `egress_proxy` needs both the operator's declaration and a VM path. A process-only host never
+    /// declares it, whatever the flag says, and a VM host without the flag does not either.
+    #[test]
+    fn egress_proxy_is_declared_only_by_a_vm_host_whose_operator_asked() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = || Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        for (vm, flag, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let wire = to_wire_capabilities(capabilities(), &status, vm, false, flag);
+            assert_eq!(wire.egress_proxy, want, "vm={vm} flag={flag}");
+        }
+        for value in ["1", "true", "YES", " yes "] {
+            assert!(egress_proxy_from(Some(value)), "{value:?} declares it");
+        }
+        for value in [Some("0"), Some("no"), Some(""), Some("enabled"), None] {
+            assert!(!egress_proxy_from(value), "{value:?} does not");
+        }
     }
 
     /// Adversarial (#332): every one of qemu/nix/kvm/vhost-vsock/
