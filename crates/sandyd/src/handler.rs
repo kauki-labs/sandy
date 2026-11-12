@@ -123,29 +123,48 @@ fn credential_placement_refusal() -> String {
 /// Refuse a Submit that names an input or an output the data link would refuse (#807, #764), before placement or any
 /// job: the same rule the sender and the receiver apply (`DataLinkMessage::validate`), so a name that cannot cross the
 /// mesh, or that would leave the staging root, fails here with the field named, not on a host after a transfer began.
-/// An output with no name is the catch-all and has no name to check.
+/// Two names in one field that are equal, or one nested inside the other (`a` and `a/b`), clash the same way the
+/// sender and the staging root refuse them. An output with no name is the catch-all and has no name to check.
 fn transfer_name_refusal(submit: &SubmitRequest) -> Option<String> {
-    let inputs = submit.inputs.iter().map(|input| ("inputs", input.name.as_str()));
-    let outputs = submit
+    let inputs: Vec<&str> = submit.inputs.iter().map(|input| input.name.as_str()).collect();
+    let outputs: Vec<&str> = submit
         .outputs
         .iter()
         .filter_map(|output| output.name.as_deref())
-        .map(|name| ("outputs", name));
-    inputs.chain(outputs).find_map(|(field, name)| {
+        .collect();
+    [("inputs", inputs), ("outputs", outputs)]
+        .into_iter()
+        .find_map(|(field, names)| field_name_refusal(field, &names))
+}
+
+fn field_name_refusal(field: &str, names: &[&str]) -> Option<String> {
+    for name in names {
         let probe = sandy_executor_proto::DataLinkMessage {
             op: Some(sandy_executor_proto::data_link_message::Op::InputChunk(
                 sandy_executor_proto::InputChunk {
-                    name: name.to_owned(),
+                    name: (*name).to_owned(),
                     offset: 0,
                     bytes: Vec::new(),
                 },
             )),
         };
-        probe
-            .validate()
-            .err()
-            .map(|e| format!("{field}: the name {name:?} is not a plain relative path the data link accepts: {e}"))
-    })
+        if let Err(e) = probe.validate() {
+            return Some(format!(
+                "{field}: the name {name:?} is not a plain relative path the data link accepts: {e}"
+            ));
+        }
+    }
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            let nested = |outer: &str, inner: &str| inner.strip_prefix(outer).is_some_and(|rest| rest.starts_with('/'));
+            if a == b || nested(a, b) || nested(b, a) {
+                return Some(format!(
+                    "{field}: the names {a:?} and {b:?} clash (equal, or one inside the other)"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
