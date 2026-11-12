@@ -377,7 +377,8 @@ async fn relay_dispatches(
                 match frame {
                     Some(Ok(Some(message))) => match message.op {
                         Some(host_executor_message::Op::Result(result)) => {
-                            record_job_result(store, job_registry, &mut in_flight, result).await;
+                            // Ignored until the wiring lands (red).
+                            let _awaited = record_job_result(store, job_registry, &mut in_flight, result).await;
                         }
                         // Stage 1 has no re-registration or capability-update
                         // machinery (#269): any other frame from the
@@ -484,7 +485,7 @@ async fn record_job_result(
     job_registry: &JobRegistry,
     in_flight: &mut HashSet<String>,
     result: JobResult,
-) {
+) -> Option<AwaitedOutputs> {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
     // Only a job dispatched on this connection may have its credential ended
@@ -497,7 +498,7 @@ async fn record_job_result(
             job_id,
             "a job result arrived for a job not dispatched on this connection; ignored"
         );
-        return;
+        return None;
     }
 
     let store = Arc::clone(store);
@@ -536,6 +537,31 @@ async fn record_job_result(
     }
     // The job is over on its host whatever the store said: revoke its credential (#481).
     job_registry.release_credential(&job_id);
+    None
+}
+
+/// A succeeded job whose outputs are still owed (#482 slice 6c-2): its terminal status waits for the receive.
+#[derive(Debug)]
+#[allow(dead_code, reason = "a stub until the wiring lands (red)")]
+pub(crate) struct AwaitedOutputs {
+    job_id: String,
+}
+
+#[allow(dead_code, reason = "a stub until the wiring lands (red)")]
+impl AwaitedOutputs {
+    /// The awaited job.
+    pub(crate) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// Wait for the outputs, at most `within`, then record the job's terminal status.
+    pub(crate) async fn settle(
+        self,
+        _store: &Arc<JobStore>,
+        _job_registry: &JobRegistry,
+        _within: std::time::Duration,
+    ) {
+    }
 }
 
 /// Fail a job whose host-executor disconnected before reporting a result
@@ -1676,6 +1702,142 @@ mod tests {
 
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(5), serve).await??;
+        Ok(())
+    }
+
+    /// A registered, running job that declares one output, as a `transfer` host's job would.
+    async fn job_owing_outputs(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) -> anyhow::Result<()> {
+        store.insert_pending(job_id, b"m", "test/v1")?;
+        store.mark_running(job_id)?;
+        let mut job = crate::dispatch::mint_job_channel(job_id, job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.data_outputs = vec![sandy_executor_proto::Output {
+            name: Some("out".to_owned()),
+            dest: "/nowhere".to_owned(),
+        }];
+        job_registry.insert(job_id.to_owned(), job);
+        Ok(())
+    }
+
+    fn result_for(job_id: &str, exit_code: i32, outputs_follow: bool) -> JobResult {
+        JobResult {
+            job_id: job_id.to_owned(),
+            booted: true,
+            exit_code: Some(exit_code),
+            timed_out: false,
+            transport_error: None,
+            console: String::new(),
+            outputs_follow,
+        }
+    }
+
+    const SOON: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// #482 slice 6c-2: a succeeded job that owes outputs is not terminal when its result arrives; it is terminal
+    /// once the receive says the outputs are in place.
+    #[tokio::test]
+    async fn a_succeeded_job_that_owes_outputs_is_terminal_once_they_arrive() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
+            .await
+            .context("a job that owes outputs must wait for them")?;
+        assert_eq!(awaited.job_id(), "job-1");
+        assert_eq!(
+            store.status("job-1")?,
+            Some(JobStatus::Running),
+            "not terminal before the outputs"
+        );
+        assert!(
+            in_flight.contains("job-1"),
+            "still in flight: a disconnect must still fail it"
+        );
+
+        let job = job_registry.get("job-1").context("registered")?;
+        job.outputs.publish(crate::output_slot::OutputsState::Received(
+            crate::data_link_recv::Received { files: 1, bytes: 3 },
+        ));
+        awaited.settle(&store, &job_registry, SOON).await;
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
+        Ok(())
+    }
+
+    /// A job whose outputs failed to arrive is a failure, never a success with missing outputs.
+    #[tokio::test]
+    async fn a_failed_receive_fails_the_job() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
+            .await
+            .context("owed")?;
+        let job = job_registry.get("job-1").context("registered")?;
+        job.outputs
+            .publish(crate::output_slot::OutputsState::Failed("the link closed".to_owned()));
+        awaited.settle(&store, &job_registry, SOON).await;
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        Ok(())
+    }
+
+    /// Outputs that never arrive do not hold the job forever.
+    #[tokio::test]
+    async fn outputs_that_never_arrive_fail_the_job_at_the_wait_limit() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
+            .await
+            .context("owed")?;
+        awaited
+            .settle(&store, &job_registry, std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        Ok(())
+    }
+
+    /// sandyd decides from its own record of what the job declared. A host that reports nothing follows for a job
+    /// that owes outputs is wrong, and the job is not a success.
+    #[tokio::test]
+    async fn a_host_that_says_nothing_follows_for_a_job_that_owes_outputs_fails_it_at_once() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, false)).await;
+        assert!(awaited.is_none(), "nothing to wait for: the host says nothing follows");
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        assert!(!in_flight.contains("job-1"));
+        Ok(())
+    }
+
+    /// A failed run sends no outputs, so there is nothing to wait for.
+    #[tokio::test]
+    async fn a_failed_run_that_owes_outputs_is_terminal_at_once() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 1, false)).await;
+        assert!(awaited.is_none());
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        Ok(())
+    }
+
+    /// The host's flag alone never makes sandyd wait: a job that declared no outputs finishes at once.
+    #[tokio::test]
+    async fn a_job_that_owes_nothing_is_terminal_at_once_whatever_the_host_flag_says() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job_registry.insert("job-1".to_owned(), job);
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true)).await;
+        assert!(awaited.is_none());
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
         Ok(())
     }
 }
