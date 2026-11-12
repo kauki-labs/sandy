@@ -1196,6 +1196,49 @@ mod tests {
         Ok(())
     }
 
+    /// A named output whose staged root is a file (the guest replaced the output directory with a file) is the one case
+    /// the overlap acceptance test does not cover: local collection writes the file to the destination itself, and the
+    /// received file must be the same bytes at the same place (#783).
+    #[tokio::test]
+    async fn a_named_file_output_equals_the_locally_collected_file() -> anyhow::Result<()> {
+        let src = tempfile::tempdir().context("src")?;
+        std::fs::write(src.path().join("report"), b"payload").context("staged file")?;
+        let local = tempfile::tempdir().context("local dest")?;
+        let remote = tempfile::tempdir().context("remote dest")?;
+
+        let local_outputs = [sandy::Output {
+            name: Some("report".to_owned()),
+            dest: local.path().join("out.bin"),
+        }];
+        sandy::collect_outputs(&local_outputs, src.path(), false).context("local collection")?;
+
+        let outputs = [out(Some("report"), &remote.path().join("out.bin"))];
+        let (received, _peer) = run(&[chunk(0, "report", b"payload"), end()], &outputs, quick(), false).await?;
+        received.context("the receive")?;
+
+        assert_eq!(tree(local.path())?, files(&[("out.bin", b"payload")]));
+        assert_eq!(tree(remote.path())?, tree(local.path())?);
+        Ok(())
+    }
+
+    /// The receiver trusts `Dispatch.outputs[].dest`: a symlink in an ancestor of a destination is followed, as local
+    /// collection does, because the ancestors are resolved by path (#607) and the caller passes only Submit-validated
+    /// destinations. This pins that behaviour, so a change to it is a decision and not an accident (#784).
+    #[tokio::test]
+    async fn a_symlink_in_an_ancestor_of_the_destination_is_followed_like_local_collection() -> anyhow::Result<()> {
+        let base = tempfile::tempdir().context("base")?;
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).context("real")?;
+        symlink(&real, base.path().join("link")).context("ancestor link")?;
+        let outputs = [out(None, &base.path().join("link/out"))];
+
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &outputs, quick(), false).await?;
+        received.context("the receive")?;
+
+        assert_eq!(std::fs::read(real.join("out/x.txt")).context("through the link")?, b"X");
+        Ok(())
+    }
+
     /// A runtime with one blocking-pool thread, so a test can occupy it and see which work waits for the pool.
     fn runtime_with_one_blocking_thread() -> anyhow::Result<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_multi_thread()
