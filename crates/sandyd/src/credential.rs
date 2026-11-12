@@ -924,6 +924,48 @@ mod tests {
         Ok(())
     }
 
+    /// A2 (#483, sandy-5e F2' on #828): the message is redacted whole, then cut to its tail. Cut first, a token that
+    /// straddles the cut survives as a suffix the whole-token match misses.
+    #[tokio::test]
+    async fn a_token_straddling_the_message_cut_is_redacted_before_the_cut() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_host_with(&d, "host-1", capabilities(true)).await?;
+        let submitted = match submit(&d, submit_req(Some("gh-test"), Vec::new())).await? {
+            control_response::Result::Submit(ok) => ok,
+            other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
+        };
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+
+        // The message is 4 KiB when cut to its tail, so this one starts the cut halfway through the token.
+        let filler = "z".repeat(4096 - TOKEN.len() / 2);
+        sandy_control_proto::write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: None,
+                    timed_out: false,
+                    transport_error: Some(format!("{TOKEN}{filler}")),
+                    console: String::new(),
+                    outputs_follow: false,
+                })),
+            },
+        )
+        .await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        wait_status(&d, &submitted.job_id, JobStatus::Failed).await?;
+
+        let json = d.store.envelope_json(&submitted.job_id)?.unwrap_or_default();
+        let half = &TOKEN[TOKEN.len() / 2..];
+        assert!(!json.contains(half), "a suffix of the token survived the cut: {half:?}");
+
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
     /// Acceptance 5: a revoke failure is surfaced in the daemon log, naming the
     /// job, and the staged file is still removed.
     #[tokio::test]
