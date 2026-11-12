@@ -2042,7 +2042,7 @@ mod tests {
             Status,
             bool,
         );
-        let rows: [Row<'_>; 5] = [
+        let rows: [Row<'_>; 6] = [
             (
                 "exit 0",
                 true,
@@ -2087,6 +2087,17 @@ mod tests {
                 "never booted",
                 false,
                 None,
+                false,
+                None,
+                JobStatus::Failed,
+                Status::Failed,
+                true,
+            ),
+            // #829: a result that says it never booted cannot be a success, whatever exit code it carries.
+            (
+                "never booted, exit 0",
+                false,
+                Some(0),
                 false,
                 None,
                 JobStatus::Failed,
