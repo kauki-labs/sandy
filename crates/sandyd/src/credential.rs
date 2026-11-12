@@ -511,13 +511,21 @@ mod tests {
         d: &Daemon<P>,
         host_id: &str,
     ) -> anyhow::Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<()>)> {
+        connect_host_with(d, host_id, capabilities(true)).await
+    }
+
+    async fn connect_host_with<P>(
+        d: &Daemon<P>,
+        host_id: &str,
+        capabilities: Capabilities,
+    ) -> anyhow::Result<(tokio::io::DuplexStream, tokio::task::JoinHandle<()>)> {
         let (mut client, server) = tokio::io::duplex(1 << 16);
         sandy_control_proto::write_frame(
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Register(Register {
                     host_id: host_id.to_owned(),
-                    capabilities: Some(capabilities(true)),
+                    capabilities: Some(capabilities),
                 })),
             },
         )
@@ -741,6 +749,63 @@ mod tests {
         .await?;
         wait_status(&d, &submitted.job_id, JobStatus::Succeeded).await?;
         wait_revoked_and_removed(&d, &path).await?;
+
+        drop(client);
+        tokio::time::timeout(WAIT, serve).await??;
+        Ok(())
+    }
+
+    /// #481 with #482: a job whose outputs follow is not terminal when its result arrives, but its credential is
+    /// no longer needed: the run is over. The token must be revoked and its file removed then, not when the outputs
+    /// settle (up to `OUTPUTS_WAIT` later).
+    #[tokio::test]
+    async fn a_job_awaiting_its_outputs_releases_its_credential_when_the_run_ends() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let (mut client, serve) = connect_host_with(
+            &d,
+            "host-1",
+            Capabilities {
+                transfer: true,
+                ..capabilities(true)
+            },
+        )
+        .await?;
+        let mut request = submit_req(Some("gh-test"), Vec::new());
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.outputs = vec![sandy_control_proto::Output {
+                name: Some("result".to_owned()),
+                dest: "/out".to_owned(),
+            }];
+        }
+        let submitted = match submit(&d, request).await? {
+            control_response::Result::Submit(ok) => ok,
+            other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
+        };
+        let dispatch = read_dispatch(&mut client).await?;
+        let path = staged_token_path(&dispatch)?;
+
+        sandy_control_proto::write_frame(
+            &mut client,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Result(JobResult {
+                    job_id: submitted.job_id.clone(),
+                    booted: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    transport_error: None,
+                    console: String::new(),
+                    outputs_follow: true,
+                })),
+            },
+        )
+        .await?;
+        wait_revoked_and_removed(&d, &path).await?;
+        assert_eq!(d.registry.credentials().map(|c| c.live_count()), Some(0));
+        assert_eq!(
+            d.store.status(&submitted.job_id)?,
+            Some(JobStatus::Running),
+            "the job itself still waits for its outputs"
+        );
 
         drop(client);
         tokio::time::timeout(WAIT, serve).await??;
