@@ -403,6 +403,39 @@ mod tests {
         Ok(())
     }
 
+    /// A bad declared name later in the list is refused before the first input's chunks go out (#770): the up-front
+    /// check covers every declared name, not only the one being walked.
+    #[tokio::test]
+    async fn a_bad_second_declared_name_is_refused_before_the_first_input_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("good"), b"1")?;
+        write(&source.path().join("other"), b"2")?;
+        let bad = sandy_executor_proto::Input {
+            name: "a/../b".to_owned(),
+            ..input(source.path(), "other")
+        };
+        assert_refused_before_any_chunk(&[input(source.path(), "good"), bad]).await
+    }
+
+    /// Declared `a` and `a/b` clash on the receiver (a name is both a file and a directory) after bytes moved: refused
+    /// up front, in either order.
+    #[tokio::test]
+    async fn a_declared_name_inside_another_declared_name_is_refused_before_anything_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("one"), b"1")?;
+        write(&source.path().join("two"), b"2")?;
+        let outer = sandy_executor_proto::Input {
+            name: "a".to_owned(),
+            ..input(source.path(), "one")
+        };
+        let inner = sandy_executor_proto::Input {
+            name: "a/b".to_owned(),
+            ..input(source.path(), "two")
+        };
+        assert_refused_before_any_chunk(&[outer.clone(), inner.clone()]).await?;
+        assert_refused_before_any_chunk(&[inner, outer]).await
+    }
+
     /// A file inside a tree gets a wire name `<input>/<path>`; one that is too long for the receiver is refused
     /// before any of its own chunks, and the peer is told (#770). Files found earlier in the walk may already be out.
     #[tokio::test]
