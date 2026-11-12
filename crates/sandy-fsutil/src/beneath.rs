@@ -58,9 +58,12 @@ pub struct FileId {
 
 /// A device or inode number as the `u64` of a [`FileId`], keeping its bits: a negative `i32` device (a major number of
 /// 128 or more on macOS) becomes the same `u64` the standard library's `MetadataExt::dev` gives, not an error.
-#[allow(dead_code, reason = "file_id switches to it in the next commit")]
-fn wrap_u64(_value: i128) -> u64 {
-    0
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the wrap is the point: the bits of the value are kept"
+)]
+fn wrap_u64(value: i128) -> u64 {
+    value as u64
 }
 
 /// A directory opened without following a symlink, to read or write beneath.
@@ -136,8 +139,9 @@ impl Beneath {
         Ok(EntryKind::of(stat.st_mode))
     }
 
-    /// The identity of the entry `name`, or `None` when there is no such entry. A symlink is not followed: its own id
-    /// is returned.
+    /// The identity of the entry `name`, or `None` when there is no such entry, or when the filesystem reports no
+    /// inode for it (0, as some FUSE and 9p mounts do: the assumption is that such an entry cannot be told apart from
+    /// another, so it has no id). A symlink is not followed: its own id is returned.
     ///
     /// # Errors
     ///
@@ -147,10 +151,15 @@ impl Beneath {
         let path = self.path.join(name);
         match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => {
-                // `st_dev` is a `u64` on Linux and an `i32` on macOS; a value that does not fit is an overflow error.
-                #[allow(clippy::useless_conversion, reason = "st_dev is u64 on Linux and i32 on macOS")]
-                let dev = u64::try_from(stat.st_dev).map_err(|_| FsError::io("stat entry", &path, Errno::OVERFLOW))?;
-                Ok(Some(FileId { dev, ino: stat.st_ino }))
+                // Some filesystems (FUSE, 9p mounts) report no inode: 0 is "no id", never a key two files could share.
+                if stat.st_ino == 0 {
+                    return Ok(None);
+                }
+                // `st_dev` is a `u64` on Linux and an `i32` on macOS; the bits are kept either way.
+                Ok(Some(FileId {
+                    dev: wrap_u64(i128::from(stat.st_dev)),
+                    ino: stat.st_ino,
+                }))
             }
             Err(Errno::NOENT) => Ok(None),
             Err(e) => Err(FsError::io("stat entry", &path, e)),

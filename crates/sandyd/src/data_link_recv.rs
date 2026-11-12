@@ -372,7 +372,9 @@ fn commit(current: &InFlight, completed: &std::sync::Mutex<HashSet<sandy_fsutil:
         return Err(ReceiveError::Alias);
     }
     dir.rename(temp, &current.name)?;
-    let _ = mine; // red: the completed file's identity is not recorded yet
+    if let Some(id) = mine {
+        completed.lock().map_err(|_| poisoned())?.insert(id);
+    }
     Ok(())
 }
 

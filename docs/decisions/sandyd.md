@@ -2032,7 +2032,9 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - A rename onto a file this receive already completed is refused with `Alias`, decided by file identity (device and
   inode, `Beneath::file_id`), not by name: on a case-insensitive destination `a` then `A` name one file, and the second
   would replace the first while the receive counts two, but on a case-sensitive one they are two files, as local
-  collection copies them. A file that existed before the transfer is still replaced (#787).
+  collection copies them. A file that existed before the transfer is still replaced (#787). This differs from local
+  collection, which on a case-insensitive filesystem overwrites `a` with `A` without a word: the receive refuses, since
+  it reports a count of files written. An entry whose filesystem reports no inode has no id and is not checked.
 - A receive is also bounded in total: `DEFAULT_TOTAL` (30 minutes, as the host's input pull) ends it with
   `TotalDeadline` however steadily frames arrive, and `max_frames` (twice the entries plus one chunk per
   `MAX_CHUNK_BYTES` of the byte cap) ends it with `TooManyFrames`, so a peer cannot hold the link and an open file
