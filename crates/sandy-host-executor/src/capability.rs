@@ -167,7 +167,7 @@ fn to_wire_capabilities(
             .map(Into::into)
             .collect(),
         shares_submitter_filesystem,
-        transfer: false,
+        transfer,
         // Declared only with VM capability: a process job has no egress boundary to apply a policy with.
         egress_proxy: vm_available && egress_proxy,
     }
@@ -205,7 +205,11 @@ fn egress_proxy_from(value: Option<&str>) -> bool {
 /// auto-detected, fail-closed like the other declarations, but a value that is neither a yes nor a no spelling is
 /// refused by name rather than read as `false`.
 fn transfer_from(value: Option<&str>) -> Result<bool, DetectError> {
-    Ok(declared(value))
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "0" | "false" | "no") => Ok(false),
+        Some("1" | "true" | "yes") => Ok(true),
+        Some(_) => Err(DetectError::InvalidTransferFlag(value.unwrap_or_default().to_owned())),
+    }
 }
 
 /// An operator declaration: `1`, `true` or `yes`, case-insensitive; anything else, or unset, is not declared.
