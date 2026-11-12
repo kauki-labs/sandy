@@ -1426,6 +1426,42 @@ mod tests {
         Ok(())
     }
 
+    /// #772: a job that ends (cancelled or invalidated) during a large input send stops the send. The peer reads
+    /// nothing, so the write blocks; without the job's end as a stop signal the serve waits for the write timeout.
+    /// The job declares inputs only: the end must stop the send for a job that owes no outputs too.
+    #[tokio::test]
+    async fn a_job_that_ends_during_the_input_send_stops_the_send() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        std::fs::write(source.path().join("big"), vec![7u8; 8 * 1024 * 1024]).context("big input")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = crate::dispatch::mint_job_channel("job-1", registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.remote_link = Some(RemoteLink::with_token(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            marker_token("send-end-agent"),
+        ));
+        job.data_inputs = vec![sandy_executor_proto::Input {
+            host: source.path().join("big").to_string_lossy().into_owned(),
+            name: "big".to_owned(),
+            guest_path: None,
+        }];
+        registry.insert("job-1".to_owned(), job);
+        let job = registry.get("job-1").context("registered")?;
+        // A small buffer and a peer that never reads: the send blocks on its first frames.
+        let (_peer, mut local) = tokio::io::duplex(1024);
+        let serving = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        registry.invalidate_remote_link("job-1");
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+            .await
+            .context("the job ended but the input send kept running")??;
+        Ok(())
+    }
+
     /// The job ending mid-receive drops the receive, and the file it had in flight goes with it.
     #[tokio::test]
     async fn a_job_that_ends_mid_receive_leaves_no_partial_file() -> anyhow::Result<()> {

@@ -28,6 +28,10 @@ use tokio::io::AsyncWrite;
 /// accept task, for ever.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default [`SendLimits::read_timeout`]: one chunk is at most `MAX_CHUNK_BYTES`, so a read that takes this long is
+/// stalled, not slow.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The caps one send enforces. The default is the §22 pair; a test lowers them.
 #[derive(Debug, Clone, Copy)]
 pub struct SendLimits {
@@ -35,6 +39,9 @@ pub struct SendLimits {
     pub max_bytes: u64,
     /// The most entries the send counts: files plus the directories the receiver creates for their names.
     pub max_entries: usize,
+    /// The longest the writer waits for the reader thread's next chunk. A stalled source (an NFS or FUSE read) holds
+    /// that thread; this frees the link and the accept task (#769).
+    pub read_timeout: Duration,
 }
 
 impl Default for SendLimits {
@@ -42,6 +49,7 @@ impl Default for SendLimits {
         Self {
             max_bytes: MAX_TRANSFER_BYTES,
             max_entries: MAX_TRANSFER_ENTRIES,
+            read_timeout: READ_TIMEOUT,
         }
     }
 }
@@ -61,6 +69,9 @@ pub enum SendError {
     /// Writing to the link failed or timed out: the peer is gone or stopped reading.
     #[error("writing to the data link: {0}")]
     Link(#[from] FrameError),
+    /// The reader thread produced no chunk within [`SendLimits::read_timeout`]: a source read is stalled (#769).
+    #[error("reading an input stalled past the read timeout")]
+    ReadTimedOut,
     /// The write of one frame took longer than [`WRITE_TIMEOUT`].
     #[error("the data link did not accept a frame within the write timeout")]
     WriteTimedOut,
@@ -105,7 +116,7 @@ impl SendError {
     pub fn peer_reason(&self) -> &'static str {
         match self {
             Self::Link(_) | Self::WriteTimedOut | Self::Stopped => "the sender's link failed",
-            Self::Source(_) | Self::Read(_) => "an input could not be read",
+            Self::Source(_) | Self::Read(_) | Self::ReadTimedOut => "an input could not be read",
             Self::Symlink => "an input holds a symlink",
             Self::UnsupportedEntry => "an input holds an entry that is not a file or a directory",
             Self::EmptyInput => "a declared input holds no file",
@@ -138,15 +149,10 @@ pub async fn send_inputs(
         .collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(QUEUE_DEPTH);
     let reader = tokio::task::spawn_blocking(move || read_inputs(&inputs, limits, &tx));
-    while let Some(chunk) = rx.recv().await {
-        let message = DataLinkMessage {
-            op: Some(Op::InputChunk(chunk)),
-        };
-        if let Err(e) = write(link, &message).await {
-            // Dropping the receiver stops the reader at its next hand-over.
-            drop(rx);
-            return Err(e);
-        }
+    if let Err(e) = forward_chunks(link, &mut rx, limits.read_timeout).await {
+        // Dropping the receiver stops the reader at its next hand-over.
+        drop(rx);
+        return Err(e);
     }
     let sent = match reader.await {
         Ok(Ok(sent)) => sent,
@@ -170,6 +176,23 @@ pub async fn send_inputs(
     )
     .await?;
     Ok(sent)
+}
+
+/// Write every chunk the reader hands over, until it closes the channel. A chunk that does not arrive within
+/// `read_timeout` ends the send: the reader is stuck in a source read this task cannot interrupt.
+async fn forward_chunks(
+    link: &mut (impl AsyncWrite + Unpin),
+    rx: &mut tokio::sync::mpsc::Receiver<InputChunk>,
+    read_timeout: Duration,
+) -> Result<(), SendError> {
+    let _ = read_timeout;
+    while let Some(chunk) = rx.recv().await {
+        let message = DataLinkMessage {
+            op: Some(Op::InputChunk(chunk)),
+        };
+        write(link, &message).await?;
+    }
+    Ok(())
 }
 
 /// The receiver's own name rule (`DataLinkMessage::validate`), applied to a name before any chunk carries it.
@@ -498,6 +521,76 @@ mod tests {
             ..input(source.path(), "two")
         };
         assert_refused_before_any_chunk(&[first, second]).await
+    }
+
+    /// A reader that hands over nothing (stuck in a source read) ends the send at the read timeout instead of holding
+    /// the link and the accept task (#769).
+    #[tokio::test]
+    async fn a_stalled_reader_ends_the_send_at_the_read_timeout() -> anyhow::Result<()> {
+        let (mut link, _peer) = tokio::io::duplex(64 * 1024);
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            forward_chunks(&mut link, &mut rx, Duration::from_millis(300)),
+        )
+        .await
+        .context("the send was not bounded by the read timeout")?;
+        assert!(matches!(ended, Err(SendError::ReadTimedOut)), "got {ended:?}");
+        Ok(())
+    }
+
+    /// A slow but alive reader (each chunk inside the timeout) is not cut off.
+    #[tokio::test]
+    async fn a_reader_that_keeps_handing_over_chunks_is_not_cut_off() -> anyhow::Result<()> {
+        let (mut link, mut peer) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        let feeder = tokio::spawn(async move {
+            for i in 0..4u64 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let chunk = InputChunk {
+                    name: "f".to_owned(),
+                    offset: i,
+                    bytes: vec![0],
+                };
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        forward_chunks(&mut link, &mut rx, Duration::from_millis(400))
+            .await
+            .context("a live reader must not time out")?;
+        feeder.await.context("feeder")?;
+        drop(link);
+        let mut frames = 0;
+        while read_frame::<DataLinkMessage>(&mut peer)
+            .await
+            .context("frame")?
+            .is_some()
+        {
+            frames += 1;
+        }
+        assert_eq!(frames, 4);
+        Ok(())
+    }
+
+    /// A walk over directories with no files never hands a chunk over, so it never learns the writer is gone: it
+    /// checks the channel itself (#769).
+    #[test]
+    fn a_walk_over_empty_directories_stops_when_the_writer_is_gone() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        for i in 0..20 {
+            std::fs::create_dir_all(source.path().join(format!("tree/d{i}/e"))).context("dirs")?;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
+        drop(rx);
+        let result = read_inputs(
+            &[("tree".to_owned(), source.path().join("tree"))],
+            SendLimits::default(),
+            &tx,
+        );
+        assert!(matches!(result, Err(SendError::Stopped)), "got {result:?}");
+        Ok(())
     }
 
     /// A tree with a multi-chunk file, nested directories and a zero-byte file arrives byte for byte through the
