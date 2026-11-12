@@ -27,11 +27,11 @@
 //! `mint` in the call log must have its `revoke`, and no staged directory may remain.
 //!
 //! `SANDYD_BIN` and `BROKER_BIN` override the sibling binaries. Every wait is bounded, and the stack guard
-//! stops what the test started: only descendants of this test's own `sandyd`, matched by pid and start time, are
-//! ever killed (qemu, virtiofsd, the egress proxy). The daemon runs with `TMPDIR` set to a directory inside the
-//! test's own temp dir, so the staging base (`<TMPDIR>/sandy`, with the secret share, console log and sockets) is
-//! scanned for the canary and removed with that directory. Nothing outside it is ever deleted; a new `/tmp/sandy*`
-//! entry made by another session is only reported.
+//! stops what the test started: only descendants of this test's own `sandyd` and the members of its own process group,
+//! matched by pid and start time, are ever killed (qemu, virtiofsd, the egress proxy). The daemon runs with `TMPDIR`
+//! set to a directory inside the test's own temp dir, so the staging base (`<TMPDIR>/sandy`, with the secret share,
+//! console log and sockets) is scanned for the canary and removed with that directory. Nothing outside it is ever
+//! deleted; a new `/tmp/sandy*` entry made by another session is only reported.
 #![cfg(feature = "live")]
 #![cfg(target_os = "linux")]
 
@@ -41,7 +41,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
     net::TcpListener,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -55,8 +55,8 @@ use anyhow::{Context, Result, bail, ensure};
 use common::{
     mcp_client::{BIN, Mcp, SCRIPT, credential_file, run_script},
     procs::{
-        descendants_in, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left, sandy_entries,
-        stat_is_live,
+        descendants_in, files_holding, foreign_new_entries, group_members_in, is_vm_part, parse_pgrp, parse_stat,
+        run_dirs_left, sandy_entries, stat_is_live,
     },
 };
 use serde_json::{Value, json};
@@ -196,12 +196,37 @@ fn descendants(root: u32) -> Vec<(u32, u64)> {
     descendants_in(&table, root)
 }
 
-/// The descendants of `root` that are part of a VM: qemu, virtiofsd and the egress proxy.
+/// `(pid, start time)` of every process in the process group `pgid`, from `/proc`, `pgid` itself included. The test
+/// starts `sandyd` as the leader of its own group, so this reaches a child that was re-parented or double-forked,
+/// which the parent walk in [`descendants`] cannot (#734). A process that calls `setsid` or `setpgid` leaves the
+/// group; `vm_parts_using` covers those by their command line.
+fn group_members(pgid: u32) -> Vec<(u32, u64)> {
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let table: Vec<(u32, u32, u64)> = proc
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+            let (_, start) = parse_stat(&stat)?;
+            Some((pid, parse_pgrp(&stat)?, start))
+        })
+        .collect();
+    group_members_in(&table, pgid)
+}
+
+/// The processes of this daemon's tree that are part of a VM: qemu, virtiofsd and the egress proxy. Its descendants
+/// and the members of its process group, so a re-parented one still counts.
 fn vm_parts(root: u32) -> Vec<(u32, u64)> {
-    descendants(root)
+    let mut parts: Vec<(u32, u64)> = descendants(root)
         .into_iter()
+        .chain(group_members(root))
         .filter(|(pid, _)| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| is_vm_part(&comm)))
-        .collect()
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    parts
 }
 
 /// `(pid, start time)` of every VM part whose command line names `base`: the test daemon's own `TMPDIR`, unique to
@@ -361,6 +386,8 @@ impl Stack {
             .env("SANDY_ENV_PROVISION_TIMEOUT_SECS", PROVISION_SECS.to_string())
             .stdout(Stdio::from(std::fs::File::create(dir.path().join("sandyd.out"))?))
             .stderr(Stdio::from(std::fs::File::create(dir.path().join("sandyd.log"))?))
+            // Its own process group: teardown finds a re-parented child of the daemon by the group (#734).
+            .process_group(0)
             .spawn()
             .context("spawn sandyd")?;
         // From here the guard owns the daemon, so a failed start still stops it.
@@ -581,7 +608,15 @@ impl Stack {
             let _ = broker.kill();
             let _ = broker.wait();
         }
-        let mut owned = descendants(self.sandyd.id());
+        let sandyd_pid = self.sandyd.id();
+        let mut owned = descendants(sandyd_pid);
+        // Also the members of the daemon's process group: a child that was re-parented before this walk is not a
+        // descendant any more, and is still in the group (#734).
+        owned.extend(
+            group_members(sandyd_pid)
+                .into_iter()
+                .filter(|(pid, _)| *pid != sandyd_pid),
+        );
         // A daemon that already exited died during the run: its children were re-parented, and every "no VM left"
         // answer since was blind. The status is reaped here, so it is reported once, and the pid is never signalled
         // (it may belong to another process now). The walk finds nothing, so the VM parts are found by the staging
@@ -590,6 +625,13 @@ impl Stack {
             Ok(Some(status)) => {
                 findings.push(format!("sandyd had already exited during the run: {status}"));
                 owned = vm_parts_using(&self.tmp);
+                owned.extend(
+                    group_members(sandyd_pid)
+                        .into_iter()
+                        .filter(|(pid, _)| *pid != sandyd_pid),
+                );
+                owned.sort_unstable();
+                owned.dedup();
                 true
             }
             _ => false,
