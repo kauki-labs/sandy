@@ -1035,8 +1035,28 @@ mod tests {
         for n in 1..=1000 {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
-        let found = open_temp(dest.path(), &[], 0);
-        assert!(found.is_err(), "every name the search may try is taken");
+        let Err(error) = open_temp(dest.path(), &[], 0) else {
+            anyhow::bail!("every name the search may try is taken, it must fail");
+        };
+        assert!(
+            error.to_string().contains("too many stale temp files"),
+            "wrong error: {error}"
+        );
+        Ok(())
+    }
+
+    /// The bound is exactly 1,000 name attempts per call: with 999 names taken the 1000th is found.
+    #[test]
+    fn the_thousandth_temp_name_is_still_tried() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let pid = std::process::id();
+        for n in 1..=999 {
+            std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
+        }
+        let (cleanup, _file, seq) =
+            open_temp(dest.path(), &[], 0).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+        assert_eq!(seq, 1000);
+        drop(cleanup);
         Ok(())
     }
 
