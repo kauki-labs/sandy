@@ -35,7 +35,7 @@ use sandy_api::{
     backend::BackendError,
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
-use sandy_control_proto::v1::EnvironmentSpec as WireSpec;
+use sandy_control_proto::v1::{EnvironmentLifetimeKind, EnvironmentSpec as WireSpec};
 
 use crate::{
     environment_credential::EnvironmentCredentials,
@@ -96,6 +96,8 @@ pub struct Report {
     pub killed: Vec<String>,
     /// Environment ids stopped because their idle-stop lease ran out.
     pub idle_stopped: Vec<String>,
+    /// Ephemeral environment ids deleted because their TTL ran out (#812).
+    pub reaped: Vec<String>,
 }
 
 impl Report {
@@ -105,6 +107,7 @@ impl Report {
             && self.failed.is_empty()
             && self.killed.is_empty()
             && self.idle_stopped.is_empty()
+            && self.reaped.is_empty()
     }
 }
 
@@ -196,6 +199,18 @@ impl EnvironmentDriver {
         report: &mut Report,
         probes: &mut Vec<PendingProbe>,
     ) -> Result<(), EnvironmentStoreError> {
+        // An ephemeral environment past its TTL is deleted by the store's own delete, then converged as a deleted row
+        // in this same pass: its box is killed and its credential revoked below (#812).
+        let mut row = row;
+        let reaped;
+        if self.ttl_expired(row, now) && self.store.delete(&row.environment_id)? == EnvTransition::Applied {
+            report.reaped.push(row.environment_id.clone());
+            reaped = EnvironmentRecord {
+                state: EnvironmentState::Deleted,
+                ..row.clone()
+            };
+            row = &reaped;
+        }
         match row.state {
             EnvironmentState::Provisioning => {
                 probes.extend(self.provision(row, now, running, report)?);
@@ -220,6 +235,26 @@ impl EnvironmentDriver {
                 Ok(())
             }
         }
+    }
+
+    /// Whether `row` is a live ephemeral environment whose TTL, counted from its creation, has passed at `now`. The
+    /// deadline comes from the stored row, so a restarted daemon recomputes it. A persistent row, a row that is already
+    /// `Deleted` and a spec that does not decode are never expired.
+    fn ttl_expired(&self, row: &EnvironmentRecord, now: i64) -> bool {
+        if row.state == EnvironmentState::Deleted {
+            return false;
+        }
+        let Some(lifetime) = WireSpec::decode(row.spec.as_slice())
+            .ok()
+            .and_then(|wire| wire.lifetime)
+        else {
+            return false;
+        };
+        if lifetime.kind() != EnvironmentLifetimeKind::Ephemeral {
+            return false;
+        }
+        let ttl = i64::try_from(lifetime.ttl_secs).unwrap_or(i64::MAX);
+        now >= row.created_at.saturating_add(ttl)
     }
 
     fn kill(&self, id: &str, running: &mut BTreeSet<String>, report: &mut Report) {
@@ -699,17 +734,24 @@ mod tests {
         }
     }
 
-    fn spec_bytes(size: &str) -> Vec<u8> {
+    /// The longest TTL the API accepts, so a test that moves the clock far ahead is not a TTL test.
+    const LONG_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+    fn ephemeral_spec_bytes(size: &str, ttl_secs: u64) -> Vec<u8> {
         WireSpec {
             profile: "harness".to_owned(),
             size: size.to_owned(),
             lifetime: Some(EnvironmentLifetime {
                 kind: EnvironmentLifetimeKind::Ephemeral.into(),
-                ttl_secs: 600,
+                ttl_secs,
             }),
             task_ref: "task-1".to_owned(),
         }
         .encode_to_vec()
+    }
+
+    fn spec_bytes(size: &str) -> Vec<u8> {
+        ephemeral_spec_bytes(size, LONG_TTL_SECS)
     }
 
     struct Rig {
@@ -938,6 +980,101 @@ mod tests {
         Ok(())
     }
 
+    /// Create an ephemeral environment with a 600 s TTL.
+    fn add_short(store: &EnvironmentStore, n: u32) -> Result<String> {
+        let id = format!("env-{n}");
+        store.create(
+            &format!("r{n}"),
+            &id,
+            &ephemeral_spec_bytes("small", 600),
+            "sandy.control.v1.EnvironmentSpec",
+        )?;
+        Ok(id)
+    }
+
+    fn persistent_spec_bytes() -> Vec<u8> {
+        WireSpec {
+            profile: "harness".to_owned(),
+            size: "small".to_owned(),
+            lifetime: Some(EnvironmentLifetime {
+                kind: EnvironmentLifetimeKind::Persistent.into(),
+                ttl_secs: 0,
+            }),
+            task_ref: "task-1".to_owned(),
+        }
+        .encode_to_vec()
+    }
+
+    /// An ephemeral environment is deleted once its TTL (600 s, `add_short`) has passed, by the same path as an
+    /// explicit delete: the row is `Deleted` and the next pass ends its box (#812).
+    #[test]
+    fn an_ephemeral_environment_is_deleted_when_its_ttl_runs_out() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add_short(&r.store, 1)?;
+        let created = state(&r.store, &id)?.created_at;
+        r.driver.reconcile_once(created)?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+
+        let before = r.driver.reconcile_once(created + 599)?;
+        assert!(before.reaped.is_empty(), "one second before the TTL: {before:?}");
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+
+        let report = r.driver.reconcile_once(created + 600)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&id));
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Deleted);
+        r.driver.reconcile_once(created + 601)?;
+        assert!(r.backend.boxes()?.is_empty(), "the reap must end the box");
+        Ok(())
+    }
+
+    /// A row that is still `Provisioning` at its TTL is reaped too: the TTL bounds the environment, not Ready.
+    #[test]
+    fn a_provisioning_environment_past_its_ttl_is_reaped() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add_short(&r.store, 1)?;
+        let created = state(&r.store, &id)?.created_at;
+        let report = r.driver.reconcile_once(created + 700)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&id));
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Deleted);
+        Ok(())
+    }
+
+    /// A persistent environment has no TTL and is never reaped, however old.
+    #[test]
+    fn a_persistent_environment_is_never_reaped() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        r.store.create(
+            "rp",
+            "env-p",
+            &persistent_spec_bytes(),
+            "sandy.control.v1.EnvironmentSpec",
+        )?;
+        let created = state(&r.store, "env-p")?.created_at;
+        r.driver.reconcile_once(created)?;
+        let report = r.driver.reconcile_once(created + 10 * 24 * 3600)?;
+        assert!(report.reaped.is_empty(), "{report:?}");
+        assert_eq!(state(&r.store, "env-p")?.state, EnvironmentState::Ready);
+        Ok(())
+    }
+
+    /// Deadlines come from the stored row, so a daemon that was down past a TTL reaps the row on its first pass and
+    /// leaves a younger one alone (#812, the restart rule).
+    #[test]
+    fn a_restarted_daemon_reaps_an_expired_row_and_keeps_a_young_one() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let old = add_short(&r.store, 1)?;
+        let created = state(&r.store, &old)?.created_at;
+        r.driver.reconcile_once(created)?;
+        let restarted = EnvironmentDriver::new(Arc::clone(&r.store), Arc::clone(&r.backend) as _, config());
+        let report = restarted.reconcile_once(created + 900)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&old));
+        assert_eq!(state(&r.store, &old)?.state, EnvironmentState::Deleted);
+        let young = add_short(&r.store, 2)?;
+        let report = restarted.reconcile_once(state(&r.store, &young)?.created_at + 10)?;
+        assert!(report.reaped.is_empty(), "{report:?}");
+        Ok(())
+    }
+
     #[test]
     fn use_renews_the_lease_and_inactivity_alone_does_not() -> Result<()> {
         let store = Arc::new(EnvironmentStore::open_in_memory()?);
@@ -979,7 +1116,10 @@ mod tests {
     #[test]
     fn no_idle_timeout_never_stops_an_environment() -> Result<()> {
         let r = rig(FakeEnvironmentBackend::new())?;
-        let id = add(&r.store, 1)?;
+        // Persistent: an ephemeral row would be reaped at its TTL long before this far-off clock.
+        let id = "env-1".to_owned();
+        r.store
+            .create("r1", &id, &persistent_spec_bytes(), "sandy.control.v1.EnvironmentSpec")?;
         r.driver.reconcile_once(now())?;
         let report = r.driver.reconcile_once(now() + 10_000_000)?;
         assert!(report.idle_stopped.is_empty());
