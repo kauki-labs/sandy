@@ -117,6 +117,19 @@ pub enum RegisterError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistrationId(u64);
 
+/// What a Submit's path fields need from the host that runs it (#496, decision 21; #807).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathNeeds {
+    /// No path field: any host qualifies.
+    Anywhere,
+    /// The paths must be readable on the host itself (`secrets`, a `credential`, or any path field with no transfer):
+    /// the host must declare `shares_submitter_filesystem`.
+    SharedFilesystem,
+    /// Only `inputs` and `outputs`: the host declares `shares_submitter_filesystem` or `transfer`, because the data
+    /// link carries the files (#482).
+    SharedFilesystemOrTransfer,
+}
+
 /// A registered host identified as a placement candidate (#298): its id,
 /// peer IP (to bind a decision-6 remote link), and declared capabilities (to
 /// decide `Dispatch.backend`), captured together so a placement decision
@@ -383,18 +396,34 @@ impl HostRegistry {
         required_sandbox_kind: i32,
         require_local: bool,
     ) -> Option<PlacementCandidate> {
-        self.pick_host_for_egress(required_isolation_class, required_sandbox_kind, require_local, false)
+        let needs = if require_local {
+            PathNeeds::SharedFilesystem
+        } else {
+            PathNeeds::Anywhere
+        };
+        self.pick_host(required_isolation_class, required_sandbox_kind, needs)
     }
 
-    /// [`Self::pick_host_for`] that also requires, when `require_egress_proxy` is set, a host that declared
-    /// `egress_proxy` (A1, #483). An executor drops a `Dispatch.egress` it does not know without a word, so a job with
-    /// an egress policy is never placed on a host that did not declare it.
+    /// [`Self::pick_host_for`] with the path rule spelled out: see [`PathNeeds`].
     #[must_use]
-    pub fn pick_host_for_egress(
+    pub fn pick_host(
         &self,
         required_isolation_class: i32,
         required_sandbox_kind: i32,
-        require_local: bool,
+        needs: PathNeeds,
+    ) -> Option<PlacementCandidate> {
+        self.pick_host_egress(required_isolation_class, required_sandbox_kind, needs, false)
+    }
+
+    /// [`Self::pick_host`] that also requires, when `require_egress_proxy` is set, a host that declared
+    /// `egress_proxy` (A1, #483). An executor drops a `Dispatch.egress` it does not know without a word, so a job with
+    /// an egress policy is never placed on a host that did not declare it.
+    #[must_use]
+    pub fn pick_host_egress(
+        &self,
+        required_isolation_class: i32,
+        required_sandbox_kind: i32,
+        needs: PathNeeds,
         require_egress_proxy: bool,
     ) -> Option<PlacementCandidate> {
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
@@ -437,8 +466,14 @@ impl HostRegistry {
                         .capabilities
                         .supported_sandbox_kinds
                         .contains(&required_sandbox_kind)
-                    && (!require_local || host.capabilities.shares_submitter_filesystem)
                     && (!require_egress_proxy || host.capabilities.egress_proxy)
+                    && match needs {
+                        PathNeeds::Anywhere => true,
+                        PathNeeds::SharedFilesystem => host.capabilities.shares_submitter_filesystem,
+                        PathNeeds::SharedFilesystemOrTransfer => {
+                            host.capabilities.shares_submitter_filesystem || host.capabilities.transfer
+                        }
+                    }
             })
             .map(|(host_id, host)| PlacementCandidate {
                 host_id: host_id.clone(),
@@ -984,6 +1019,69 @@ mod tests {
             registry.pick_host_for(IsolationClass::Trusted.into(), SandboxKind::Process.into(), true),
             None,
             "a host that didn't declare shares_submitter_filesystem must never be picked when require_local is set"
+        );
+    }
+
+    fn register_one(capabilities: Capabilities) -> HostRegistry {
+        let allowlist = ExecutorAllowlist::new([(executor_ip(), executor_fp())]);
+        let registry = HostRegistry::default();
+        registry
+            .register(
+                &allowlist,
+                executor_ip(),
+                executor_fp(),
+                "remote-host".to_owned(),
+                capabilities,
+            )
+            .expect("the allowed peer must register");
+        registry
+    }
+
+    /// #807: a host that declared `transfer` but not a shared filesystem takes a job whose only path fields are
+    /// inputs and outputs, because the data link carries them.
+    #[test]
+    fn a_transfer_host_is_picked_for_a_job_that_only_moves_inputs_and_outputs() {
+        let registry = register_one(Capabilities {
+            transfer: true,
+            ..capabilities()
+        });
+        let picked = registry.pick_host(
+            IsolationClass::Trusted.into(),
+            SandboxKind::Process.into(),
+            PathNeeds::SharedFilesystemOrTransfer,
+        );
+        assert!(picked.is_some(), "a transfer host must qualify for inputs and outputs");
+    }
+
+    /// A host with neither capability is never picked for a job with inputs or outputs.
+    #[test]
+    fn a_host_with_neither_capability_is_not_picked_for_inputs_and_outputs() {
+        let registry = register_one(capabilities());
+        assert_eq!(
+            registry.pick_host(
+                IsolationClass::Trusted.into(),
+                SandboxKind::Process.into(),
+                PathNeeds::SharedFilesystemOrTransfer
+            ),
+            None
+        );
+    }
+
+    /// `secrets` and a `credential` are files on the submitter's machine: `transfer` does not carry them, so a
+    /// transfer-only host is not picked for them (#496 stays in force for those).
+    #[test]
+    fn a_transfer_only_host_is_not_picked_when_the_paths_must_be_local() {
+        let registry = register_one(Capabilities {
+            transfer: true,
+            ..capabilities()
+        });
+        assert_eq!(
+            registry.pick_host(
+                IsolationClass::Trusted.into(),
+                SandboxKind::Process.into(),
+                PathNeeds::SharedFilesystem
+            ),
+            None
         );
     }
 

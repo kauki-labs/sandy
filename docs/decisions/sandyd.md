@@ -1482,6 +1482,12 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   precedent. The bare `sandy daemon submit <manifest-file>` path needs no
   new flags — an operator writing `argv/v1` JSON by hand already has the
   object shape available.
+- A3 (#483): the positional of `daemon submit` is a manifest file with `--manifest-encoding`, else a TEMPLATE, sent as a
+  `flake/v1` manifest with kind `topology` (the executor adds its own system and hypervisor, so a submitter's host attr
+  never travels). A template that names an existing file or `-` is refused as a forgotten `--manifest-encoding`, and one
+  with a `#` is refused naming `--flake`. The plain flags apply to a template or `--flake` and are refused with a
+  manifest file. `--from-devshell` is a `flake/v1` field (`from_devshell`, absent when false); an executor that predates
+  it refuses the manifest naming the field.
 - A1 (#483): `sandy daemon submit --allow HOST:PORT` (repeatable) sends an egress policy, `SubmitRequest.egress`, copied
   into `Dispatch.egress`. A policy is a message field, so an empty one (deny all) stays apart from none. A policy runs
   the guest behind the executor's per-run egress proxy, the same `Some(AllowList)` `sandy run` builds under
