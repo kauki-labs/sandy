@@ -500,6 +500,18 @@ where
 /// physical-outcome/classification split the backend seam draws).
 #[must_use]
 pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorMessage {
+    outcome_result_message_with_outputs(job_id, outcome, false)
+}
+
+/// [`outcome_result_message`] with `JobResult.outputs_follow` set: the host has sent (or tried to send) the job's
+/// outputs over the data link, so the orchestrator must not read the result as the end of the job until they arrive
+/// or the transfer fails (#482).
+#[must_use]
+pub fn outcome_result_message_with_outputs(
+    job_id: String,
+    outcome: Outcome,
+    outputs_follow: bool,
+) -> HostExecutorMessage {
     HostExecutorMessage {
         op: Some(host_executor_message::Op::Result(JobResult {
             job_id,
@@ -508,7 +520,7 @@ pub fn outcome_result_message(job_id: String, outcome: Outcome) -> HostExecutorM
             timed_out: outcome.timed_out,
             transport_error: outcome.transport_error,
             console: outcome.console,
-            outputs_follow: false,
+            outputs_follow,
         })),
     }
 }
@@ -1795,6 +1807,29 @@ mod tests {
             "a pre-registration Cancel should already have cancelled the job's control by the time it starts"
         );
         Ok(())
+    }
+
+    /// The flag rides on the result: set when outputs followed over the data link, clear otherwise.
+    #[test]
+    fn outcome_result_message_with_outputs_sets_the_flag_it_is_given() {
+        let outcome = || Outcome {
+            digests: None,
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        };
+        for follow in [true, false] {
+            let message = outcome_result_message_with_outputs("job-1".to_owned(), outcome(), follow);
+            match message.op {
+                Some(host_executor_message::Op::Result(result)) => {
+                    assert_eq!(result.outputs_follow, follow);
+                    assert_eq!(result.exit_code, Some(0), "the rest of the result is unchanged");
+                }
+                other => panic!("expected a JobResult, got {other:?}"),
+            }
+        }
     }
 
     #[test]

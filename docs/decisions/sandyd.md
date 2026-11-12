@@ -2051,6 +2051,10 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - A failed flush discards the file before the error returns, so the unlink is done before the peer hears of it. The temp
   name is `.sandy-recv-<pid>-<n>` with `n` running across the receive; a collision with a stale name tries the next one,
   at most 1,000 name attempts per file, so a long receive is not failed by one stale name (#793).
+- The first time a receive makes a temp file in a directory it sweeps the `.sandy-recv-<pid>-<n>` regular files there
+  that a process that has exited left behind (a crash skips the cleanup), looking at most at 10,000 entries. It never
+  touches this process's own temp files (another job's receive may be writing one), a live process's, a directory, a
+  symlink, or a name that is not a temp name (#782).
 - Filesystem work runs on the blocking pool, never on the async worker (#779): the directory creation and the temp
   file, the rename into place, and the unlink of a file that never completed. A `Cleanup` guard owns that unlink; a
   failed receive awaits it before it tells the peer, and a dropped receive queues it, so a cancelled job leaves no
@@ -2075,6 +2079,52 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   `TransferError` with a fixed reason and no path.
 - The sender is not called yet: 6c stages the outputs under a host-local root, calls it after the run, and sets
   `JobResult.outputs_follow`.
+
+### Slice 6c-1: the host stages the outputs, sends them after the run, and sets `outputs_follow`
+
+- A dispatch with a data link and declared outputs gets a private `sandy-outputs-*` root under the host's temp
+  directory, and the backend collects output `i` into `<root>/<i>` instead of the submitter's path (`output_stage`).
+  `<root>/<i>` is not created: a named output whose staged root is a file is written at that path by the backend.
+- After `backend.run` returns, the staged trees go back over the retained data link (`output_send`, tagged with the
+  position `i`), and the root and the link are dropped. `handle_dispatch` returns `Dispatched { outcome, outputs_follow }`
+  and `main.rs` puts the flag on the `JobResult`.
+- `outputs_follow` is true whenever the transfer was started, including when the send failed: a failed send must never
+  read as "nothing follows", or a job with missing outputs is recorded as a success. A run that fails (`backend.run`
+  returns an error) sends nothing and reports a failure with the flag clear: it has no outputs to wait for.
+- The send is bounded: `OUTPUT_SEND_TOTAL_SECS` (30 minutes, as the input pull) however slowly the peer reads, and it
+  stops at once on a cancel. The job's deadline is not a reason to stop. The host handles dispatches one at a time, so
+  a peer that read a frame every few seconds would otherwise hold the loop for days. A send cut short still reports
+  `outputs_follow`, and the orchestrator ends the transfer on the closed link.
+- The sandyd side (the receive and the per-job rendezvous that holds the job non-terminal) is slice 6c-2, below.
+
+### Slice 6c-2: the sandyd side of the output transfer
+
+- **The link stays open after the inputs.** A claimed data link of a job that declares outputs runs `receive_outputs`
+  (6a) after `send_inputs`, and publishes how it ended to a per-job `OutputsSlot` (`Pending`, `Received`, or
+  `Failed` with a fixed text). A job that declares none gets the link closed after the inputs, as before.
+  `JobChannel.data_outputs` is the Submit-validated path outputs, set at mint beside `data_link`.
+- **The receive clocks start at the first byte.** The host sends the outputs after the job ran, which can be hours after
+  the link opened. The serve reads one byte with no time limit, then runs the receive over a link that replays it, so
+  the idle limit and the total limit time the transfer, not the job. Until the first byte the wait is bounded by the
+  slot, not a clock: the job ending, or its outputs being overdue, publishes a failure and the serve gives up (a
+  receive in flight is dropped and removes its temp file).
+- **sandyd decides from its own record.** A succeeded result for a job with `data_outputs` is not terminal. It waits
+  for the slot, for at most the receive total plus five minutes (the executor may open the link after the result
+  reached us). `Received` records the run's own status (a non-zero exit stays `Failed`: the host collects and sends
+  after any run that returned, so a failed run's outputs are awaited too); `Failed`, a timeout, or a missing receive
+  records `Failed` with the reason appended to the console. The host's `outputs_follow` flag does not make sandyd
+  wait for a job that owes none (ignored). A flag clear for a succeeded job that owes outputs is a `Failed` at once,
+  and a failed run with the flag clear (the run itself errored, nothing was collected) is recorded at once. A second
+  result for a job already waiting is ignored, and a succeeded job the registry no longer knows fails closed.
+- **The relay never blocks.** The waiting job stays in `in_flight` and the settle runs as one future in the relay's
+  select, so results, dispatches and cancels keep flowing. A host that disconnects first fails the job through the
+  existing disconnect path, which also ends the slot.
+- **Ending the job ends the slot.** `finish_job` and `invalidate_remote_link` publish `Failed("the job ended")`
+  (the first outcome stands), which releases a serve still waiting and drops a receive in flight.
+- **Known limits.** The destination ancestors are checked at Submit, and a later swap of one cannot be seen here: the
+  receive opens the destination once and never follows a link below it, and a destination whose parent an attacker
+  can write is outside the threat model (the executor is a trusted writer). A cancel mid-receive ends the slot and
+  drops the receive, but the host may still be sending until its own send cap.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 

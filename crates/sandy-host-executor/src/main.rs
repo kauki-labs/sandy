@@ -14,10 +14,10 @@ use sandy_host_executor::{
     build_rev::{log_startup, resolve_rev, version_line, wants_version},
     capability::{detect_register_capabilities, detect_vm_capability},
     client_config::{ExecutorConfig, parse_executor_config},
-    dispatch::handle_dispatch,
+    dispatch::{Dispatched, handle_dispatch},
     run::{
-        DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, failure_result_message, outcome_result_message, register,
-        run_dispatch_loop,
+        DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, failure_result_message, outcome_result_message_with_outputs,
+        register, run_dispatch_loop,
     },
 };
 use sandy_impls_local::SystemdRunContainment;
@@ -119,16 +119,20 @@ async fn main() {
                     // orchestrator in this result message (and on to the result
                     // envelope's `logs.tail`), not into this host's own
                     // logs/journald. The other fields are safe to log.
-                    Ok(Ok(outcome)) => {
+                    Ok(Ok(Dispatched {
+                        outcome,
+                        outputs_follow,
+                    })) => {
                         tracing::info!(
                             job_id,
                             booted = outcome.booted,
                             guest_exit = outcome.guest_exit,
                             timed_out = outcome.timed_out,
                             transport_error = outcome.transport_error.as_deref(),
+                            outputs_follow,
                             "dispatch finished"
                         );
-                        outcome_result_message(job_id, outcome)
+                        outcome_result_message_with_outputs(job_id, outcome, outputs_follow)
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(job_id, error = %e, "dispatch refused or failed");

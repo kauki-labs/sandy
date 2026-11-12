@@ -16,8 +16,8 @@
 //! the chunks of one file are contiguous and in order; an empty chunk is only the one chunk of a zero-byte file; the
 //! caps count files plus the directories below a root; and every frame passes `DataLinkMessage::validate`.
 //!
-//! What this does NOT do: stage the outputs or call this from `handle_dispatch` (6c), or set
-//! `JobResult.outputs_follow` (6c).
+//! `output_stage` stages the outputs and calls this from `handle_dispatch`, and `main.rs` sets
+//! `JobResult.outputs_follow` (6c-1). What receives them in sandyd, and holds the job open until they arrive, is 6c-2.
 
 use std::{collections::HashSet, ffi::OsStr, io::Read, path::PathBuf, time::Duration};
 

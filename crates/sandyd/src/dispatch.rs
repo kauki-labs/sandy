@@ -93,6 +93,12 @@ pub struct JobChannel {
     /// The path inputs the data link sends to the executor (#482 slice 5c). Empty exactly when `data_link` is
     /// `None` or the job has outputs only.
     pub data_inputs: Vec<sandy_executor_proto::Input>,
+    /// The path outputs the executor sends back over the data link (#482 slice 6c-2): the Submit-validated outputs,
+    /// set at mint beside `data_link`. Empty exactly when `data_link` is `None` or the job has inputs only. sandyd
+    /// decides from this, never from the host's `outputs_follow` flag, whether a succeeded job owes outputs.
+    pub data_outputs: Vec<sandy_executor_proto::Output>,
+    /// How the receive of `data_outputs` came out, for the result relay to wait on.
+    pub outputs: crate::output_slot::OutputsSlot,
     /// Caps derived from the manifest's `requested_caps`, bounded by the
     /// submitter's own held caps (decision C, #226) — scoped to channels
     /// OTHER than this job's own (e.g. the submitter's orchestrator channel,
@@ -261,6 +267,8 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         remote_link: None,
         data_link: None,
         data_inputs: Vec::new(),
+        data_outputs: Vec::new(),
+        outputs: crate::output_slot::OutputsSlot::new(),
         granted_caps: Vec::new(),
         session: Uuid::nil(),
         host_id: None,
@@ -614,6 +622,9 @@ impl JobRegistry {
         for link in [&job.remote_link, &job.data_link].into_iter().flatten() {
             link.invalidate();
         }
+        // A receive still waiting on the data link gives up: the job it was for is over (first outcome stands).
+        job.outputs
+            .publish(crate::output_slot::OutputsState::Failed("the job ended".to_owned()));
     }
 }
 
