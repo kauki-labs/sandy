@@ -2942,6 +2942,8 @@ mod tests {
                         })
                         .collect(),
                 }),
+                // A policy runs the guest behind the egress proxy, so a VM job: `flake/v1` resolves to the Vm kind.
+                manifest_encoding: "flake/v1".to_owned(),
                 ..match submit_req(id).op {
                     Some(control_request::Op::Submit(submit)) => submit,
                     _ => unreachable!("submit_req builds a Submit"),
@@ -2952,9 +2954,47 @@ mod tests {
 
     fn egress_host(egress_proxy: bool) -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             egress_proxy,
             ..trusted_host_capabilities()
         }
+    }
+
+    /// CodeRabbit on #818 (and #819 item 1): a policy is a VM-only feature, so a Submit that names one for a process
+    /// job (`argv/v1`, whatever host qualifies) is refused at Submit with the sandbox named, before any job, mint or
+    /// placement, not accepted and then refused by the executor after the row exists.
+    #[tokio::test]
+    async fn an_egress_policy_on_a_process_job_is_refused_at_submit() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "capable-host", peer_ip, egress_host(true));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let mut request = submit_req_with_egress(1, Some(&[("example.com", 443)]));
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.manifest_encoding = "argv/v1".to_owned();
+        }
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(
+                    e.message.contains("egress") && e.message.contains("Vm"),
+                    "must name the policy and the sandbox: {}",
+                    e.message
+                );
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "nothing was dispatched");
+        assert!(store.list()?.is_empty(), "no job row is left behind");
+        Ok(())
     }
 
     /// A1 (#483): the policy a Submit names reaches the host's `Dispatch` as the same list, and an absent policy stays
