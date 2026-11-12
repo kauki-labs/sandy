@@ -136,8 +136,18 @@ impl Beneath {
     ///
     /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`].
     pub fn file_id(&self, name: &OsStr) -> Result<Option<FileId>, FsError> {
-        let _ = component(name, &self.path)?;
-        Ok(None)
+        let name = component(name, &self.path)?;
+        let path = self.path.join(name);
+        match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                // `st_dev` is a `u64` on Linux and an `i32` on macOS; a value that does not fit is an overflow error.
+                #[allow(clippy::useless_conversion, reason = "st_dev is u64 on Linux and i32 on macOS")]
+                let dev = u64::try_from(stat.st_dev).map_err(|_| FsError::io("stat entry", &path, Errno::OVERFLOW))?;
+                Ok(Some(FileId { dev, ino: stat.st_ino }))
+            }
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(FsError::io("stat entry", &path, e)),
+        }
     }
 
     /// Open the subdirectory `name`, refusing a symlink.

@@ -270,7 +270,6 @@ struct Receive<'a> {
     current: Option<InFlight>,
     temp_seq: u64,
     /// The identity of each file this receive completed, so a rename onto one of them is caught (#787).
-    #[allow(dead_code, reason = "the check that reads this arrives in the next commit")]
     completed_ids: std::sync::Arc<std::sync::Mutex<HashSet<sandy_fsutil::FileId>>>,
 }
 
@@ -353,6 +352,32 @@ impl Drop for UnlinkOnDrop {
 /// How many temp names one `open_temp` call tries before it gives up on a destination full of stale ones.
 const MAX_TEMP_NAME_TRIES: u32 = 1000;
 
+/// Rename the finished temp file onto its final name, unless that name is a file this receive already completed.
+/// On a case-insensitive destination `a` then `A` name one file; case-folding the receive's keys would wrongly refuse
+/// them on a case-sensitive one, where they are two files, so the target's identity decides (#787). Runs on the
+/// blocking pool.
+fn commit(current: &InFlight, completed: &std::sync::Mutex<HashSet<sandy_fsutil::FileId>>) -> Result<(), ReceiveError> {
+    let poisoned = || ReceiveError::Io(std::io::Error::other("the completed-file set is poisoned"));
+    let Some((dir, temp)) = current.cleanup.0.as_ref() else {
+        return Err(sandy_fsutil::FsError::Unsafe {
+            path: PathBuf::from(&current.name),
+            reason: "the temp file was already removed".to_owned(),
+        }
+        .into());
+    };
+    let mine = dir.file_id(temp)?;
+    if let Some(target) = dir.file_id(&current.name)?
+        && completed.lock().map_err(|_| poisoned())?.contains(&target)
+    {
+        return Err(ReceiveError::Alias);
+    }
+    dir.rename(temp, &current.name)?;
+    if let Some(id) = mine {
+        completed.lock().map_err(|_| poisoned())?.insert(id);
+    }
+    Ok(())
+}
+
 /// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
 /// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
 /// including when the receive that asked for it is gone by the time this ends.
@@ -427,15 +452,9 @@ impl<'a> Receive<'a> {
             current.discard().await;
             return Err(ReceiveError::Io(e));
         }
-        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
-            let renamed = match current.cleanup.0.as_ref() {
-                Some((dir, temp)) => dir.rename(temp, &current.name),
-                None => Err(sandy_fsutil::FsError::Unsafe {
-                    path: PathBuf::from(&current.name),
-                    reason: "the temp file was already removed".to_owned(),
-                }),
-            };
-            match renamed {
+        let completed = std::sync::Arc::clone(&self.completed_ids);
+        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, ReceiveError> {
+            match commit(&current, &completed) {
                 Ok(()) => {
                     current.cleanup.disarm();
                     Ok(current)

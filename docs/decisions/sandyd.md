@@ -2029,6 +2029,10 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The receive remembers a completed file and a created directory by a fixed 16-byte key (a truncated SHA-256 of the
   output index and the length-prefixed name), not by the name, so a hostile host cannot make it hold about 400 MB
   with 100,000 entries of 4 KiB names (#780). A collision needs a 128-bit hash collision.
+- A rename onto a file this receive already completed is refused with `Alias`, decided by file identity (device and
+  inode, `Beneath::file_id`), not by name: on a case-insensitive destination `a` then `A` name one file, and the second
+  would replace the first while the receive counts two, but on a case-sensitive one they are two files, as local
+  collection copies them. A file that existed before the transfer is still replaced (#787).
 - A receive is also bounded in total: `DEFAULT_TOTAL` (30 minutes, as the host's input pull) ends it with
   `TotalDeadline` however steadily frames arrive, and `max_frames` (twice the entries plus one chunk per
   `MAX_CHUNK_BYTES` of the byte cap) ends it with `TooManyFrames`, so a peer cannot hold the link and an open file
