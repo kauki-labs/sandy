@@ -272,11 +272,13 @@ async fn relay_dispatches(
     // Succeeded jobs waiting for their outputs (#482 slice 6c-2). They stay in `in_flight` until settled, so the
     // cleanup below fails them if the host goes away first.
     let mut awaiting = futures_util::stream::FuturesUnordered::new();
+    let mut awaiting_ids: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
             Some(settled) = futures_util::StreamExt::next(&mut awaiting), if !awaiting.is_empty() => {
                 in_flight.remove(&settled);
+                awaiting_ids.remove(&settled);
             }
             dispatch = dispatch_rx.recv() => {
                 let Some(dispatch) = dispatch else {
@@ -383,7 +385,7 @@ async fn relay_dispatches(
                 match frame {
                     Some(Ok(Some(message))) => match message.op {
                         Some(host_executor_message::Op::Result(result)) => {
-                            if let Some(awaited) = record_job_result(store, job_registry, &mut in_flight, result).await {
+                            if let Some(awaited) = record_job_result(store, job_registry, &mut in_flight, &mut awaiting_ids, result).await {
                                 // The relay keeps reading frames and dispatching while the outputs arrive.
                                 awaiting.push(awaited.settle(store, job_registry, OUTPUTS_WAIT));
                             }
@@ -503,6 +505,7 @@ async fn record_job_result(
     store: &Arc<JobStore>,
     job_registry: &JobRegistry,
     in_flight: &mut HashSet<String>,
+    _awaiting: &mut HashSet<String>,
     result: JobResult,
 ) -> Option<AwaitedOutputs> {
     let (status, exit_code) = classify(&result);
@@ -921,7 +924,7 @@ mod tests {
             console: String::new(),
             outputs_follow: false,
         };
-        record_job_result(&store, &job_registry, &mut in_flight, result).await;
+        record_job_result(&store, &job_registry, &mut in_flight, &mut HashSet::new(), result).await;
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
 
         // A second insert is what the sweep is tied to (#270).
@@ -1835,9 +1838,15 @@ mod tests {
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
 
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
-            .await
-            .context("a job that owes outputs must wait for them")?;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await
+        .context("a job that owes outputs must wait for them")?;
         assert_eq!(awaited.job_id(), "job-1");
         assert_eq!(
             store.status("job-1")?,
@@ -1864,9 +1873,15 @@ mod tests {
         let (store, job_registry) = (test_store(), test_job_registry());
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
-            .await
-            .context("owed")?;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await
+        .context("owed")?;
         let job = job_registry.get("job-1").context("registered")?;
         job.outputs
             .publish(crate::output_slot::OutputsState::Failed("the link closed".to_owned()));
@@ -1881,9 +1896,15 @@ mod tests {
         let (store, job_registry) = (test_store(), test_job_registry());
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
-            .await
-            .context("owed")?;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await
+        .context("owed")?;
         awaited
             .settle(&store, &job_registry, std::time::Duration::from_millis(50))
             .await;
@@ -1898,7 +1919,14 @@ mod tests {
         let (store, job_registry) = (test_store(), test_job_registry());
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, false)).await;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, false),
+        )
+        .await;
         assert!(awaited.is_none(), "nothing to wait for: the host says nothing follows");
         assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
         assert!(!in_flight.contains("job-1"));
@@ -1911,7 +1939,14 @@ mod tests {
         let (store, job_registry) = (test_store(), test_job_registry());
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 1, false)).await;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 1, false),
+        )
+        .await;
         assert!(awaited.is_none());
         assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
         Ok(())
@@ -1928,7 +1963,14 @@ mod tests {
             .context("mint job channel")?;
         job_registry.insert("job-1".to_owned(), job);
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true)).await;
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await;
         assert!(awaited.is_none());
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
         Ok(())
@@ -1940,21 +1982,116 @@ mod tests {
         let (store, job_registry) = (test_store(), test_job_registry());
         job_owing_outputs(&store, &job_registry, "job-1").await?;
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
-        let _awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
-            .await
-            .context("owed")?;
+        let _awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await
+        .context("owed")?;
         for job_id in in_flight {
             fail_disconnected_job(&store, &job_registry, &job_id).await;
         }
         assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
         let job = job_registry.get("job-1").context("registered")?;
-        assert!(
-            matches!(
-                job.outputs.wait(SOON).await,
-                crate::output_slot::OutputsState::Failed(_)
-            ),
-            "the receive waiting on the link must be released"
+        tokio::time::timeout(SOON, job.outputs.decided())
+            .await
+            .context("the receive waiting on the link must be released")?;
+        Ok(())
+    }
+
+    /// A booted job that exits non-zero still has its outputs collected and sent (the host sends after any run that
+    /// returns): sandyd waits for them, and the job stays `Failed`.
+    #[tokio::test]
+    async fn a_failed_run_whose_outputs_follow_waits_for_them_and_stays_failed() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 1, true),
+        )
+        .await
+        .context("a failed run whose outputs follow must wait for them")?;
+        assert_eq!(
+            store.status("job-1")?,
+            Some(JobStatus::Running),
+            "not terminal before the outputs"
         );
+        let job = job_registry.get("job-1").context("registered")?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), job.outputs.decided())
+                .await
+                .is_err(),
+            "the receive must not be told the job ended while its outputs are coming"
+        );
+        job.outputs.publish(crate::output_slot::OutputsState::Received(
+            crate::data_link_recv::Received { files: 1, bytes: 1 },
+        ));
+        awaited.settle(&store, &job_registry, SOON).await;
+        assert_eq!(
+            store.status("job-1")?,
+            Some(JobStatus::Failed),
+            "the exit status is not overturned"
+        );
+        Ok(())
+    }
+
+    /// An executor that reports the same job twice must not push a second wait for it, or fail the awaiting job.
+    #[tokio::test]
+    async fn a_duplicate_result_for_an_awaiting_job_is_ignored() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let mut awaiting = HashSet::new();
+        let first = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut awaiting,
+            result_for("job-1", 0, true),
+        )
+        .await;
+        assert!(first.is_some());
+        let second = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut awaiting,
+            result_for("job-1", 0, false),
+        )
+        .await;
+        assert!(second.is_none());
+        assert_eq!(
+            store.status("job-1")?,
+            Some(JobStatus::Running),
+            "a duplicate must not fail the awaiting job"
+        );
+        Ok(())
+    }
+
+    /// A succeeded job the registry no longer knows cannot be shown to owe nothing: it fails closed.
+    #[tokio::test]
+    async fn a_succeeded_job_the_registry_lost_fails_closed() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let awaited = record_job_result(
+            &store,
+            &job_registry,
+            &mut in_flight,
+            &mut HashSet::new(),
+            result_for("job-1", 0, true),
+        )
+        .await;
+        assert!(awaited.is_none());
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
         Ok(())
     }
 }
