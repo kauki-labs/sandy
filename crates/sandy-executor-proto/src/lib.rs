@@ -36,10 +36,10 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, AttachStateChanged, Cancel, Capabilities, DataLinkMessage, Dispatch, HostExecutorMessage, Input, InputChunk,
-    InputEnd, IsolationClass, JobResult, OrchestratorMessage, Output, OutputChunk, OutputEnd, Register,
-    RegisterRefused, Registered, SandboxKind, SecretRef, TransferError, data_link_message, host_executor_message,
-    orchestrator_message,
+    Arch, AttachStateChanged, Cancel, Capabilities, DataLinkMessage, Dispatch, EgressPolicy, EgressRule,
+    HostExecutorMessage, Input, InputChunk, InputEnd, IsolationClass, JobResult, OrchestratorMessage, Output,
+    OutputChunk, OutputEnd, Register, RegisterRefused, Registered, SandboxKind, SecretRef, TransferError,
+    data_link_message, host_executor_message, orchestrator_message,
 };
 
 /// The most file bytes one `InputChunk` or `OutputChunk` may carry (sandyd.md
