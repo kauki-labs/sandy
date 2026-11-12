@@ -552,12 +552,20 @@ async fn record_job_result(
         // The host collects and sends after any run that returns, a non-zero exit included, so the wait does not
         // depend on the status: the exit is recorded as classified once the outputs are in.
         if result.outputs_follow {
+            // The run is over: nothing uses the job's credential while its outputs arrive, so revoke it now, not
+            // when they settle (up to `OUTPUTS_WAIT` later). `finish_job` releases again; that is a no-op.
+            // Redact first: once the credential is released, `finish_job` can no longer find the token to redact.
+            let (credentials, jid, console) = (job_registry.credentials().cloned(), job_id.clone(), result.console);
+            let console = tokio::task::spawn_blocking(move || redact_console(credentials.as_deref(), &jid, console))
+                .await
+                .unwrap_or_else(|_| "[console withheld: it could not be redacted]".to_owned());
+            job_registry.release_credential(&job_id);
             awaiting.insert(job_id.clone());
             return Some(AwaitedOutputs {
                 job_id,
                 status,
                 exit_code,
-                console: result.console,
+                console,
             });
         }
         if status == JobStatus::Succeeded {
@@ -579,6 +587,17 @@ async fn record_job_result(
     None
 }
 
+/// `console` with the staged token of `job_id` redacted. Blocking: it reads the staged file.
+fn redact_console(credentials: Option<&crate::credential::JobCredentials>, job_id: &str, console: String) -> String {
+    match credentials {
+        Some(credentials) => match credentials.redact_bytes(job_id, console.into_bytes()) {
+            Redaction::Redacted(bytes) | Redaction::NotHeld(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Redaction::Unavailable => "[console withheld: the job's credential could not be redacted]".to_owned(),
+        },
+        None => console,
+    }
+}
+
 /// Move `job_id` to its terminal `status`, off the connection task, and end its credential and its outputs slot.
 async fn finish_job(
     store: &Arc<JobStore>,
@@ -593,13 +612,7 @@ async fn finish_job(
     let jid = job_id.to_owned();
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
-        let console = match &credentials {
-            Some(credentials) => match credentials.redact_bytes(&jid, console.into_bytes()) {
-                Redaction::Redacted(bytes) | Redaction::NotHeld(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Redaction::Unavailable => "[console withheld: the job's credential could not be redacted]".to_owned(),
-            },
-            None => console,
-        };
+        let console = redact_console(credentials.as_deref(), &jid, console);
         store.finish(&jid, status, exit_code, &console)
     })
     .await;

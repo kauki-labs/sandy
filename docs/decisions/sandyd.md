@@ -2116,6 +2116,8 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   wait for a job that owes none (ignored). A flag clear for a succeeded job that owes outputs is a `Failed` at once,
   and a failed run with the flag clear (the run itself errored, nothing was collected) is recorded at once. A second
   result for a job already waiting is ignored, and a succeeded job the registry no longer knows fails closed.
+  The job's credential (decision 37) is revoked when the result arrives, not when the outputs settle: the run is over
+  and nothing reads the token while they come (#481).
 - **The relay never blocks.** The waiting job stays in `in_flight` and the settle runs as one future in the relay's
   select, so results, dispatches and cancels keep flowing. A host that disconnects first fails the job through the
   existing disconnect path, which also ends the slot.
