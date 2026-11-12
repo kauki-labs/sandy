@@ -2051,6 +2051,10 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - A failed flush discards the file before the error returns, so the unlink is done before the peer hears of it. The temp
   name is `.sandy-recv-<pid>-<n>` with `n` running across the receive; a collision with a stale name tries the next one,
   at most 1,000 name attempts per file, so a long receive is not failed by one stale name (#793).
+- The first time a receive makes a temp file in a directory it sweeps the `.sandy-recv-<pid>-<n>` regular files there
+  that a process that has exited left behind (a crash skips the cleanup), looking at most at 10,000 entries. It never
+  touches this process's own temp files (another job's receive may be writing one), a live process's, a directory, a
+  symlink, or a name that is not a temp name (#782).
 - Filesystem work runs on the blocking pool, never on the async worker (#779): the directory creation and the temp
   file, the rename into place, and the unlink of a file that never completed. A `Cleanup` guard owns that unlink; a
   failed receive awaits it before it tells the peer, and a dropped receive queues it, so a cancelled job leaves no
