@@ -163,7 +163,7 @@ where
     // Explicit: `tempfile` applies only the umask default (0755) unless a mode is given, and the pulled inputs are the
     // job's own files (#802).
     let root = tempfile::Builder::new()
-        .prefix("sandy-inputs-")
+        .prefix(&crate::staging_sweep::root_prefix("inputs"))
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(parent)
         .map_err(StageError::Root)?;
