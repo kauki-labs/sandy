@@ -818,6 +818,7 @@ mod tests {
     /// `Pending` and from `Running`, so no terminal row lacks one. The direct `kill` writes the same shape.
     #[test]
     fn a_cancelled_job_records_a_cancelled_envelope() -> anyhow::Result<()> {
+        use anyhow::Context;
         for running in [false, true] {
             let store = JobStore::open_in_memory()?;
             store.insert_pending("job-1", b"m", "test/v1")?;
