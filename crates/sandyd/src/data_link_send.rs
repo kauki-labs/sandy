@@ -344,6 +344,84 @@ mod tests {
         Ok((sent, out))
     }
 
+    /// An input the sender refuses must be refused before anything is sent: no chunk reaches the link, and the peer
+    /// gets a `TransferError` (#770, #771).
+    async fn assert_refused_before_any_chunk(inputs: &[sandy_executor_proto::Input]) -> anyhow::Result<()> {
+        let (sent, messages) = frames(inputs, SendLimits::default()).await?;
+        assert!(sent.is_err(), "the send must be refused, got {sent:?}");
+        assert!(
+            !messages.iter().any(|m| matches!(m.op, Some(Op::InputChunk(_)))),
+            "a chunk was sent before the refusal"
+        );
+        assert!(
+            messages.iter().any(|m| matches!(m.op, Some(Op::TransferError(_)))),
+            "the peer was not told"
+        );
+        Ok(())
+    }
+
+    /// A name the receiver would refuse is refused at the source (#770): too long, a `..` or `.` component, an absolute
+    /// path, a NUL, an empty component.
+    #[tokio::test]
+    async fn a_declared_name_the_receiver_would_refuse_is_refused_at_the_source() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("f"), b"x")?;
+        let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
+        for name in [too_long.as_str(), "a/../b", "./a", "/abs", "a\0b", "a//b", "a/"] {
+            let declared = sandy_executor_proto::Input {
+                host: source.path().join("f").to_string_lossy().into_owned(),
+                name: name.to_owned(),
+                guest_path: None,
+                ..input(source.path(), "f")
+            };
+            assert_refused_before_any_chunk(&[declared])
+                .await
+                .with_context(|| format!("name {name:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// A file inside a tree gets a wire name `<input>/<path>`; one that is too long for the receiver is refused
+    /// before any of its own chunks, and the peer is told (#770). Files found earlier in the walk may already be out.
+    #[tokio::test]
+    async fn a_nested_file_whose_wire_name_is_too_long_is_refused_at_the_source() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("tree/short"), b"x")?;
+        let deep = vec!["d".repeat(200); 4].join("/");
+        write(&source.path().join("tree").join(deep).join("f"), b"y")?;
+        let (sent, messages) = frames(&[input(source.path(), "tree")], SendLimits::default()).await?;
+        assert!(sent.is_err(), "the send must be refused, got {sent:?}");
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(&m.op, Some(Op::InputChunk(c)) if c.name.len() > sandy_executor_proto::MAX_CHUNK_NAME_BYTES)),
+            "a chunk with an over-long name was sent"
+        );
+        assert!(
+            messages.iter().any(|m| matches!(m.op, Some(Op::TransferError(_)))),
+            "the peer was not told"
+        );
+        Ok(())
+    }
+
+    /// Two declared inputs with one name make the receiver end with `Clash` after bytes moved. The sender refuses
+    /// them first (#771).
+    #[tokio::test]
+    async fn two_declared_inputs_with_one_name_are_refused_before_anything_is_sent() -> anyhow::Result<()> {
+        let source = tempfile::tempdir().context("source")?;
+        write(&source.path().join("one"), b"1")?;
+        write(&source.path().join("two"), b"2")?;
+        let first = sandy_executor_proto::Input {
+            name: "same".to_owned(),
+            ..input(source.path(), "one")
+        };
+        let second = sandy_executor_proto::Input {
+            name: "same".to_owned(),
+            ..input(source.path(), "two")
+        };
+        assert_refused_before_any_chunk(&[first, second]).await
+    }
+
     /// A tree with a multi-chunk file, nested directories and a zero-byte file arrives byte for byte through the
     /// real receiver.
     #[tokio::test]
