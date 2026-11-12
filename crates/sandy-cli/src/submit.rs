@@ -56,7 +56,7 @@ pub fn classify_positional<'a>(
     if positional.contains('#') {
         return Err(PlanError::Invalid(format!(
             "template `{positional}` has a `#`: a template is a flake reference, not a full attr; use --flake (with \
-             --kind)              for one"
+             --kind) for one"
         )));
     }
     Ok(Positional::Template(positional))
@@ -200,6 +200,14 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("from_devshell") || err.contains("unknown field"), "{err}");
+        // The real type keeps the guard: an unknown key is refused by name, never dropped.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        value["not_a_field"] = serde_json::Value::Bool(true);
+        let err = sandy_guest_template::manifest::decode_flake_manifest(&serde_json::to_vec(&value)?)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("not_a_field"), "{err}");
         Ok(())
     }
 

@@ -891,7 +891,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         let template = match (flake, manifest) {
             (None, Some(positional)) => {
                 match sandy_cli::submit::classify_positional(positional, manifest_encoding.as_deref(), |p| {
-                    std::path::Path::new(p).exists()
+                    std::path::Path::new(p).is_file()
                 }) {
                     Ok(sandy_cli::submit::Positional::Template(t)) => Some(t.to_owned()),
                     Ok(sandy_cli::submit::Positional::Manifest(_)) => None,
