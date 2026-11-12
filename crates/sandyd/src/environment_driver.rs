@@ -96,6 +96,8 @@ pub struct Report {
     pub killed: Vec<String>,
     /// Environment ids stopped because their idle-stop lease ran out.
     pub idle_stopped: Vec<String>,
+    /// Ephemeral environment ids deleted because their TTL ran out (#812).
+    pub reaped: Vec<String>,
 }
 
 impl Report {
@@ -105,6 +107,7 @@ impl Report {
             && self.failed.is_empty()
             && self.killed.is_empty()
             && self.idle_stopped.is_empty()
+            && self.reaped.is_empty()
     }
 }
 
@@ -935,6 +938,89 @@ mod tests {
         );
         driver.reconcile_once(now() + 302)?;
         assert!(backend.boxes()?.is_empty(), "the stop must end the box");
+        Ok(())
+    }
+
+    fn persistent_spec_bytes() -> Vec<u8> {
+        WireSpec {
+            profile: "harness".to_owned(),
+            size: "small".to_owned(),
+            lifetime: Some(EnvironmentLifetime {
+                kind: EnvironmentLifetimeKind::Persistent.into(),
+                ttl_secs: 0,
+            }),
+            task_ref: "task-1".to_owned(),
+        }
+        .encode_to_vec()
+    }
+
+    /// An ephemeral environment is deleted once its TTL (600 s in `spec_bytes`) has passed, by the same path as an
+    /// explicit delete: the row is `Deleted` and the next pass ends its box (#812).
+    #[test]
+    fn an_ephemeral_environment_is_deleted_when_its_ttl_runs_out() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        let created = state(&r.store, &id)?.created_at;
+        r.driver.reconcile_once(created)?;
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+
+        let before = r.driver.reconcile_once(created + 599)?;
+        assert!(before.reaped.is_empty(), "one second before the TTL: {before:?}");
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Ready);
+
+        let report = r.driver.reconcile_once(created + 600)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&id));
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Deleted);
+        r.driver.reconcile_once(created + 601)?;
+        assert!(r.backend.boxes()?.is_empty(), "the reap must end the box");
+        Ok(())
+    }
+
+    /// A row that is still `Provisioning` at its TTL is reaped too: the TTL bounds the environment, not Ready.
+    #[test]
+    fn a_provisioning_environment_past_its_ttl_is_reaped() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let id = add(&r.store, 1)?;
+        let created = state(&r.store, &id)?.created_at;
+        let report = r.driver.reconcile_once(created + 700)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&id));
+        assert_eq!(state(&r.store, &id)?.state, EnvironmentState::Deleted);
+        Ok(())
+    }
+
+    /// A persistent environment has no TTL and is never reaped, however old.
+    #[test]
+    fn a_persistent_environment_is_never_reaped() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        r.store.create(
+            "rp",
+            "env-p",
+            &persistent_spec_bytes(),
+            "sandy.control.v1.EnvironmentSpec",
+        )?;
+        let created = state(&r.store, "env-p")?.created_at;
+        r.driver.reconcile_once(created)?;
+        let report = r.driver.reconcile_once(created + 10 * 24 * 3600)?;
+        assert!(report.reaped.is_empty(), "{report:?}");
+        assert_eq!(state(&r.store, "env-p")?.state, EnvironmentState::Ready);
+        Ok(())
+    }
+
+    /// Deadlines come from the stored row, so a daemon that was down past a TTL reaps the row on its first pass and
+    /// leaves a younger one alone (#812, the restart rule).
+    #[test]
+    fn a_restarted_daemon_reaps_an_expired_row_and_keeps_a_young_one() -> Result<()> {
+        let r = rig(FakeEnvironmentBackend::new())?;
+        let old = add(&r.store, 1)?;
+        let created = state(&r.store, &old)?.created_at;
+        r.driver.reconcile_once(created)?;
+        let restarted = EnvironmentDriver::new(Arc::clone(&r.store), Arc::clone(&r.backend) as _, config());
+        let report = restarted.reconcile_once(created + 900)?;
+        assert_eq!(report.reaped, std::slice::from_ref(&old));
+        assert_eq!(state(&r.store, &old)?.state, EnvironmentState::Deleted);
+        let young = add(&r.store, 2)?;
+        let report = restarted.reconcile_once(state(&r.store, &young)?.created_at + 10)?;
+        assert!(report.reaped.is_empty(), "{report:?}");
         Ok(())
     }
 
