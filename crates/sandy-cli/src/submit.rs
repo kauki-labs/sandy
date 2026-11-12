@@ -45,7 +45,20 @@ pub fn classify_positional<'a>(
     manifest_encoding: Option<&str>,
     exists: impl Fn(&str) -> bool,
 ) -> Result<Positional<'a>, PlanError> {
-    let _ = (manifest_encoding, exists);
+    if manifest_encoding.is_some() {
+        return Ok(Positional::Manifest(positional));
+    }
+    if positional == "-" || exists(positional) {
+        return Err(PlanError::Invalid(format!(
+            "`{positional}` looks like a manifest file; pass --manifest-encoding to submit it as one"
+        )));
+    }
+    if positional.contains('#') {
+        return Err(PlanError::Invalid(format!(
+            "template `{positional}` has a `#`: a template is a flake reference, not a full attr; use --flake (with \
+             --kind)              for one"
+        )));
+    }
     Ok(Positional::Template(positional))
 }
 
@@ -61,8 +74,24 @@ pub fn flake_manifest(
     from_devshell: bool,
     plain: PlainFlags,
 ) -> Result<FlakeManifestV1, PlanError> {
-    let _ = (flake, kind, attr, from_devshell, plain);
-    Err(PlanError::Invalid("not implemented".to_owned()))
+    let env = plain
+        .env
+        .iter()
+        .map(|raw| crate::plan::parse_env(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FlakeManifestV1 {
+        flake,
+        kind,
+        attr,
+        command: plain.command,
+        history_lines: plain.history_lines,
+        env,
+        cpu: plain.cpu,
+        mem: plain.mem,
+        timeout_secs: plain.timeout,
+        service: None,
+        from_devshell,
+    })
 }
 
 /// The `flake/v1` manifest for a template: the flake reference with kind `topology`.
@@ -71,7 +100,7 @@ pub fn flake_manifest(
 ///
 /// [`PlanError::Invalid`] for a malformed `--env` entry.
 pub fn template_manifest(template: &str, plain: PlainFlags) -> Result<FlakeManifestV1, PlanError> {
-    flake_manifest(template.to_owned(), None, None, false, plain)
+    flake_manifest(template.to_owned(), Some("topology".to_owned()), None, false, plain)
 }
 
 #[cfg(test)]

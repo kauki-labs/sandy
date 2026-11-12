@@ -795,9 +795,9 @@ pub fn handle_dispatch(
                 &decoded.flake,
                 decoded.kind.as_deref(),
                 decoded.attr.as_deref(),
-                // `--from-devshell` over M2: non-goal (#332) — not worth
-                // forcing in without it falling out for free.
-                false,
+                // `--from-devshell` rides the manifest (A3, #483); an executor that predates the field refuses the
+                // manifest.
+                decoded.from_devshell,
                 // The macOS vfkit-prereq check: dead code on this host's
                 // Linux build target (`cfg!(target_os = "macos")` is false
                 // there), so a callback that never fires is correct, not a
