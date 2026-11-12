@@ -518,10 +518,22 @@ pub enum HandleDispatchError {
 }
 
 impl HandleDispatchError {
-    /// The `JobResult` message that reports this failure for `job_id` (#762).
+    /// The `JobResult` message that reports this failure for `job_id` (#762). A deadline or the total cap passing
+    /// during the input pull is a timeout; every other failure is a plain one, and a cancel keeps its own stable text
+    /// (sandyd already knows it cancelled).
     #[must_use]
     pub fn result_message(&self, job_id: String) -> sandy_executor_proto::HostExecutorMessage {
-        crate::run::failure_result_message(job_id, self.to_string())
+        let mut message = crate::run::failure_result_message(job_id, self.to_string());
+        if matches!(
+            self,
+            Self::DataLink(
+                crate::input_stage::StageError::DeadlinePassed | crate::input_stage::StageError::TotalCapExceeded
+            )
+        ) && let Some(sandy_executor_proto::host_executor_message::Op::Result(result)) = &mut message.op
+        {
+            result.timed_out = true;
+        }
+        message
     }
 }
 
@@ -897,7 +909,7 @@ mod tests {
         assert!(!cancelled.booted);
         assert_eq!(
             cancelled.transport_error.as_deref(),
-            Some("the job was cancelled while its inputs were being pulled")
+            Some("staging the inputs from the data link: the job was cancelled while its inputs were being pulled")
         );
         let failed = reported(&HandleDispatchError::DataLink(StageError::Dial("x".to_owned())))?;
         assert!(!failed.timed_out);

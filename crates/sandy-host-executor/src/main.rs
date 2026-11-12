@@ -136,7 +136,7 @@ async fn main() {
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(job_id, error = %e, "dispatch refused or failed");
-                        failure_result_message(job_id, e.to_string())
+                        e.result_message(job_id)
                     }
                     Err(e) => {
                         tracing::error!(job_id, error = %e, "the dispatch task panicked");
