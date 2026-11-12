@@ -58,6 +58,27 @@ message JobResult {
   // or a disconnect ends the transfer. False (also a sender that predates the
   // field): nothing follows.
   bool outputs_follow = 7;
+  // What the executor observed of the job's egress boundary (A2b of #483): present only when the dispatch carried an
+  // egress policy. Absent means the executor reported nothing (no policy, a sender that predates the field, or a run
+  // that ended before it could say), and the orchestrator must treat that as unenforced, never as applied.
+  optional EgressReport egress = 8;
+}
+
+// The state of a job's egress boundary, mirroring `sandy::EgressOutcome` and the apply failure the direct path
+// records: PROXIED is `Ok(Proxied)` (the per-run egress proxy served a booted guest), UNENFORCED is
+// `Ok(Unenforced { reason })`, FAILED is the `Err(reason)` of a boundary that was not established or never served a
+// run. UNSPECIFIED is never sent; a receiver reads it as no report.
+enum EgressState {
+  EGRESS_STATE_UNSPECIFIED = 0;
+  EGRESS_STATE_PROXIED = 1;
+  EGRESS_STATE_UNENFORCED = 2;
+  EGRESS_STATE_FAILED = 3;
+}
+
+message EgressReport {
+  EgressState state = 1;
+  // Why, for UNENFORCED and FAILED. Never a secret: an error string.
+  optional string reason = 2;
 }
 
 // Orchestrator -> host-executor.

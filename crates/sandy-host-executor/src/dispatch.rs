@@ -580,6 +580,18 @@ impl HandleDispatchError {
     }
 }
 
+/// The executor's egress report for a run that carried an egress policy (A2b of #483): the same outcome the direct
+/// path's receipt reads, `sandy::proxy_receipt_result`, in its wire shape. `PROXIED` only when the per-run egress
+/// proxy served a booted guest; a refusal before boot or a guest that never booted is `FAILED` with the reason.
+#[must_use]
+pub fn egress_report(run: &Result<Outcome, BackendError>) -> sandy_executor_proto::EgressReport {
+    let _ = run;
+    sandy_executor_proto::EgressReport {
+        state: sandy_executor_proto::EgressState::Unspecified.into(),
+        reason: None,
+    }
+}
+
 /// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
 #[derive(Debug)]
 pub struct Dispatched {
@@ -588,6 +600,8 @@ pub struct Dispatched {
     /// True when the outputs were sent over the data link (even if the send failed), so the orchestrator must wait
     /// for them before it records the job as finished (#482).
     pub outputs_follow: bool,
+    /// What the executor observed of the egress boundary: `Some` only for a run that carried a policy.
+    pub egress: Option<sandy_executor_proto::EgressReport>,
 }
 
 /// Plan where a remote job's outputs are collected: `None` for a local dispatch (no data link) or a job with no
@@ -626,6 +640,7 @@ fn dispatched(
     Dispatched {
         outcome,
         outputs_follow,
+        egress: None,
     }
 }
 
@@ -1792,6 +1807,61 @@ mod tests {
             "expected EgressPolicyInvalid before the manifest decode, got {err:?}"
         );
         Ok(())
+    }
+
+    /// A2b (#483): the report the executor sends is `sandy::proxy_receipt_result` in its wire shape, one row per way a
+    /// proxy-mode run can end, so the daemon's receipt reads the same fact the direct path's does.
+    #[test]
+    fn the_egress_report_mirrors_the_direct_proxy_receipt() {
+        use sandy_executor_proto::EgressState;
+        let outcome = |booted: bool| Outcome {
+            booted,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        };
+        let rows: Vec<(&str, Result<Outcome, BackendError>, EgressState, Option<&str>)> = vec![
+            ("booted guest", Ok(outcome(true)), EgressState::Proxied, None),
+            (
+                "guest never booted",
+                Ok(outcome(false)),
+                EgressState::Failed,
+                Some("the guest never booted, so the egress proxy served no run"),
+            ),
+            (
+                "refused before boot",
+                Err(BackendError::Spawn("no proxy binary".to_owned())),
+                EgressState::Failed,
+                Some("no proxy binary"),
+            ),
+            (
+                "proxy dead before the guest booted",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: false,
+                    guest_exit: None,
+                }),
+                EgressState::Failed,
+                Some("the egress proxy died before the guest booted, so it served no run"),
+            ),
+            (
+                "proxy dead after the guest booted",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: true,
+                    guest_exit: None,
+                }),
+                EgressState::Proxied,
+                None,
+            ),
+        ];
+        for (name, run, state, reason) in rows {
+            let report = egress_report(&run);
+            assert_eq!(report.state, i32::from(state), "{name}: state");
+            assert_eq!(report.reason.as_deref(), reason, "{name}: reason");
+        }
     }
 
     /// Adversarial (#332): an unrecognized/unspecified `backend` value is

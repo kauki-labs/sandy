@@ -1044,6 +1044,7 @@ mod tests {
             transport_error: None,
             console: String::new(),
             outputs_follow: false,
+            egress: None,
         };
         record_job_result(&store, &job_registry, &mut in_flight, &mut HashSet::new(), result).await;
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
@@ -1949,6 +1950,7 @@ mod tests {
             transport_error: None,
             console: String::new(),
             outputs_follow,
+            egress: None,
         }
     }
 
@@ -2105,6 +2107,7 @@ mod tests {
                 transport_error: transport_error.map(str::to_owned),
                 console: "hi\n".to_owned(),
                 outputs_follow: false,
+                egress: None,
             };
             record_job_result(
                 &store,
@@ -2227,6 +2230,148 @@ mod tests {
             sandy_executor_proto::Message::encoded_len(&reply) < sandy_control_proto::MAX_FRAME_LEN as usize,
             "the Status reply must fit one frame"
         );
+        Ok(())
+    }
+
+    /// The allow-list a test job was dispatched with.
+    fn allow() -> sandy::AllowList {
+        sandy::AllowList {
+            rules: vec![sandy::EgressRule {
+                host: "example.com".to_owned(),
+                port: 443,
+            }],
+        }
+    }
+
+    /// The egress receipt of the envelope the daemon records for a job dispatched with `allow()` whose executor sent
+    /// `report`.
+    async fn egress_receipt_for(
+        report: Option<sandy_executor_proto::EgressReport>,
+    ) -> anyhow::Result<sandy::EgressReceipt> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.egress_allow = Some(allow());
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                egress: report,
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let envelope = store.envelope("job-1")?.context("a terminal job carries an envelope")?;
+        Ok(envelope
+            .receipt
+            .context("the envelope carries the audit receipt")?
+            .host_observed
+            .egress)
+    }
+
+    /// A2b (#483): the envelope's egress receipt reads the executor's report: proxied is enforced with the allow-list
+    /// the job was dispatched with; unenforced and failed carry their reason and no allow-list; no report, or an
+    /// unspecified one, is unenforced and says the executor reported nothing. Never applied without a report.
+    #[tokio::test]
+    async fn the_egress_receipt_reads_the_executors_report() -> anyhow::Result<()> {
+        use sandy::EgressEnforcement::{Enforced, Unenforced};
+        use sandy_executor_proto::{EgressReport, EgressState};
+        let report = |state: EgressState, reason: Option<&str>| {
+            Some(EgressReport {
+                state: state.into(),
+                reason: reason.map(str::to_owned),
+            })
+        };
+        let rows = vec![
+            ("proxied", report(EgressState::Proxied, None), Enforced, None, true),
+            (
+                "unenforced",
+                report(EgressState::Unenforced, Some("macOS has no boundary")),
+                Unenforced,
+                Some("macOS has no boundary"),
+                false,
+            ),
+            (
+                "failed",
+                report(EgressState::Failed, Some("proxy refused")),
+                Unenforced,
+                Some("proxy refused"),
+                false,
+            ),
+            ("no report", None, Unenforced, Some("did not report"), false),
+            (
+                "unspecified",
+                report(EgressState::Unspecified, None),
+                Unenforced,
+                Some("did not report"),
+                false,
+            ),
+        ];
+        for (name, sent, status, reason, applied) in rows {
+            let receipt = egress_receipt_for(sent).await?;
+            assert_eq!(receipt.status, status, "{name}: status");
+            if let Some(reason) = reason {
+                assert!(
+                    receipt.reason.as_deref().is_some_and(|r| r.contains(reason)),
+                    "{name}: reason {:?}",
+                    receipt.reason
+                );
+            }
+            assert_eq!(receipt.allow_list, applied.then(allow), "{name}: allow-list");
+        }
+        Ok(())
+    }
+
+    /// A2b (#483): parity with the direct path. The same run, through the executor's report and the daemon's receipt,
+    /// gives exactly the egress receipt the direct supervisor builds from `proxy_receipt_result`: one row per way a
+    /// proxy-mode run can end.
+    #[tokio::test]
+    async fn the_daemons_egress_receipt_equals_the_direct_paths() -> anyhow::Result<()> {
+        use sandy_api::backend::{BackendError, Outcome};
+        let outcome = |booted: bool| Outcome {
+            booted,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        };
+        let runs: Vec<(&str, Result<Outcome, BackendError>)> = vec![
+            ("booted guest", Ok(outcome(true))),
+            ("guest never booted", Ok(outcome(false))),
+            (
+                "refused before boot",
+                Err(BackendError::Spawn("no proxy binary".to_owned())),
+            ),
+            (
+                "proxy dead before boot",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: false,
+                    guest_exit: None,
+                }),
+            ),
+            (
+                "proxy dead after boot",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: true,
+                    guest_exit: None,
+                }),
+            ),
+        ];
+        for (name, run) in runs {
+            let direct = sandy::build_egress_receipt(&sandy::proxy_receipt_result(&run), &allow());
+            let reported = sandy_host_executor::dispatch::egress_report(&run);
+            let daemon = egress_receipt_for(Some(reported)).await?;
+            assert_eq!(daemon, direct, "{name}");
+        }
         Ok(())
     }
 
