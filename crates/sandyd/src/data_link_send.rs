@@ -18,8 +18,8 @@ use std::{collections::HashSet, ffi::OsStr, io::Read, path::PathBuf, time::Durat
 
 use sandy_control_proto::{FrameError, write_frame};
 use sandy_executor_proto::{
-    DataLinkMessage, InputChunk, InputEnd, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES, MAX_TRANSFER_ENTRIES, TransferError,
-    data_link_message::Op,
+    DataLinkMessage, DataLinkViolation, InputChunk, InputEnd, MAX_CHUNK_BYTES, MAX_TRANSFER_BYTES,
+    MAX_TRANSFER_ENTRIES, TransferError, data_link_message::Op,
 };
 use sandy_fsutil::beneath::{self, Beneath, EntryKind};
 use tokio::io::AsyncWrite;
@@ -82,6 +82,12 @@ pub enum SendError {
     /// A declared input has an empty name, so its chunks cannot be named.
     #[error("a declared input has no name")]
     UnnamedInput,
+    /// Two declared inputs have one name: the receiver would end with `Clash` after bytes moved (#771).
+    #[error("two declared inputs have the same name")]
+    DuplicateName,
+    /// A name the receiver would refuse (too long, an absolute or `..` path, a NUL): refused at the source (#770).
+    #[error("an input name the receiver would refuse: {0}")]
+    InvalidName(#[source] DataLinkViolation),
     /// The transfer is past its byte cap.
     #[error("the transfer is past its byte cap")]
     TooManyBytes,
@@ -104,6 +110,8 @@ impl SendError {
             Self::UnsupportedEntry => "an input holds an entry that is not a file or a directory",
             Self::EmptyInput => "a declared input holds no file",
             Self::UnnamedInput => "a declared input has no name",
+            Self::DuplicateName => "two declared inputs have the same name",
+            Self::InvalidName(_) => "an input name is not allowed",
             Self::TooManyBytes => "the transfer is past its byte cap",
             Self::TooManyEntries => "the transfer is past its entry cap",
         }
@@ -194,10 +202,16 @@ fn read_inputs(
         entries: 0,
         dirs: HashSet::new(),
     };
-    for (name, path) in inputs {
+    let mut declared = HashSet::new();
+    for (name, _) in inputs {
         if name.is_empty() {
             return Err(SendError::UnnamedInput);
         }
+        if !declared.insert(name.as_str()) {
+            return Err(SendError::DuplicateName);
+        }
+    }
+    for (name, path) in inputs {
         let before = walk.sent.files;
         match beneath::open_file(path) {
             Ok(file) => walk.file(name, file)?,
@@ -238,6 +252,16 @@ impl Walk<'_> {
     /// Send one file as chunks in order from offset 0. A zero-byte file is one empty chunk, and no empty chunk
     /// follows data.
     fn file(&mut self, wire: &str, mut file: std::fs::File) -> Result<(), SendError> {
+        // The receiver's own check, on the name before any chunk carries it.
+        DataLinkMessage {
+            op: Some(Op::InputChunk(InputChunk {
+                name: wire.to_owned(),
+                offset: 0,
+                bytes: Vec::new(),
+            })),
+        }
+        .validate()
+        .map_err(SendError::InvalidName)?;
         for (i, _) in wire.match_indices('/') {
             if self.dirs.insert(wire[..i].to_owned()) {
                 self.count_entry()?;
@@ -369,9 +393,7 @@ mod tests {
         let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
         for name in [too_long.as_str(), "a/../b", "./a", "/abs", "a\0b", "a//b", "a/"] {
             let declared = sandy_executor_proto::Input {
-                host: source.path().join("f").to_string_lossy().into_owned(),
                 name: name.to_owned(),
-                guest_path: None,
                 ..input(source.path(), "f")
             };
             assert_refused_before_any_chunk(&[declared])
@@ -387,9 +409,13 @@ mod tests {
     async fn a_nested_file_whose_wire_name_is_too_long_is_refused_at_the_source() -> anyhow::Result<()> {
         let source = tempfile::tempdir().context("source")?;
         write(&source.path().join("tree/short"), b"x")?;
-        let deep = vec!["d".repeat(200); 4].join("/");
-        write(&source.path().join("tree").join(deep).join("f"), b"y")?;
-        let (sent, messages) = frames(&[input(source.path(), "tree")], SendLimits::default()).await?;
+        write(&source.path().join("tree").join("f".repeat(200)), b"y")?;
+        // A declared name just under the cap: the file below it has a wire name over it.
+        let declared = sandy_executor_proto::Input {
+            name: "n".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES - 100),
+            ..input(source.path(), "tree")
+        };
+        let (sent, messages) = frames(&[declared], SendLimits::default()).await?;
         assert!(sent.is_err(), "the send must be refused, got {sent:?}");
         assert!(
             !messages
