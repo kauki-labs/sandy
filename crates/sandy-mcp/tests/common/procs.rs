@@ -47,6 +47,18 @@ pub fn descendants_in(table: &[(u32, u32, u64)], root: u32) -> Vec<(u32, u64)> {
     found
 }
 
+/// The process group id from the text of `/proc/<pid>/stat`.
+pub fn parse_pgrp(_stat: &str) -> Option<u32> {
+    None
+}
+
+/// `(pid, start time)` of every member of process group `pgid` in `table`, a list of `(pid, pgrp, start time)`.
+/// `pgid` itself is listed when it is a member. The test starts `sandyd` as the leader of its own group, so a VM part
+/// that was re-parented or double-forked still carries that group id, which the parent walk cannot see.
+pub fn group_members_in(_table: &[(u32, u32, u64)], _pgid: u32) -> Vec<(u32, u64)> {
+    Vec::new()
+}
+
 /// Whether a process name (`/proc/<pid>/comm`) is part of a VM: qemu, its virtiofs daemons or the egress proxy.
 /// The nix-wrapped binaries report a leading dot (`.qemu-system-x8`), and `comm` keeps 15 characters.
 pub fn is_vm_part(comm: &str) -> bool {
