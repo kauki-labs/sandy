@@ -173,8 +173,13 @@ pub(crate) const MAX_SUBMIT_TRANSFER_PATHS: usize = 256;
 
 /// Refuse a Submit that declares more inputs or outputs than `MAX_SUBMIT_TRANSFER_PATHS` (#807), before any side
 /// effect.
-fn submit_caps_refusal(_submit: &SubmitRequest) -> Option<String> {
-    None
+fn submit_caps_refusal(submit: &SubmitRequest) -> Option<String> {
+    [("inputs", submit.inputs.len()), ("outputs", submit.outputs.len())]
+        .into_iter()
+        .find(|&(_, count)| count > MAX_SUBMIT_TRANSFER_PATHS)
+        .map(|(field, count)| {
+            format!("{field}: {count} declared, at most {MAX_SUBMIT_TRANSFER_PATHS} are allowed per Submit")
+        })
 }
 
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
