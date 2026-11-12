@@ -10,8 +10,9 @@ use std::time::SystemTime;
 /// it, so a `Status` reply (the console twice, one of them JSON-escaped at up to six bytes per byte) fits one frame.
 pub(crate) const MAX_CONSOLE_BYTES: usize = 64 * 1024;
 
-/// The most bytes of the envelope's `message` the daemon keeps.
-const MAX_MESSAGE_BYTES: usize = 4 * 1024;
+/// The most bytes of the envelope's `message` the daemon keeps. Applied after redaction, never before: a cut first
+/// would leave the end of a token that straddles it.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 
 /// `text` cut to its last `max` bytes, on a character boundary.
 pub(crate) fn tail(text: &str, max: usize) -> &str {
@@ -87,7 +88,8 @@ fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>) -> Audit
 }
 
 /// The envelope for a run that ended with `facts` and `exit_code`, once its outputs are settled to `outputs`.
-/// `console` is the already-redacted tail.
+/// `console` is the already-redacted tail. The `message` is the executor's own words, unredacted and uncut: the caller
+/// redacts it, then cuts it to `MAX_MESSAGE_BYTES`.
 pub(crate) fn from_run(
     job_id: &str,
     facts: &RunFacts,
@@ -120,7 +122,7 @@ pub(crate) fn from_run(
         None,
         classification,
         exit_code,
-        tail(&message, MAX_MESSAGE_BYTES).to_owned(),
+        message,
         tail(&console, MAX_CONSOLE_BYTES).to_owned(),
         Vec::new(),
         Some(receipt(job_id, exit_code, host_id)),

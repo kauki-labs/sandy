@@ -436,10 +436,8 @@ impl JobStore {
         Ok(Transition::Applied)
     }
 
-    /// Record a terminal result for `job_id` with no result envelope: for callers that never produce one (the broker's
-    /// test fixtures). The daemon's own terminal paths use `finish_with` and record an envelope.
-    ///
-    /// Record a terminal result for `job_id`: its final `status`, the guest
+    /// Record a terminal result for `job_id` with no result envelope (the daemon's own terminal paths use
+    /// `finish_with` and record one): its final `status`, the guest
     /// `exit_code` (if any), and a bounded `console` tail (#292). Applies only
     /// from `Pending` or `Running`; refused from any terminal state, so a
     /// result arriving after a cancel (decision 12: a cancel cannot retract an
