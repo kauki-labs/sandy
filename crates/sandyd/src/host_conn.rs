@@ -465,7 +465,11 @@ async fn relay_dispatches(
 /// may be none).
 fn classify(result: &JobResult) -> (JobStatus, Option<i32>) {
     match result.exit_code {
-        Some(0) if !result.timed_out && result.transport_error.is_none() => (JobStatus::Succeeded, Some(0)),
+        // A run that says it never booted is not a success whatever exit it carries (#829): the envelope's own
+        // classifier says the same.
+        Some(0) if result.booted && !result.timed_out && result.transport_error.is_none() => {
+            (JobStatus::Succeeded, Some(0))
+        }
         other => (JobStatus::Failed, other),
     }
 }
