@@ -38,7 +38,7 @@ impl OutputStaging {
         // Explicit: `tempfile` applies only the umask default (0755) unless a mode is given, and the staged outputs are
         // the job's own files.
         let root = tempfile::Builder::new()
-            .prefix("sandy-outputs-")
+            .prefix(&crate::staging_sweep::root_prefix("outputs"))
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(parent)?;
         let mut run_outputs = Vec::with_capacity(declared.len());

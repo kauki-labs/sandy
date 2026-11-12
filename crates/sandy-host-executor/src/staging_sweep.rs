@@ -10,15 +10,62 @@ use std::path::Path;
 /// The directory-name prefix of a staging root of `kind` (`inputs` or `outputs`) made by this process.
 #[must_use]
 pub fn root_prefix(kind: &str) -> String {
-    format!("sandy-{kind}-")
+    format!("sandy-{kind}-{}-", std::process::id())
+}
+
+/// The pid in a `sandy-<inputs|outputs>-<pid>-<random>` name, or `None` for any other name.
+fn root_name_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix("sandy-inputs-")
+        .or_else(|| name.strip_prefix("sandy-outputs-"))?;
+    let (pid, random) = rest.split_once('-')?;
+    (!random.is_empty()).then_some(())?;
+    pid.parse().ok()
+}
+
+/// Whether a process with this pid exists. A pid that cannot be signalled for lack of permission still exists.
+fn process_is_alive(pid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process};
+
+    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return true;
+    };
+    !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH))
 }
 
 /// Remove the staging roots under `parent` that a process that is gone left behind. Returns how many it removed.
-/// Best effort: nothing here fails the start.
+/// Only a real directory owned by this user with a root name is a candidate: a symlink, a file or a foreign name is
+/// left, and this process's own roots are never touched (a job may be using one). A live process's roots are left, and
+/// a pid reused by a live process keeps its leftover. Best effort: nothing here fails the start.
 #[must_use]
 pub fn sweep_stale_roots(parent: &Path) -> usize {
-    let _ = parent;
-    0
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    let (own, uid) = (std::process::id(), rustix::process::getuid().as_raw());
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let Some(pid) = entry.file_name().to_str().and_then(root_name_pid) else {
+            continue;
+        };
+        if pid == own || process_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.uid() != uid {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(error = %e, root = %path.display(), "could not remove a stale staging root"),
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

@@ -48,6 +48,12 @@ async fn main() {
         }
     };
 
+    // A crash or a kill skips the drop of a job's staging roots: remove the ones whose process is gone (#763).
+    let swept = sandy_host_executor::staging_sweep::sweep_stale_roots(&std::env::temp_dir());
+    if swept > 0 {
+        tracing::info!(swept, "removed stale staging roots left by a process that is gone");
+    }
+
     let capabilities = match detect_register_capabilities() {
         Ok(capabilities) => capabilities,
         Err(e) => {
