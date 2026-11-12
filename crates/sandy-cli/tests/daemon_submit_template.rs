@@ -164,3 +164,25 @@ fn from_devshell_with_a_flake_is_accepted() -> anyhow::Result<()> {
     assert!(!text.contains("unexpected argument"), "{text}");
     Ok(())
 }
+
+/// A path flake (a directory) is the commonest local TEMPLATE: it is not a manifest file and must reach the daemon
+/// step, not be refused as one.
+#[test]
+fn a_directory_template_is_not_taken_for_a_manifest_file() -> anyhow::Result<()> {
+    let home = tempfile::tempdir().context("home")?;
+    let flake = home.path().join("guest");
+    std::fs::create_dir(&flake).context("flake dir")?;
+    std::fs::write(flake.join("flake.nix"), b"{}").context("flake.nix")?;
+    let out = submit(
+        home.path(),
+        &[flake.to_str().context("utf8")?, "--isolation-class", "trusted"],
+    )?;
+    let text = stderr(&out);
+    assert!(!text.contains("looks like a manifest file"), "{text}");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "a directory template is not a usage error: {text}"
+    );
+    Ok(())
+}
