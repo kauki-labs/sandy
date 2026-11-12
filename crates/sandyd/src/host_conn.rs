@@ -552,6 +552,9 @@ async fn record_job_result(
         // The host collects and sends after any run that returns, a non-zero exit included, so the wait does not
         // depend on the status: the exit is recorded as classified once the outputs are in.
         if result.outputs_follow {
+            // The run is over: nothing uses the job's credential while its outputs arrive, so revoke it now, not
+            // when they settle (up to `OUTPUTS_WAIT` later). `finish_job` releases again; that is a no-op.
+            job_registry.release_credential(&job_id);
             awaiting.insert(job_id.clone());
             return Some(AwaitedOutputs {
                 job_id,
