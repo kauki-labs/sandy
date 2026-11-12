@@ -8,6 +8,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use sandy::OutputStatus;
 use sandy_conn::{Conn, PeerAddr};
 use sandy_control_proto::{FrameError, JobStatus, read_frame, write_frame};
 use sandy_executor_proto::{
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::{
     credential::Redaction,
     dispatch::JobRegistry,
+    envelope::RunFacts,
     host_registry::{ExecutorAllowlist, HostRegistry, RegisterError, Registration},
     store::{JobStore, Transition},
 };
@@ -510,6 +512,11 @@ async fn record_job_result(
 ) -> Option<AwaitedOutputs> {
     let (status, exit_code) = classify(&result);
     let job_id = result.job_id.clone();
+    let facts = RunFacts {
+        booted: result.booted,
+        timed_out: result.timed_out,
+        transport_error: result.transport_error.clone(),
+    };
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
     // A result for a job this connection never ran is not recorded either: it
@@ -542,9 +549,29 @@ async fn record_job_result(
                 "{}\n[sandy: the job is not registered, so its outputs cannot be checked]",
                 result.console
             );
-            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                JobStatus::Failed,
+                exit_code,
+                console,
+                &facts,
+                OutputStatus::RequiredMissing,
+            )
+            .await;
         } else {
-            finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                status,
+                exit_code,
+                result.console,
+                &facts,
+                OutputStatus::Complete,
+            )
+            .await;
         }
         return None;
     };
@@ -566,6 +593,7 @@ async fn record_job_result(
                 status,
                 exit_code,
                 console,
+                facts,
             });
         }
         if status == JobStatus::Succeeded {
@@ -578,12 +606,32 @@ async fn record_job_result(
                 "{}\n[sandy: the host reported no outputs for a job that declares outputs]",
                 result.console
             );
-            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+            finish_job(
+                store,
+                job_registry,
+                &job_id,
+                JobStatus::Failed,
+                exit_code,
+                console,
+                &facts,
+                OutputStatus::RequiredMissing,
+            )
+            .await;
             return None;
         }
     }
     in_flight.remove(&job_id);
-    finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+    finish_job(
+        store,
+        job_registry,
+        &job_id,
+        status,
+        exit_code,
+        result.console,
+        &facts,
+        OutputStatus::Complete,
+    )
+    .await;
     None
 }
 
@@ -599,6 +647,10 @@ fn redact_console(credentials: Option<&crate::credential::JobCredentials>, job_i
 }
 
 /// Move `job_id` to its terminal `status`, off the connection task, and end its credential and its outputs slot.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the terminal record: the lifecycle status, its envelope facts and where it ran"
+)]
 async fn finish_job(
     store: &Arc<JobStore>,
     job_registry: &JobRegistry,
@@ -606,14 +658,20 @@ async fn finish_job(
     status: JobStatus,
     exit_code: Option<i32>,
     console: String,
+    facts: &RunFacts,
+    outputs: OutputStatus,
 ) {
     let store = Arc::clone(store);
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
+    let facts = facts.clone();
+    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
-        store.finish(&jid, status, exit_code, &console)
+        // The envelope carries the same redacted console, so it never holds the token either.
+        let envelope = crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;
     match transition {
@@ -652,6 +710,8 @@ pub(crate) struct AwaitedOutputs {
     status: JobStatus,
     exit_code: Option<i32>,
     console: String,
+    /// The run's own physical facts, for the envelope built once the outputs settle.
+    facts: RunFacts,
 }
 
 impl AwaitedOutputs {
@@ -673,7 +733,7 @@ impl AwaitedOutputs {
             Some(job) => job.outputs.wait(within).await,
             None => crate::output_slot::OutputsState::Failed("the job is no longer registered".to_owned()),
         };
-        let (status, console) = match state {
+        let (status, console, outputs) = match state {
             crate::output_slot::OutputsState::Received(received) => {
                 tracing::info!(
                     job_id = self.job_id,
@@ -681,7 +741,7 @@ impl AwaitedOutputs {
                     bytes = received.bytes,
                     "the job's outputs are in place"
                 );
-                (self.status, self.console)
+                (self.status, self.console, OutputStatus::Complete)
             }
             crate::output_slot::OutputsState::Failed(reason) => {
                 tracing::warn!(
@@ -695,12 +755,25 @@ impl AwaitedOutputs {
                         "{}\n[sandy: the job's outputs were not received: {reason}]",
                         self.console
                     ),
+                    OutputStatus::RequiredMissing,
                 )
             }
             // `wait` never returns a pending slot.
-            crate::output_slot::OutputsState::Pending => (JobStatus::Failed, self.console),
+            crate::output_slot::OutputsState::Pending => {
+                (JobStatus::Failed, self.console, OutputStatus::RequiredMissing)
+            }
         };
-        finish_job(store, job_registry, &self.job_id, status, self.exit_code, console).await;
+        finish_job(
+            store,
+            job_registry,
+            &self.job_id,
+            status,
+            self.exit_code,
+            console,
+            &self.facts,
+            outputs,
+        )
+        .await;
         self.job_id
     }
 }
@@ -712,13 +785,11 @@ impl AwaitedOutputs {
 async fn fail_disconnected_job(store: &Arc<JobStore>, job_registry: &JobRegistry, job_id: &str) {
     let store = Arc::clone(store);
     let jid = job_id.to_owned();
+    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
     let transition = tokio::task::spawn_blocking(move || {
-        store.finish(
-            &jid,
-            JobStatus::Failed,
-            None,
-            "host-executor disconnected before reporting a result",
-        )
+        let reason = "host-executor disconnected before reporting a result";
+        let envelope = crate::envelope::infra_fault(&jid, reason, host_id.as_deref());
+        store.finish_with(&jid, JobStatus::Failed, None, reason, Some(&envelope))
     })
     .await;
     match transition {

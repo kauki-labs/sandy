@@ -854,8 +854,10 @@ pub async fn handle(
                     let reason = format!("could not dispatch to the placed host-executor: {e}");
                     let fail_job_id = job_id.clone();
                     let store = Arc::clone(&store_for_dispatch_failure);
+                    let fail_host_id = host_id.clone();
                     match tokio::task::spawn_blocking(move || {
-                        store.finish(&fail_job_id, JobStatus::Failed, None, &reason)
+                        let envelope = crate::envelope::infra_fault(&fail_job_id, &reason, Some(&fail_host_id));
+                        store.finish_with(&fail_job_id, JobStatus::Failed, None, &reason, Some(&envelope))
                     })
                     .await
                     {
@@ -1106,14 +1108,19 @@ pub async fn handle(
             // code and console tail a remote run reported back (#292), surfaced
             // so `status` returns the terminal state AND the exit, not just the
             // lifecycle band.
-            let detail = tokio::task::spawn_blocking(move || store.detail(&job_id)).await??;
+            let (detail, envelope) = tokio::task::spawn_blocking(move || {
+                let detail = store.detail(&job_id)?;
+                let envelope = store.envelope_json(&job_id)?;
+                Ok::<_, crate::store::StoreError>((detail, envelope))
+            })
+            .await??;
             match detail {
                 Some(detail) => control_response::Result::Status(StatusResponse {
                     job_id: status_req.job_id,
                     status: i32::from(detail.status),
                     exit_code: detail.exit_code,
                     console_tail: detail.console,
-                    result_envelope: None,
+                    result_envelope: envelope.map(String::into_bytes),
                 }),
                 None => control_response::Result::Error(ControlError {
                     message: format!("no such job: {}", status_req.job_id),
@@ -1313,6 +1320,51 @@ mod tests {
                 egress: None,
             }),
         )
+    }
+
+    /// A2 (#483): `Status` serves the stored result envelope of a terminal job as its own JSON, and none before the
+    /// job is terminal.
+    #[tokio::test]
+    async fn status_serves_the_stored_envelope_of_a_terminal_job_and_none_before() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let job_id = match response.result {
+            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        };
+        let status_bytes = |store: &Arc<JobStore>, registry: &Arc<JobRegistry>, host_registry: &Arc<HostRegistry>| {
+            let (store, registry, host_registry, job_id) =
+                (store.clone(), registry.clone(), host_registry.clone(), job_id.clone());
+            async move {
+                let response = handle(
+                    &store,
+                    &registry,
+                    &host_registry,
+                    None,
+                    test_session(),
+                    req(2, control_request::Op::Status(StatusRequest { job_id })),
+                )
+                .await?;
+                match response.result {
+                    Some(control_response::Result::Status(status)) => Ok::<_, anyhow::Error>(status.result_envelope),
+                    other => anyhow::bail!("expected a Status response, got {other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            status_bytes(&store, &registry, &host_registry).await?,
+            None,
+            "pending: no envelope"
+        );
+        let envelope = crate::envelope::infra_fault(&job_id, "lost the host", Some("host-1"));
+        store.finish_with(&job_id, JobStatus::Failed, None, "lost the host", Some(&envelope))?;
+        let bytes = status_bytes(&store, &registry, &host_registry)
+            .await?
+            .context("a terminal job's status carries the envelope")?;
+        let decoded: sandy::ResultEnvelope =
+            serde_json::from_slice(&bytes).context("the bytes are the envelope's JSON")?;
+        assert_eq!(decoded, envelope);
+        Ok(())
     }
 
     #[tokio::test]

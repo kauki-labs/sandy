@@ -19,6 +19,7 @@ pub mod credential;
 pub mod data_link_recv;
 pub mod data_link_send;
 pub mod dispatch;
+mod envelope;
 pub mod environment;
 pub mod environment_backend;
 pub mod environment_credential;

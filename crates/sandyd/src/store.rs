@@ -38,6 +38,15 @@ pub enum StoreError {
         /// The unrecognised stored value.
         raw: String,
     },
+    /// A stored result envelope does not decode: a row this store wrote should never hold one. Fails the one read
+    /// that touches it, never silently reports no envelope.
+    #[error("job store: job {job_id:?} has an unreadable stored result envelope: {reason}")]
+    CorruptEnvelope {
+        /// The job whose row is corrupt.
+        job_id: String,
+        /// Why it does not decode.
+        reason: String,
+    },
     /// Could not chmod the store file (CF-M-7).
     #[error("job store: {0}")]
     Io(#[from] std::io::Error),
@@ -238,6 +247,10 @@ impl JobStore {
         // backfilled or guessed at for a job submitted before this column
         // existed.
         ensure_column(&conn, "archive", "ALTER TABLE jobs ADD COLUMN archive BLOB")?;
+        // The terminal result envelope (A2 of #483), as the envelope's own JSON: written in the same statement as the
+        // terminal status, so a terminal row never lacks one unless it was recorded before this column existed
+        // (NULL, read as no envelope, never fabricated).
+        ensure_column(&conn, "envelope", "ALTER TABLE jobs ADD COLUMN envelope TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -439,6 +452,30 @@ impl JobStore {
         exit_code: Option<i32>,
         console: &str,
     ) -> Result<Transition, StoreError> {
+        self.finish_with(job_id, status, exit_code, console, None)
+    }
+
+    /// [`Self::finish`] that also stores the terminal result `envelope` (A2 of #483) in the same statement, so the
+    /// status and its envelope never disagree after a crash.
+    ///
+    /// # Errors
+    /// As [`Self::finish`]; [`StoreError::CorruptEnvelope`] if the envelope does not serialize.
+    pub fn finish_with(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        exit_code: Option<i32>,
+        console: &str,
+        envelope: Option<&sandy::ResultEnvelope>,
+    ) -> Result<Transition, StoreError> {
+        let envelope_json =
+            envelope
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| StoreError::CorruptEnvelope {
+                    job_id: job_id.to_owned(),
+                    reason: e.to_string(),
+                })?;
         let conn = self.lock();
         let Some(current) = query_status(&conn, job_id)? else {
             return Ok(Transition::NotFound);
@@ -447,8 +484,16 @@ impl JobStore {
             return Ok(Transition::Refused(current));
         }
         conn.execute(
-            "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, updated_at = ?4 WHERE job_id = ?5",
-            (status_name(status), exit_code, console, now_unix(), job_id),
+            "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, envelope = ?4, updated_at = ?5 WHERE job_id = \
+             ?6",
+            (
+                status_name(status),
+                exit_code,
+                console,
+                envelope_json,
+                now_unix(),
+                job_id,
+            ),
         )?;
         Ok(Transition::Applied)
     }
@@ -488,8 +533,29 @@ impl JobStore {
     /// # Errors
     /// [`StoreError::Sqlite`] if the read fails.
     pub fn envelope(&self, job_id: &str) -> Result<Option<sandy::ResultEnvelope>, StoreError> {
-        let _ = job_id;
-        Ok(None)
+        self.envelope_json(job_id)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| StoreError::CorruptEnvelope {
+                    job_id: job_id.to_owned(),
+                    reason: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    /// The stored envelope's JSON as written, for a reply that forwards it without decoding and re-encoding it.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read fails.
+    pub fn envelope_json(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock();
+        match conn.query_row("SELECT envelope FROM jobs WHERE job_id = ?1", [job_id], |row| {
+            row.get::<_, Option<String>>(0)
+        }) {
+            Ok(json) => Ok(json),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Every job's id and current status, in no particular guaranteed order
