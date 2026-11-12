@@ -2298,6 +2298,11 @@ terminal envelope, so it would need a second record kind and a different reconci
 - Inputs are validated before any write: keys and names are 1 to 128 (profile 64, size 32) letters, digits, `-`, `_`
   or `.`; a profile that looks like a credential is refused; `task_ref` is at most 256 bytes without control
   characters; an ephemeral lifetime needs a TTL between 1 second and 7 days, a persistent one has none.
+- The driver reaps an ephemeral environment at `created_at + ttl_secs`, counted from creation whatever state it is in, by the store's
+  `delete`; the same pass then kills its box and revokes its credential as for any deleted row (#812). The deadline is read
+  from the stored row, so a restarted daemon reaps an expired row on its first pass. A persistent environment is never
+  reaped. The grace is the driver's pass interval (1 second). Ending a task has no signal in sandyd; `delete_environment`
+  is the explicit one, and what else ends a task is #815.
 - An ephemeral environment answers `UNSUPPORTED_FOR_LIFETIME` to stop and resume. `cancel` applies only while
   `Provisioning`; `delete` applies from every state and is idempotent.
 - The daemon opens the environment store in the same `0600` file as the job store. `SANDY_MAX_ENVIRONMENTS` caps

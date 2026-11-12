@@ -74,6 +74,10 @@ const SERVICE_COMMAND: &str = "socat TCP-LISTEN:{port},bind=127.0.0.1,fork,reuse
 /// `sun_path` holds 107 plus the NUL. 38 leaves 2 bytes of margin.
 const MAX_TMP_BYTES: usize = 38;
 const STUB_ROOT: &str = "live";
+/// The TTL of the ephemeral environment of AT-5 (#812) and the grace the daemon gets past it: a boot (about 15 s), then
+/// the TTL from creation, then a pass every second.
+const TTL_SECS: u64 = 45;
+const TTL_GRACE_SECS: u64 = 30;
 const SERVICE_PORT: &str = "9000";
 const SERVICE_USER: &str = "nobody";
 
@@ -910,6 +914,26 @@ fn scenario(stack: &Stack) -> Result<()> {
     run_script(&mut mcp, &script)?;
     stack.check_session(mcp, "script session")?;
     stack.canary_leaks("after the script")?;
+
+    // AT-5 (#812): an ephemeral environment is deleted at its TTL with no delete call, and its VM and credential go
+    // with it. The TTL counts from creation and the driver passes every second, so the grace is a few seconds.
+    let mut mcp = stack.mcp()?;
+    let mut ttl_spawn = spawn_args("live-ttl", "ttl");
+    ttl_spawn["lifetime"] = json!({"kind": "ephemeral", "ttl_secs": TTL_SECS});
+    let (is_err, spawned) = mcp.call("spawn_environment", &ttl_spawn)?;
+    ensure!(!is_err, "AT-5: spawn with a short TTL failed: {spawned}");
+    let ttl_id = spawned["environment_id"].as_str().context("environment_id")?.to_owned();
+    let created = Instant::now();
+    wait_state(&mut mcp, &ttl_id, "deleted", TTL_SECS + TTL_GRACE_SECS)
+        .context("AT-5: the environment was not deleted by its TTL")?;
+    ensure!(
+        created.elapsed() >= Duration::from_secs(TTL_SECS),
+        "AT-5: deleted before its TTL: {:?}",
+        created.elapsed()
+    );
+    eprintln!("KPI ephemeral TTL {TTL_SECS} s: deleted after {:?}", created.elapsed());
+    stack.check_session(mcp, "ttl session")?;
+    stack.wait_no_vm(60)?;
 
     // After the run: no non-terminal environment through the API, no VM of ours, nothing new in /tmp/sandy-*.
     stack.wait_no_vm(120)?;
