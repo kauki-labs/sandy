@@ -62,8 +62,19 @@ impl OutputsSlot {
         let decided = tokio::time::timeout(within, rx.wait_for(|state| *state != OutputsState::Pending)).await;
         match decided {
             Ok(Ok(state)) => state.clone(),
-            Ok(Err(_)) | Err(_) => OutputsState::Failed("the outputs did not arrive in time".to_owned()),
+            // Published, so the receive that may still be waiting for a first frame gives up too.
+            Ok(Err(_)) | Err(_) => {
+                self.publish(OutputsState::Failed("the outputs did not arrive in time".to_owned()));
+                // The first outcome stands: a receive that finished just now wins over the timeout.
+                self.state.borrow().clone()
+            }
         }
+    }
+
+    /// Resolve once the slot is decided, by the receive or by the job ending. No time limit: the caller bounds it.
+    pub async fn decided(&self) {
+        let mut rx = self.state.subscribe();
+        let _ = rx.wait_for(|state| *state != OutputsState::Pending).await;
     }
 }
 

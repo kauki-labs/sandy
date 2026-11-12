@@ -19,8 +19,15 @@ use std::sync::Arc;
 use sandy_conn::{Conn, Listener, PeerAddr};
 use sandy_executor_proto::decode_remote_link_prefix;
 use sandy_fabric_local::link::serve_agent_link;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{dispatch::JobRegistry, link_auth::LinkKind, spawn_gated_accept};
+use crate::{
+    data_link_recv::{ReceiveError, receive_outputs},
+    dispatch::JobRegistry,
+    link_auth::LinkKind,
+    output_slot::OutputsState,
+    spawn_gated_accept,
+};
 
 /// How long a freshly accepted connection has to deliver its full run-id +
 /// token prefix before it's closed. Without a deadline here, a peer that
@@ -167,15 +174,122 @@ async fn serve_one_remote_link(mut conn: Box<dyn Conn>, peer: PeerAddr, registry
 
 /// Serve a claimed data link: send the job's inputs, then, when the job declares outputs, receive them and publish
 /// how that came out to the job's [`crate::output_slot::OutputsSlot`].
+///
+/// The host sends the outputs after the job ran, which can be hours after the link opened, so the receive's idle and
+/// total clocks start at the first byte, not here. Until then the wait is bounded by the slot: the result relay
+/// publishes a failure when the job ends or its outputs are overdue, and the serve gives up with it.
 async fn serve_data_link(
     job: &crate::dispatch::JobChannel,
-    conn: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
-    _limits: crate::data_link_recv::ReceiveLimits,
+    conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    limits: crate::data_link_recv::ReceiveLimits,
 ) {
+    let owed = !job.data_outputs.is_empty();
     match crate::data_link_send::send_inputs(conn, &job.data_inputs, crate::data_link_send::SendLimits::default()).await
     {
         Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "mesh accept loop: inputs sent"),
-        Err(e) => tracing::warn!(error = %e, "mesh accept loop: the input send failed"),
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh accept loop: the input send failed");
+            if owed {
+                job.outputs
+                    .publish(OutputsState::Failed("the inputs could not be sent".to_owned()));
+            }
+            return;
+        }
+    }
+    if !owed {
+        return;
+    }
+    // A receive dropped here (the job ended) removes the file it had in flight.
+    let outcome = tokio::select! {
+        biased;
+        () = job.outputs.decided() => return,
+        outcome = receive_after_first_byte(conn, &job.data_outputs, limits) => outcome,
+    };
+    match outcome {
+        Ok(received) => {
+            tracing::info!(
+                files = received.files,
+                bytes = received.bytes,
+                "mesh accept loop: outputs received"
+            );
+            job.outputs.publish(OutputsState::Received(received));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh accept loop: the output receive failed");
+            job.outputs.publish(OutputsState::Failed(e.peer_reason().to_owned()));
+        }
+    }
+}
+
+/// Wait for the first byte of the outputs without a time limit, then run the receive with its limits from there.
+async fn receive_after_first_byte(
+    conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    outputs: &[sandy_executor_proto::Output],
+    limits: crate::data_link_recv::ReceiveLimits,
+) -> Result<crate::data_link_recv::Received, ReceiveError> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut first = [0u8; 1];
+    match conn.read(&mut first).await {
+        Ok(1) => {}
+        Ok(_) => return Err(ReceiveError::Truncated),
+        Err(e) => return Err(ReceiveError::Frame(sandy_control_proto::FrameError::Io(e))),
+    }
+    receive_outputs(
+        &mut Replay {
+            first: Some(first[0]),
+            inner: conn,
+        },
+        outputs,
+        limits,
+    )
+    .await
+}
+
+/// A link that yields one byte already read, then reads on from the link.
+struct Replay<'a, C> {
+    first: Option<u8>,
+    inner: &'a mut C,
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for Replay<'_, C> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(byte) = self.first.take() {
+            if buf.remaining() > 0 {
+                buf.put_slice(&[byte]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.first = Some(byte);
+        }
+        std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for Replay<'_, C> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -1281,6 +1395,61 @@ mod tests {
         assert_eq!(
             job.outputs.wait(std::time::Duration::from_millis(50)).await,
             crate::output_slot::OutputsState::Failed("the outputs did not arrive in time".to_owned())
+        );
+        drop(peer);
+        Ok(())
+    }
+
+    /// The job ending (cancel, a failure result, an executor that went away) while the link is silent releases the
+    /// serve: it does not wait on a link the job no longer needs.
+    #[tokio::test]
+    async fn a_job_that_ends_while_the_link_is_silent_releases_the_serve() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let registry = Arc::new(JobRegistry::new().context("registry")?);
+        let mut job = job_with_output(dest.path()).await?;
+        job.remote_link = Some(RemoteLink::with_token(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            marker_token("end-agent"),
+        ));
+        registry.insert("job-1".to_owned(), job);
+        let job = registry.get("job-1").context("registered")?;
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        registry.invalidate_remote_link("job-1");
+        tokio::time::timeout(WAIT, serving).await??;
+        assert!(matches!(job.outputs.wait(WAIT).await, OutputsState::Failed(_)));
+        drop(peer);
+        Ok(())
+    }
+
+    /// The job ending mid-receive drops the receive, and the file it had in flight goes with it.
+    #[tokio::test]
+    async fn a_job_that_ends_mid_receive_leaves_no_partial_file() -> anyhow::Result<()> {
+        use sandy_control_proto::write_frame;
+        let dest = tempfile::tempdir().context("dest")?;
+        let job = Arc::new(job_with_output(dest.path()).await?);
+        let (mut peer, mut local) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { serve_data_link(&job, &mut local, crate::data_link_recv::ReceiveLimits::default()).await }
+        });
+        read_inputs_half(&mut peer).await?;
+        write_frame(&mut peer, &out_chunk("out/a.txt", b"partial")).await?;
+        // Give the receive time to open the temp file, then end the job.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        job.outputs.publish(OutputsState::Failed("the job ended".to_owned()));
+        tokio::time::timeout(WAIT, serving).await??;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let left: Vec<_> = std::fs::read_dir(dest.path())
+            .context("read dest")?
+            .collect::<Result<_, _>>()?;
+        assert!(
+            left.is_empty(),
+            "nothing may be left in the destination, found {left:?}"
         );
         drop(peer);
         Ok(())

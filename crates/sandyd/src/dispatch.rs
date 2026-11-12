@@ -622,6 +622,9 @@ impl JobRegistry {
         for link in [&job.remote_link, &job.data_link].into_iter().flatten() {
             link.invalidate();
         }
+        // A receive still waiting on the data link gives up: the job it was for is over (first outcome stands).
+        job.outputs
+            .publish(crate::output_slot::OutputsState::Failed("the job ended".to_owned()));
     }
 }
 

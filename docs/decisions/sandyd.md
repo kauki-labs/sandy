@@ -2092,6 +2092,34 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   a peer that read a frame every few seconds would otherwise hold the loop for days. A send cut short still reports
   `outputs_follow`, and the orchestrator ends the transfer on the closed link.
 - Nothing receives them yet: the sandyd side (receive, a per-job rendezvous that holds the job non-terminal) is 6c-2.
+||||||| parent of af328a72 (feat(sandyd): receive a job's outputs over the data link and record the job once they are in place (refs #482))
+
+### Slice 6c-2: the sandyd side of the output transfer
+
+- **The link stays open after the inputs.** A claimed data link of a job that declares outputs runs `receive_outputs`
+  (6a) after `send_inputs`, and publishes how it ended to a per-job `OutputsSlot` (`Pending`, `Received`, or
+  `Failed` with a fixed text). A job that declares none gets the link closed after the inputs, as before.
+  `JobChannel.data_outputs` is the Submit-validated path outputs, set at mint beside `data_link`.
+- **The receive clocks start at the first byte.** The host sends the outputs after the job ran, which can be hours after
+  the link opened. The serve reads one byte with no time limit, then runs the receive over a link that replays it, so
+  the idle limit and the total limit time the transfer, not the job. Until the first byte the wait is bounded by the
+  slot, not a clock: the job ending, or its outputs being overdue, publishes a failure and the serve gives up (a
+  receive in flight is dropped and removes its temp file).
+- **sandyd decides from its own record.** A succeeded result for a job with `data_outputs` is not terminal. It waits
+  for the slot, for at most the receive total plus five minutes (the executor may open the link after the result
+  reached us). `Received` records `Succeeded`; `Failed`, a timeout, or a missing receive records `Failed` with the
+  reason appended to the console. The host's `outputs_follow` flag does not make sandyd wait: a flag clear for a
+  succeeded job that owes outputs is a `Failed` at once, and a flag set for a job that owes none is ignored. A failed
+  run owes nothing and is recorded at once.
+- **The relay never blocks.** The waiting job stays in `in_flight` and the settle runs as one future in the relay's
+  select, so results, dispatches and cancels keep flowing. A host that disconnects first fails the job through the
+  existing disconnect path, which also ends the slot.
+- **Ending the job ends the slot.** `finish_job` and `invalidate_remote_link` publish `Failed("the job ended")`
+  (the first outcome stands), which releases a serve still waiting and drops a receive in flight.
+- **Known limits.** The destination ancestors are checked at Submit, and a later swap of one cannot be seen here: the
+  receive opens the destination once and never follows a link below it, and a destination whose parent an attacker
+  can write is outside the threat model (the executor is a trusted writer). A cancel mid-receive ends the slot and
+  drops the receive, but the host may still be sending until its own send cap.
 
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 

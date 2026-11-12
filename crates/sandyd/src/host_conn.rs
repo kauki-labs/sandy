@@ -269,9 +269,15 @@ async fn relay_dispatches(
     // and is failed terminally below, so a job can never stay stuck
     // PENDING/RUNNING after its host is gone.
     let mut in_flight: HashSet<String> = HashSet::new();
+    // Succeeded jobs waiting for their outputs (#482 slice 6c-2). They stay in `in_flight` until settled, so the
+    // cleanup below fails them if the host goes away first.
+    let mut awaiting = futures_util::stream::FuturesUnordered::new();
 
     loop {
         tokio::select! {
+            Some(settled) = futures_util::StreamExt::next(&mut awaiting), if !awaiting.is_empty() => {
+                in_flight.remove(&settled);
+            }
             dispatch = dispatch_rx.recv() => {
                 let Some(dispatch) = dispatch else {
                     // The sending half was dropped: HostRegistry has no other
@@ -377,8 +383,10 @@ async fn relay_dispatches(
                 match frame {
                     Some(Ok(Some(message))) => match message.op {
                         Some(host_executor_message::Op::Result(result)) => {
-                            // Ignored until the wiring lands (red).
-                            let _awaited = record_job_result(store, job_registry, &mut in_flight, result).await;
+                            if let Some(awaited) = record_job_result(store, job_registry, &mut in_flight, result).await {
+                                // The relay keeps reading frames and dispatching while the outputs arrive.
+                                awaiting.push(awaited.settle(store, job_registry, OUTPUTS_WAIT));
+                            }
                         }
                         // Stage 1 has no re-registration or capability-update
                         // machinery (#269): any other frame from the
@@ -472,9 +480,20 @@ async fn mark_job_running(store: &Arc<JobStore>, job_id: &str) {
     }
 }
 
+/// How long a succeeded job waits for its outputs after its result arrives: the receive's own total limit and a
+/// margin for the executor to open the link when the result reached us first.
+const OUTPUTS_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(crate::data_link_recv::DEFAULT_TOTAL.as_secs() + 5 * 60);
+
 /// Record a host-executor's reported result for one job, moving it to its
 /// terminal state (#292), and drop it from `in_flight` so a later disconnect
 /// does not then also fail it.
+///
+/// A succeeded job that declared outputs is not terminal yet (#482 slice 6c-2): the executor sends them over the
+/// data link, and the job is recorded once they are in place. That job stays in `in_flight`, so a host that
+/// disconnects meanwhile still fails it, and the caller gets an [`AwaitedOutputs`] to settle. sandyd decides from
+/// its own record of what the job declared, never from the host's `outputs_follow`: a succeeded job that owes
+/// outputs whose host says nothing follows is a failure, not a success with outputs missing.
 ///
 /// NEVER logs `result.console`: it carries up to ~64 KiB of the job's OWN
 /// stdout/stderr, which belongs in the job's record for `status`/`attach` to
@@ -490,21 +509,55 @@ async fn record_job_result(
     let job_id = result.job_id.clone();
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
-    let dispatched_here = in_flight.remove(&job_id);
     // A result for a job this connection never ran is not recorded either: it
     // would mark another host's job terminal and strand its credential.
-    if !dispatched_here {
+    if !in_flight.contains(&job_id) {
         tracing::warn!(
             job_id,
             "a job result arrived for a job not dispatched on this connection; ignored"
         );
         return None;
     }
+    let owes_outputs = job_registry
+        .get(&job_id)
+        .is_some_and(|job| !job.data_outputs.is_empty());
+    if status == JobStatus::Succeeded && owes_outputs {
+        if result.outputs_follow {
+            return Some(AwaitedOutputs {
+                job_id,
+                exit_code,
+                console: result.console,
+            });
+        }
+        tracing::warn!(
+            job_id,
+            "the host reported no outputs for a job that declares outputs; failing it"
+        );
+        in_flight.remove(&job_id);
+        let console = format!(
+            "{}\n[sandy: the host reported no outputs for a job that declares outputs]",
+            result.console
+        );
+        finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+        return None;
+    }
+    in_flight.remove(&job_id);
+    finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+    None
+}
 
+/// Move `job_id` to its terminal `status`, off the connection task, and end its credential and its outputs slot.
+async fn finish_job(
+    store: &Arc<JobStore>,
+    job_registry: &JobRegistry,
+    job_id: &str,
+    status: JobStatus,
+    exit_code: Option<i32>,
+    console: String,
+) {
     let store = Arc::clone(store);
-    let console = result.console;
     let credentials = job_registry.credentials().cloned();
-    let jid = job_id.clone();
+    let jid = job_id.to_owned();
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = match &credentials {
@@ -519,7 +572,7 @@ async fn record_job_result(
     .await;
     match transition {
         Ok(Ok(Transition::Applied)) => {
-            job_registry.mark_terminal(&job_id);
+            job_registry.mark_terminal(job_id);
             tracing::info!(job_id, ?status, ?exit_code, "recorded a job result");
         }
         Ok(Ok(Transition::Refused(current))) => {
@@ -535,32 +588,72 @@ async fn record_job_result(
         Ok(Err(e)) => tracing::warn!(job_id, error = %e, "could not record the job result"),
         Err(e) => tracing::warn!(job_id, error = %e, "the record-result store task failed"),
     }
+    // The job is over: a receive still waiting on its link gives up (the first outcome stands, so a receive that
+    // finished keeps its result).
+    if let Some(job) = job_registry.get(job_id) {
+        job.outputs
+            .publish(crate::output_slot::OutputsState::Failed("the job ended".to_owned()));
+    }
     // The job is over on its host whatever the store said: revoke its credential (#481).
-    job_registry.release_credential(&job_id);
-    None
+    job_registry.release_credential(job_id);
 }
 
 /// A succeeded job whose outputs are still owed (#482 slice 6c-2): its terminal status waits for the receive.
 #[derive(Debug)]
-#[allow(dead_code, reason = "a stub until the wiring lands (red)")]
 pub(crate) struct AwaitedOutputs {
     job_id: String,
+    exit_code: Option<i32>,
+    console: String,
 }
 
-#[allow(dead_code, reason = "a stub until the wiring lands (red)")]
 impl AwaitedOutputs {
     /// The awaited job.
+    #[cfg(test)]
     pub(crate) fn job_id(&self) -> &str {
         &self.job_id
     }
 
-    /// Wait for the outputs, at most `within`, then record the job's terminal status.
+    /// Wait for the outputs, at most `within`, then record the job's terminal status: `Succeeded` when they are in
+    /// place, `Failed` when the receive failed or they did not arrive. Returns the job's id.
     pub(crate) async fn settle(
         self,
-        _store: &Arc<JobStore>,
-        _job_registry: &JobRegistry,
-        _within: std::time::Duration,
-    ) {
+        store: &Arc<JobStore>,
+        job_registry: &JobRegistry,
+        within: std::time::Duration,
+    ) -> String {
+        let state = match job_registry.get(&self.job_id) {
+            Some(job) => job.outputs.wait(within).await,
+            None => crate::output_slot::OutputsState::Failed("the job is no longer registered".to_owned()),
+        };
+        let (status, console) = match state {
+            crate::output_slot::OutputsState::Received(received) => {
+                tracing::info!(
+                    job_id = self.job_id,
+                    files = received.files,
+                    bytes = received.bytes,
+                    "the job's outputs are in place"
+                );
+                (JobStatus::Succeeded, self.console)
+            }
+            crate::output_slot::OutputsState::Failed(reason) => {
+                tracing::warn!(
+                    job_id = self.job_id,
+                    reason,
+                    "the job's outputs did not arrive; failing it"
+                );
+                (
+                    JobStatus::Failed,
+                    format!(
+                        "{}\n[sandy: the job's outputs were not received: {reason}]",
+                        self.console
+                    ),
+                )
+            }
+            // `wait` never returns a pending slot.
+            crate::output_slot::OutputsState::Pending => (JobStatus::Failed, self.console),
+        };
+        finish_job(store, job_registry, &self.job_id, status, self.exit_code, console).await;
+        self.job_id
     }
 }
 
@@ -1838,6 +1931,30 @@ mod tests {
         let awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true)).await;
         assert!(awaited.is_none());
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
+        Ok(())
+    }
+
+    /// A host that disconnects while a succeeded job waits for its outputs fails the job: it stayed in flight.
+    #[tokio::test]
+    async fn a_host_that_disconnects_while_outputs_are_awaited_fails_the_job() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        job_owing_outputs(&store, &job_registry, "job-1").await?;
+        let mut in_flight = HashSet::from(["job-1".to_owned()]);
+        let _awaited = record_job_result(&store, &job_registry, &mut in_flight, result_for("job-1", 0, true))
+            .await
+            .context("owed")?;
+        for job_id in in_flight {
+            fail_disconnected_job(&store, &job_registry, &job_id).await;
+        }
+        assert_eq!(store.status("job-1")?, Some(JobStatus::Failed));
+        let job = job_registry.get("job-1").context("registered")?;
+        assert!(
+            matches!(
+                job.outputs.wait(SOON).await,
+                crate::output_slot::OutputsState::Failed(_)
+            ),
+            "the receive waiting on the link must be released"
+        );
         Ok(())
     }
 }
