@@ -2726,6 +2726,77 @@ mod tests {
         Ok(())
     }
 
+    /// #807: a host that declared `transfer` and not a shared filesystem takes a job with inputs: the data link
+    /// carries them, so the Dispatch names the inputs and a data link token.
+    #[tokio::test]
+    async fn a_transfer_host_without_a_shared_filesystem_takes_a_job_with_inputs() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: false,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (dispatch, job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        assert_eq!(dispatch.inputs.len(), 1);
+        assert_eq!(dispatch.data_link_token.len(), crate::link_auth::LINK_TOKEN_LEN);
+        assert!(job.data_link.is_some(), "the data link must be bound");
+        Ok(())
+    }
+
+    async fn refused_for(
+        request: ControlRequest,
+        capabilities: sandy_executor_proto::Capabilities,
+    ) -> anyhow::Result<String> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _rx = register_test_host(&host_registry, "remote-host", peer_ip, capabilities);
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(error)) => Ok(error.message),
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A `secrets` file is on the submitter's machine and `transfer` does not carry it: a transfer-only host still
+    /// refuses a Submit that names one (#496 holds for secrets).
+    #[tokio::test]
+    async fn a_transfer_only_host_is_refused_for_a_job_with_a_secret() -> anyhow::Result<()> {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.secrets = vec![sandy_control_proto::SecretRef {
+                name: "token".to_owned(),
+                host_path: "/etc/secret".to_owned(),
+            }];
+        }
+        let capabilities = sandy_executor_proto::Capabilities {
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let message = refused_for(request, capabilities).await?;
+        assert!(message.contains("shares_submitter_filesystem"), "got {message:?}");
+        Ok(())
+    }
+
+    /// A host with neither capability is refused for inputs, and the refusal names both ways to qualify.
+    #[tokio::test]
+    async fn a_host_with_neither_capability_is_refused_for_inputs_naming_both() -> anyhow::Result<()> {
+        let message = refused_for(submit_req_with_input(1), trusted_host_capabilities()).await?;
+        assert!(
+            message.contains("shares_submitter_filesystem") && message.contains("transfer"),
+            "got {message:?}"
+        );
+        Ok(())
+    }
+
     /// #482: a job with inputs on a host that did not declare `transfer`
     /// gets no data link: the host cannot take one.
     #[tokio::test]
