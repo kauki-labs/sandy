@@ -482,6 +482,21 @@ pub async fn handle(
                     result: Some(control_response::Result::Error(ControlError { message })),
                 });
             }
+            // A1 (#483): a policy runs the guest behind the egress proxy, so only a VM job can honor it; a process job
+            // shares the host network. Refused here, with no side effect, not after the row exists and the executor
+            // refuses the dispatch (CodeRabbit on #818).
+            if submit.egress.is_some() && required_sandbox_kind != SandboxKind::Vm {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!(
+                            "an egress policy needs a Vm-backed manifest encoding (e.g. flake/v1); manifest_encoding \
+                             {:?} resolves to SandboxKind::{required_sandbox_kind:?}, which has no egress boundary",
+                            submit.manifest_encoding
+                        ),
+                    })),
+                });
+            }
             // A1 (#483): a malformed egress rule is refused before placement, with no side effect.
             if let Some(message) = egress_policy_refusal(&submit) {
                 return Ok(ControlResponse {
@@ -2944,6 +2959,7 @@ mod tests {
                 }),
                 // A policy runs the guest behind the egress proxy, so a VM job: `flake/v1` resolves to the Vm kind.
                 manifest_encoding: "flake/v1".to_owned(),
+                manifest: flake_manifest_bytes(None),
                 ..match submit_req(id).op {
                     Some(control_request::Op::Submit(submit)) => submit,
                     _ => unreachable!("submit_req builds a Submit"),
