@@ -182,7 +182,6 @@ pub fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &Allo
 /// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
 /// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
 /// A proxy found dead before the guest booted (`booted: false`) counts as a guest that never booted.
-#[must_use]
 pub fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
     match run {
         Err(BackendError::Spawn(why)) => Err(why.clone()),
