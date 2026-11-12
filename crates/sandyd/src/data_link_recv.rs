@@ -343,6 +343,9 @@ impl Drop for UnlinkOnDrop {
     }
 }
 
+/// How many temp names one `open_temp` call tries before it gives up on a destination full of stale ones.
+const MAX_TEMP_NAME_TRIES: u32 = 1000;
+
 /// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
 /// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
 /// including when the receive that asked for it is gone by the time this ends.
@@ -351,16 +354,20 @@ fn open_temp(root: &Path, parts: &[String], mut seq: u64) -> Result<(Cleanup, st
     for part in parts {
         dir = dir.create_dir(OsStr::new(part))?;
     }
-    loop {
+    // `seq` runs across the whole receive so names stay unique; the retry bound is per call.
+    for _ in 0..MAX_TEMP_NAME_TRIES {
         seq += 1;
         let temp = OsString::from(format!(".sandy-recv-{}-{seq}", std::process::id()));
         match dir.create_new_file(&temp) {
             Ok(file) => return Ok((Cleanup::new(dir, temp), file, seq)),
             // A stale name from a crashed receive: try the next one.
-            Err(sandy_fsutil::FsError::Unsafe { .. }) if seq < 1000 => {}
+            Err(sandy_fsutil::FsError::Unsafe { .. }) => {}
             Err(e) => return Err(e.into()),
         }
     }
+    Err(ReceiveError::Write(
+        "too many stale temp files in the destination".to_owned(),
+    ))
 }
 
 impl<'a> Receive<'a> {
@@ -406,7 +413,12 @@ impl<'a> Receive<'a> {
         let Some(mut current) = self.current.take() else {
             return Ok(());
         };
-        current.file.flush().await.map_err(ReceiveError::Io)?;
+        if let Err(e) = current.file.flush().await {
+            // `finish_file` took the file out of `receive.current`, so the error path cannot discard it: do it here,
+            // before the error returns and the peer is told (decision 22).
+            current.discard().await;
+            return Err(ReceiveError::Io(e));
+        }
         let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
             let renamed = match current.cleanup.0.as_ref() {
                 Some((dir, temp)) => dir.rename(temp, &current.name),

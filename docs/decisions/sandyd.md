@@ -2042,6 +2042,9 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
 - The receiver trusts `Dispatch.outputs[].dest`: `Beneath::create_dir_at` resolves and creates the ancestors of a
   destination by path, as local collection does (#607). The caller must pass only Submit-validated destinations. A
   symlink in an ancestor is followed, and one test pins it (#784).
+- A failed flush discards the file before the error returns, so the unlink is done before the peer hears of it. The temp
+  name is `.sandy-recv-<pid>-<n>` with `n` running across the receive; a collision with a stale name tries the next one,
+  at most 1,000 times per file, so a long receive is not failed by one stale name (#793).
 - Filesystem work runs on the blocking pool, never on the async worker (#779): the directory creation and the temp
   file, the rename into place, and the unlink of a file that never completed. A `Cleanup` guard owns that unlink; a
   failed receive awaits it before it tells the peer, and a dropped receive queues it, so a cancelled job leaves no
