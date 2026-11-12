@@ -95,7 +95,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wait_that_started_first_is_woken_by_the_publish() {
+    async fn a_wait_that_started_first_is_woken_by_the_publish() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
         let slot = std::sync::Arc::new(OutputsSlot::new());
         let waiting = tokio::spawn({
             let slot = std::sync::Arc::clone(&slot);
@@ -104,9 +106,10 @@ mod tests {
         tokio::task::yield_now().await;
         slot.publish(OutputsState::Failed("link closed".to_owned()));
         assert_eq!(
-            waiting.await.expect("the waiter ran"),
+            waiting.await.context("the waiter ran")?,
             OutputsState::Failed("link closed".to_owned())
         );
+        Ok(())
     }
 
     #[tokio::test]

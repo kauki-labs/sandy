@@ -505,7 +505,7 @@ async fn record_job_result(
     store: &Arc<JobStore>,
     job_registry: &JobRegistry,
     in_flight: &mut HashSet<String>,
-    _awaiting: &mut HashSet<String>,
+    awaiting: &mut HashSet<String>,
     result: JobResult,
 ) -> Option<AwaitedOutputs> {
     let (status, exit_code) = classify(&result);
@@ -521,28 +521,58 @@ async fn record_job_result(
         );
         return None;
     }
-    let owes_outputs = job_registry
-        .get(&job_id)
-        .is_some_and(|job| !job.data_outputs.is_empty());
-    if status == JobStatus::Succeeded && owes_outputs {
+    // A second result for a job already waiting on its outputs is a buggy or hostile executor: it must not start a
+    // second wait or fail the first.
+    if awaiting.contains(&job_id) {
+        tracing::warn!(
+            job_id,
+            "a second result arrived for a job awaiting its outputs; ignored"
+        );
+        return None;
+    }
+    let Some(job) = job_registry.get(&job_id) else {
+        // A job the registry lost cannot be shown to owe nothing, so a success is not trusted.
+        in_flight.remove(&job_id);
+        if status == JobStatus::Succeeded {
+            tracing::warn!(
+                job_id,
+                "a succeeded job is not registered, so its outputs cannot be checked; failing it"
+            );
+            let console = format!(
+                "{}\n[sandy: the job is not registered, so its outputs cannot be checked]",
+                result.console
+            );
+            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+        } else {
+            finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
+        }
+        return None;
+    };
+    if !job.data_outputs.is_empty() {
+        // The host collects and sends after any run that returns, a non-zero exit included, so the wait does not
+        // depend on the status: the exit is recorded as classified once the outputs are in.
         if result.outputs_follow {
+            awaiting.insert(job_id.clone());
             return Some(AwaitedOutputs {
                 job_id,
+                status,
                 exit_code,
                 console: result.console,
             });
         }
-        tracing::warn!(
-            job_id,
-            "the host reported no outputs for a job that declares outputs; failing it"
-        );
-        in_flight.remove(&job_id);
-        let console = format!(
-            "{}\n[sandy: the host reported no outputs for a job that declares outputs]",
-            result.console
-        );
-        finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
-        return None;
+        if status == JobStatus::Succeeded {
+            tracing::warn!(
+                job_id,
+                "the host reported no outputs for a job that declares outputs; failing it"
+            );
+            in_flight.remove(&job_id);
+            let console = format!(
+                "{}\n[sandy: the host reported no outputs for a job that declares outputs]",
+                result.console
+            );
+            finish_job(store, job_registry, &job_id, JobStatus::Failed, exit_code, console).await;
+            return None;
+        }
     }
     in_flight.remove(&job_id);
     finish_job(store, job_registry, &job_id, status, exit_code, result.console).await;
@@ -605,6 +635,8 @@ async fn finish_job(
 #[derive(Debug)]
 pub(crate) struct AwaitedOutputs {
     job_id: String,
+    /// The status the run's own result classified to: what the job is recorded as once the outputs are in.
+    status: JobStatus,
     exit_code: Option<i32>,
     console: String,
 }
@@ -636,7 +668,7 @@ impl AwaitedOutputs {
                     bytes = received.bytes,
                     "the job's outputs are in place"
                 );
-                (JobStatus::Succeeded, self.console)
+                (self.status, self.console)
             }
             crate::output_slot::OutputsState::Failed(reason) => {
                 tracing::warn!(

@@ -1219,7 +1219,7 @@ mod tests {
         let accepting = accept_n(listener, &registry, 1);
 
         let mut conn = connect(&loopback(addr.port())).await.context("connect data")?;
-        let prefix = encode_remote_link_prefix("job-1", &data).expect("encode prefix");
+        let prefix = encode_remote_link_prefix("job-1", &data).context("encode prefix")?;
         tokio::io::AsyncWriteExt::write_all(&mut conn, &prefix)
             .await
             .context("prefix")?;
@@ -1328,8 +1328,8 @@ mod tests {
         let dest = tempfile::tempdir().context("dest")?;
         let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
         let limits = crate::data_link_recv::ReceiveLimits {
-            idle: std::time::Duration::from_millis(200),
-            total: std::time::Duration::from_millis(400),
+            idle: std::time::Duration::from_millis(500),
+            total: std::time::Duration::from_millis(1000),
             ..crate::data_link_recv::ReceiveLimits::default()
         };
         let (mut peer, mut local) = tokio::io::duplex(1 << 20);
@@ -1338,7 +1338,7 @@ mod tests {
             async move { serve_data_link(&job, &mut local, limits).await }
         });
         read_inputs_half(&mut peer).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         write_frame(&mut peer, &out_chunk("out/a.txt", b"late")).await?;
         write_frame(&mut peer, &out_end()).await?;
         assert!(matches!(
@@ -1357,7 +1357,7 @@ mod tests {
         let dest = tempfile::tempdir().context("dest")?;
         let job = std::sync::Arc::new(job_with_output(dest.path()).await?);
         let limits = crate::data_link_recv::ReceiveLimits {
-            idle: std::time::Duration::from_millis(200),
+            idle: std::time::Duration::from_millis(500),
             ..crate::data_link_recv::ReceiveLimits::default()
         };
         let (mut peer, mut local) = tokio::io::duplex(1 << 20);
@@ -1439,18 +1439,32 @@ mod tests {
         });
         read_inputs_half(&mut peer).await?;
         write_frame(&mut peer, &out_chunk("out/a.txt", b"partial")).await?;
-        // Give the receive time to open the temp file, then end the job.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The receive is mid-file once its temp file exists: only then does ending the job exercise the cleanup.
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::fs::read_dir(dest.path()).context("read dest")?.next().is_none() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the receive never opened its temp file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         job.outputs.publish(OutputsState::Failed("the job ended".to_owned()));
         tokio::time::timeout(WAIT, serving).await??;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let left: Vec<_> = std::fs::read_dir(dest.path())
-            .context("read dest")?
-            .collect::<Result<_, _>>()?;
-        assert!(
-            left.is_empty(),
-            "nothing may be left in the destination, found {left:?}"
-        );
+        // The unlink runs on the blocking pool, so wait for it.
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let left: Vec<_> = std::fs::read_dir(dest.path())
+                .context("read dest")?
+                .collect::<Result<_, _>>()?;
+            if left.is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "nothing may be left in the destination, found {left:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         drop(peer);
         Ok(())
     }

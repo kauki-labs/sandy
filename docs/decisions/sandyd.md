@@ -2106,10 +2106,12 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   receive in flight is dropped and removes its temp file).
 - **sandyd decides from its own record.** A succeeded result for a job with `data_outputs` is not terminal. It waits
   for the slot, for at most the receive total plus five minutes (the executor may open the link after the result
-  reached us). `Received` records `Succeeded`; `Failed`, a timeout, or a missing receive records `Failed` with the
-  reason appended to the console. The host's `outputs_follow` flag does not make sandyd wait: a flag clear for a
-  succeeded job that owes outputs is a `Failed` at once, and a flag set for a job that owes none is ignored. A failed
-  run owes nothing and is recorded at once.
+  reached us). `Received` records the run's own status (a non-zero exit stays `Failed`: the host collects and sends
+  after any run that returned, so a failed run's outputs are awaited too); `Failed`, a timeout, or a missing receive
+  records `Failed` with the reason appended to the console. The host's `outputs_follow` flag does not make sandyd
+  wait for a job that owes none (ignored). A flag clear for a succeeded job that owes outputs is a `Failed` at once,
+  and a failed run with the flag clear (the run itself errored, nothing was collected) is recorded at once. A second
+  result for a job already waiting is ignored, and a succeeded job the registry no longer knows fails closed.
 - **The relay never blocks.** The waiting job stays in `in_flight` and the settle runs as one future in the relay's
   select, so results, dispatches and cancels keep flowing. A host that disconnects first fails the job through the
   existing disconnect path, which also ends the slot.
