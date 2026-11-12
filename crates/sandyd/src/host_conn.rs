@@ -459,10 +459,10 @@ async fn relay_dispatches(
 /// Classify a reported [`JobResult`] into the terminal [`JobStatus`] to record
 /// and the exit code to keep with it. The host reports physical facts; the
 /// orchestrator decides the band (the same split the backend seam draws). A
-/// clean `exit 0` — no timeout, no transport fault — is the only `Succeeded`;
-/// a non-zero exit, a timeout, a transport fault, or a run that never produced
-/// an exit at all is `Failed`, carrying whatever exit code it did report (which
-/// may be none).
+/// clean `exit 0` of a booted guest — no timeout, no transport fault — is the
+/// only `Succeeded`; a non-zero exit, a timeout, a transport fault, a guest
+/// that never booted, or a run that never produced an exit at all is `Failed`,
+/// carrying whatever exit code it did report (which may be none).
 fn classify(result: &JobResult) -> (JobStatus, Option<i32>) {
     match result.exit_code {
         // A run that says it never booted is not a success whatever exit it carries (#829): the envelope's own
