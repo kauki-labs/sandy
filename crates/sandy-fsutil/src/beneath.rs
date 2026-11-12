@@ -46,6 +46,26 @@ impl EntryKind {
     }
 }
 
+/// Which file an entry is: the device and the inode, as the filesystem reports them. Two names that reach the same
+/// file (a hard link, or two spellings on a case-insensitive filesystem) have the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    /// The device the file is on.
+    pub dev: u64,
+    /// The inode on that device.
+    pub ino: u64,
+}
+
+/// A device or inode number as the `u64` of a [`FileId`], keeping its bits: a negative `i32` device (a major number of
+/// 128 or more on macOS) becomes the same `u64` the standard library's `MetadataExt::dev` gives, not an error.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the wrap is the point: the bits of the value are kept"
+)]
+fn wrap_u64(value: i128) -> u64 {
+    value as u64
+}
+
 /// A directory opened without following a symlink, to read or write beneath.
 #[derive(Debug)]
 pub struct Beneath {
@@ -117,6 +137,33 @@ impl Beneath {
         let stat = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| FsError::io("stat entry", &self.path.join(name), e))?;
         Ok(EntryKind::of(stat.st_mode))
+    }
+
+    /// The identity of the entry `name`, or `None` when there is no such entry, or when the filesystem reports no
+    /// inode for it (0, as some FUSE and 9p mounts do: the assumption is that such an entry cannot be told apart from
+    /// another, so it has no id). A symlink is not followed: its own id is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`].
+    pub fn file_id(&self, name: &OsStr) -> Result<Option<FileId>, FsError> {
+        let name = component(name, &self.path)?;
+        let path = self.path.join(name);
+        match rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                // Some filesystems (FUSE, 9p mounts) report no inode: 0 is "no id", never a key two files could share.
+                if stat.st_ino == 0 {
+                    return Ok(None);
+                }
+                // `st_dev` is a `u64` on Linux and an `i32` on macOS; the bits are kept either way.
+                Ok(Some(FileId {
+                    dev: wrap_u64(i128::from(stat.st_dev)),
+                    ino: stat.st_ino,
+                }))
+            }
+            Err(Errno::NOENT) => Ok(None),
+            Err(e) => Err(FsError::io("stat entry", &path, e)),
+        }
     }
 
     /// Open the subdirectory `name`, refusing a symlink.
@@ -769,5 +816,53 @@ mod tests {
         assert!(dir.path().join("sub").is_dir());
         assert!(matches!(held.remove_file(name("a/b")), Err(FsError::Unsafe { .. })));
         Ok(())
+    }
+
+    /// `file_id` is the device and inode of the entry, the same a `stat` reports, so two names of one file agree.
+    #[test]
+    fn file_id_is_the_device_and_inode_of_the_entry() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a"), b"x")?;
+        fs::hard_link(dir.path().join("a"), dir.path().join("b"))?;
+        fs::write(dir.path().join("other"), b"y")?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        let meta = fs::metadata(dir.path().join("a"))?;
+        let id = held.file_id(name("a")).context("file_id a")?.context("a exists")?;
+        assert_eq!((id.dev, id.ino), (meta.dev(), meta.ino()));
+        assert_eq!(held.file_id(name("b"))?, Some(id), "a hard link is the same file");
+        assert_ne!(held.file_id(name("other"))?, Some(id), "another file has another id");
+        Ok(())
+    }
+
+    /// A missing entry has no id, a symlink has its own id (not its target's), and a name with a separator is refused.
+    #[test]
+    fn file_id_of_a_missing_entry_a_link_and_a_bad_name() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("target"), b"x")?;
+        symlink(dir.path().join("target"), dir.path().join("link"))?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        assert_eq!(held.file_id(name("missing"))?, None);
+        let target = held.file_id(name("target"))?.context("target exists")?;
+        let link = held.file_id(name("link"))?.context("link exists")?;
+        assert_ne!(link, target, "a symlink is not followed: it has its own id");
+        assert!(matches!(held.file_id(name("a/b")), Err(FsError::Unsafe { .. })));
+        Ok(())
+    }
+
+    /// A device number keeps its bits when it becomes a `u64`: a negative `i32` is its two's complement, as
+    /// `MetadataExt::dev` reports it, and a `u64` is itself.
+    #[test]
+    fn wrap_u64_keeps_the_bits_of_a_device_number() {
+        assert_eq!(wrap_u64(5), 5);
+        assert_eq!(wrap_u64(i128::from(u64::MAX)), u64::MAX);
+        assert_eq!(wrap_u64(-1), u64::MAX);
+        assert_eq!(
+            wrap_u64(i128::from(i32::MIN)),
+            u64::from_ne_bytes(i64::from(i32::MIN).to_ne_bytes())
+        );
     }
 }

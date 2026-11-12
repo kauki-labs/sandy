@@ -115,6 +115,9 @@ pub enum ReceiveError {
     /// A file that already completed arrived again.
     #[error("a file arrived twice")]
     Reopened,
+    /// Two files of the transfer name the same destination file (two spellings on a case-insensitive filesystem).
+    #[error("two files of the transfer name the same destination file")]
+    Alias,
     /// The transfer is past its byte cap.
     #[error("the transfer is past its byte cap")]
     TooManyBytes,
@@ -149,6 +152,7 @@ impl ReceiveError {
         match self {
             Self::Frame(_) | Self::Truncated | Self::Idle | Self::PeerError(_) => "the receiver's link failed",
             Self::Violation(_) | Self::BadIndex | Self::NameMismatch | Self::Reopened => "an output chunk broke a rule",
+            Self::Alias => "two output files name the same destination file",
             Self::Unexpected => "an unexpected message on the output transfer",
             Self::NoProgress => "an empty chunk made no progress",
             Self::TooManyBytes => "the transfer is past its byte cap",
@@ -265,6 +269,8 @@ struct Receive<'a> {
     done: HashSet<EntryKey>,
     current: Option<InFlight>,
     temp_seq: u64,
+    /// The identity of each file this receive completed, so a rename onto one of them is caught (#787).
+    completed_ids: std::sync::Arc<std::sync::Mutex<HashSet<sandy_fsutil::FileId>>>,
 }
 
 /// The file being received: written under a temp name in its final directory, renamed into place on completion,
@@ -346,6 +352,32 @@ impl Drop for UnlinkOnDrop {
 /// How many temp names one `open_temp` call tries before it gives up on a destination full of stale ones.
 const MAX_TEMP_NAME_TRIES: u32 = 1000;
 
+/// Rename the finished temp file onto its final name, unless that name is a file this receive already completed.
+/// On a case-insensitive destination `a` then `A` name one file; case-folding the receive's keys would wrongly refuse
+/// them on a case-sensitive one, where they are two files, so the target's identity decides (#787). Runs on the
+/// blocking pool.
+fn commit(current: &InFlight, completed: &std::sync::Mutex<HashSet<sandy_fsutil::FileId>>) -> Result<(), ReceiveError> {
+    let poisoned = || ReceiveError::Io(std::io::Error::other("the completed-file set is poisoned"));
+    let Some((dir, temp)) = current.cleanup.0.as_ref() else {
+        return Err(sandy_fsutil::FsError::Unsafe {
+            path: PathBuf::from(&current.name),
+            reason: "the temp file was already removed".to_owned(),
+        }
+        .into());
+    };
+    let mine = dir.file_id(temp)?;
+    if let Some(target) = dir.file_id(&current.name)?
+        && completed.lock().map_err(|_| poisoned())?.contains(&target)
+    {
+        return Err(ReceiveError::Alias);
+    }
+    dir.rename(temp, &current.name)?;
+    if let Some(id) = mine {
+        completed.lock().map_err(|_| poisoned())?.insert(id);
+    }
+    Ok(())
+}
+
 /// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
 /// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
 /// including when the receive that asked for it is gone by the time this ends.
@@ -381,6 +413,7 @@ impl<'a> Receive<'a> {
             done: HashSet::new(),
             current: None,
             temp_seq: 0,
+            completed_ids: std::sync::Arc::default(),
         }
     }
 
@@ -419,15 +452,9 @@ impl<'a> Receive<'a> {
             current.discard().await;
             return Err(ReceiveError::Io(e));
         }
-        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, sandy_fsutil::FsError> {
-            let renamed = match current.cleanup.0.as_ref() {
-                Some((dir, temp)) => dir.rename(temp, &current.name),
-                None => Err(sandy_fsutil::FsError::Unsafe {
-                    path: PathBuf::from(&current.name),
-                    reason: "the temp file was already removed".to_owned(),
-                }),
-            };
-            match renamed {
+        let completed = std::sync::Arc::clone(&self.completed_ids);
+        let current = tokio::task::spawn_blocking(move || -> Result<InFlight, ReceiveError> {
+            match commit(&current, &completed) {
                 Ok(()) => {
                     current.cleanup.disarm();
                     Ok(current)
@@ -1057,6 +1084,115 @@ mod tests {
             open_temp(dest.path(), &[], 0).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1000);
         drop(cleanup);
+        Ok(())
+    }
+
+    /// A rename onto a file this transfer already completed is refused, not done: on a case-insensitive destination `a`
+    /// then `A` name one file, and the second would replace the first while the receive counts two. The completed file
+    /// stays as it was and the temp file goes.
+    #[tokio::test]
+    async fn a_target_that_is_a_file_of_this_transfer_is_refused_not_replaced() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use tokio::io::AsyncWriteExt as _;
+
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::write(dest.path().join("a"), b"first").context("first file")?;
+        let meta = std::fs::metadata(dest.path().join("a")).context("stat")?;
+        let dir = Beneath::open_dir(dest.path()).context("open dest")?;
+        let temp = OsString::from(".sandy-recv-alias-test");
+        let mut file = tokio::fs::File::from_std(dir.create_new_file(&temp).context("temp file")?);
+        file.write_all(b"second").await.context("write")?;
+
+        let mut receive = Receive::new(&[], quick());
+        receive
+            .completed_ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the id set is poisoned"))?
+            .insert(sandy_fsutil::FileId {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            });
+        receive.current = Some(InFlight {
+            key: (0, "a".to_owned()),
+            name: OsString::from("a"),
+            file,
+            cleanup: Cleanup::new(dir, temp.clone()),
+        });
+
+        let finished = receive.finish_file().await;
+        assert!(matches!(finished, Err(ReceiveError::Alias)), "got {finished:?}");
+        assert_eq!(
+            std::fs::read(dest.path().join("a")).context("read a")?,
+            b"first",
+            "the completed file must not be replaced"
+        );
+        assert!(!dest.path().join(&temp).exists(), "the temp file is removed");
+        Ok(())
+    }
+
+    /// A finished-looking file in flight: a temp file written in `dest`, held the way the receive holds one.
+    async fn in_flight(dest: &Path, name: &str, temp: &str, body: &[u8]) -> anyhow::Result<InFlight> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = Beneath::open_dir(dest).context("open dest")?;
+        let temp = OsString::from(temp);
+        let mut file = tokio::fs::File::from_std(dir.create_new_file(&temp).context("temp file")?);
+        file.write_all(body).await.context("write")?;
+        Ok(InFlight {
+            key: (0, name.to_owned()),
+            name: OsString::from(name),
+            file,
+            cleanup: Cleanup::new(dir, temp),
+        })
+    }
+
+    /// The record side of the check: a file the receive completes is remembered by identity, so a later file whose
+    /// target is another name of it is refused. `a` is finished for real, a hard link `b` is made to it, and finishing
+    /// `b` must be an `Alias`. Without the receive recording `a`'s id, the second rename goes through on any
+    /// filesystem.
+    #[tokio::test]
+    async fn a_completed_file_is_remembered_so_a_hard_link_to_it_is_refused() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        let mut receive = Receive::new(&[], quick());
+
+        receive.current = Some(in_flight(dest.path(), "a", ".sandy-recv-t1", b"first").await?);
+        receive.finish_file().await.context("finish a")?;
+        std::fs::hard_link(dest.path().join("a"), dest.path().join("b")).context("hard link")?;
+
+        receive.current = Some(in_flight(dest.path(), "b", ".sandy-recv-t2", b"second").await?);
+        let finished = receive.finish_file().await;
+        assert!(matches!(finished, Err(ReceiveError::Alias)), "got {finished:?}");
+        assert_eq!(std::fs::read(dest.path().join("a")).context("read a")?, b"first");
+        assert_eq!(
+            std::fs::read(dest.path().join("b")).context("read b")?,
+            b"first",
+            "b is a hard link to a and must not have been replaced"
+        );
+        assert!(!dest.path().join(".sandy-recv-t2").exists(), "the temp file is removed");
+        Ok(())
+    }
+
+    /// Names that differ only by case: on a case-insensitive destination they are one file and the second is refused,
+    /// on a case-sensitive one they are two files and both arrive. The probe decides which this filesystem is, so the
+    /// test holds on both.
+    #[tokio::test]
+    async fn names_differing_only_by_case_follow_the_destination_filesystem() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::write(dest.path().join("probe-x"), b"").context("probe")?;
+        let folds_case = dest.path().join("PROBE-X").exists();
+        std::fs::remove_file(dest.path().join("probe-x")).context("remove probe")?;
+
+        let outputs = [out(None, dest.path())];
+        let messages = [chunk(0, "a", b"1"), chunk(0, "A", b"2"), end()];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        if folds_case {
+            assert!(matches!(received, Err(ReceiveError::Alias)), "got {received:?}");
+            assert_eq!(std::fs::read(dest.path().join("a")).context("read a")?, b"1");
+        } else {
+            assert_eq!(received.context("two distinct files")?.files, 2);
+            assert_eq!(tree(dest.path())?, files(&[("a", b"1"), ("A", b"2")]));
+        }
         Ok(())
     }
 
