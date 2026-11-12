@@ -926,8 +926,10 @@ fn scenario(stack: &Stack) -> Result<()> {
     let created = Instant::now();
     wait_state(&mut mcp, &ttl_id, "deleted", TTL_SECS + TTL_GRACE_SECS)
         .context("AT-5: the environment was not deleted by its TTL")?;
+    // The row's creation time is whole seconds, truncated, and `created` is taken after the spawn call returned, so the
+    // deletion can read up to a second or two early here; far earlier than that is a bug.
     ensure!(
-        created.elapsed() >= Duration::from_secs(TTL_SECS),
+        created.elapsed() + Duration::from_secs(2) >= Duration::from_secs(TTL_SECS),
         "AT-5: deleted before its TTL: {:?}",
         created.elapsed()
     );
