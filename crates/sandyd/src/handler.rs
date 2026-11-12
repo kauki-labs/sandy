@@ -2669,6 +2669,85 @@ mod tests {
         )
     }
 
+    fn submit_with_names(input: Option<&str>, output: Option<Option<&str>>) -> ControlRequest {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.inputs = input
+                .map(|name| {
+                    vec![sandy_control_proto::Input {
+                        host: "/src".to_owned(),
+                        name: name.to_owned(),
+                        guest_path: None,
+                    }]
+                })
+                .unwrap_or_default();
+            submit.outputs = output
+                .map(|name| {
+                    vec![sandy_control_proto::Output {
+                        name: name.map(str::to_owned),
+                        dest: "/out".to_owned(),
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        request
+    }
+
+    /// #807, #764: a name the data link would refuse is refused at Submit, naming the field, before placement or any
+    /// job: an absolute path, a `..` or `.` component, an empty component, a NUL, an over-long name.
+    #[tokio::test]
+    async fn a_submit_with_an_unsafe_input_or_output_name_is_refused_naming_the_field() -> anyhow::Result<()> {
+        let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
+        for bad in [
+            too_long.as_str(),
+            "/abs",
+            "../up",
+            "a/../b",
+            "./a",
+            "a//b",
+            "a/",
+            "a\0b",
+        ] {
+            for (request, field) in [
+                (submit_with_names(Some(bad), None), "inputs"),
+                (submit_with_names(None, Some(Some(bad))), "outputs"),
+            ] {
+                let (store, registry) = (new_store(), new_registry());
+                let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+                let Some(control_response::Result::Error(error)) = response.result else {
+                    anyhow::bail!("name {bad:?} in {field}: expected a refusal, got {response:?}");
+                };
+                assert!(
+                    error.message.contains("is not a plain relative path") && error.message.contains(field),
+                    "name {bad:?} in {field}: got {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A catch-all output (no name) and plain names, including a nested one, pass the name check (they may still be
+    /// refused for placement, which is a different message).
+    #[tokio::test]
+    async fn plain_names_and_a_catch_all_output_pass_the_name_check() -> anyhow::Result<()> {
+        for request in [
+            submit_with_names(Some("src"), Some(None)),
+            submit_with_names(Some("a/b/c.txt"), Some(Some("report"))),
+        ] {
+            let (store, registry) = (new_store(), new_registry());
+            let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+            if let Some(control_response::Result::Error(error)) = response.result {
+                assert!(
+                    !error.message.contains("is not a plain relative path"),
+                    "a plain name was refused: {:?}",
+                    error.message
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Place `request` on one registered host and return its `Dispatch` and
     /// the job, for the #482 data-link gating tests.
     async fn place_and_read(
