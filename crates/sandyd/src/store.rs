@@ -610,6 +610,18 @@ impl JobStore {
         tx.commit()?;
         Ok(evicted)
     }
+
+    /// Move every `Pending` and `Running` row to `Failed` with an infra-fault envelope naming `reason`, and return
+    /// their ids (#830, restart recovery). A job still open when the daemon starts has no connection that can deliver
+    /// its result, so it can never end by itself. Terminal rows are not touched, and the console and exit code a row
+    /// recorded stay. One transaction: after it no row is left open, and a second call finds nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read or a write fails; no row changes then.
+    pub fn recover_unfinished(&self, reason: &str) -> Result<Vec<String>, StoreError> {
+        let _ = reason;
+        Ok(Vec::new())
+    }
 }
 
 /// `SELECT status FROM jobs WHERE job_id = ?1`, parsed, or `None` if no such
@@ -910,6 +922,58 @@ mod tests {
                 console: "hi\n".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    /// #830: recovery fails every open row with a retryable infra-fault envelope, leaves a terminal row as it was
+    /// (status, envelope, console), keeps the console an open row had recorded, and a second run changes nothing.
+    #[test]
+    fn recovery_fails_open_rows_with_a_retryable_envelope_and_spares_terminal_ones() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("pending", b"m", "argv/v1")?;
+        store.insert_pending("running", b"m", "argv/v1")?;
+        store.mark_running("running")?;
+        store.insert_pending("done", b"m", "argv/v1")?;
+        store.finish("done", JobStatus::Succeeded, Some(0), "ok\n")?;
+        let done_before = store.envelope_json("done")?;
+
+        let mut recovered = store.recover_unfinished("sandyd restarted while the job was running")?;
+        recovered.sort();
+
+        assert_eq!(recovered, ["pending", "running"]);
+        for id in ["pending", "running"] {
+            assert_eq!(store.status(id)?, Some(JobStatus::Failed), "{id}");
+            let envelope = store
+                .envelope(id)?
+                .with_context(|| format!("{id} must carry an envelope"))?;
+            assert_eq!(envelope.status, sandy::Status::Failed, "{id}");
+            assert!(envelope.retryable, "{id}: an infra fault is retryable");
+            assert_eq!(envelope.job_id, id);
+            assert!(
+                envelope.message.contains("sandyd restarted"),
+                "{id}: {:?}",
+                envelope.message
+            );
+        }
+        assert_eq!(store.status("done")?, Some(JobStatus::Succeeded));
+        assert_eq!(store.envelope_json("done")?, done_before, "a terminal row is untouched");
+        assert_eq!(store.detail("done")?.map(|d| d.console), Some("ok\n".to_owned()));
+
+        assert_eq!(store.recover_unfinished("again")?, Vec::<String>::new());
+        let message = store.envelope("running")?.map(|e| e.message).unwrap_or_default();
+        assert!(
+            message.contains("sandyd restarted"),
+            "a second run must not rewrite: {message:?}"
+        );
+        Ok(())
+    }
+
+    /// An empty store recovers nothing and does not fail.
+    #[test]
+    fn recovery_of_an_empty_store_is_a_no_op() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        assert_eq!(store.recover_unfinished("x")?, Vec::<String>::new());
         Ok(())
     }
 
