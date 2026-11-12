@@ -132,8 +132,31 @@ pub enum DispatchError {
 fn allow_list_from_policy(
     policy: Option<&sandy_executor_proto::EgressPolicy>,
 ) -> Result<Option<sandy_api::egress::AllowList>, DispatchError> {
-    let _ = policy;
-    Ok(None)
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let rules = policy
+        .rules
+        .iter()
+        .map(|rule| {
+            let port = u16::try_from(rule.port).ok().filter(|port| *port != 0).ok_or_else(|| {
+                DispatchError::EgressPolicyInvalid(format!(
+                    "port {} of `{}` is not a TCP port in 1..=65535",
+                    rule.port, rule.host
+                ))
+            })?;
+            if rule.host.is_empty() {
+                return Err(DispatchError::EgressPolicyInvalid(format!(
+                    "a rule for port {port} has no host"
+                )));
+            }
+            Ok(sandy_api::egress::EgressRule {
+                host: rule.host.clone(),
+                port,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(sandy_api::egress::AllowList { rules }))
 }
 
 /// Refuse a guest NIC for a dispatched VM (#602).
@@ -754,6 +777,11 @@ pub fn handle_dispatch(
 
     match ProtoSandboxKind::try_from(dispatch.backend).ok() {
         Some(ProtoSandboxKind::Process) => {
+            // A process job shares the host network: refuse a policy before the inputs are pulled, never run it
+            // unfiltered (A1, #483).
+            if dispatch.egress.is_some() {
+                return Err(DispatchError::EgressPolicyUnsupported.into());
+            }
             let decoded = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
             set_deadline_from_timeout_secs(&control, timeout_secs);
@@ -804,6 +832,9 @@ pub fn handle_dispatch(
         // below, exactly like an unrecognized backend value.
         Some(ProtoSandboxKind::Vm) if vm_available => {
             refuse_guest_nic(std::env::var(sandy_api::egress::NETWORK_ENV))?;
+            // A policy runs the guest behind the backend's per-run egress proxy: no NIC, exactly these destinations.
+            // Checked here with the other cheap refusals, before the slow flake resolution.
+            let allow = allow_list_from_policy(dispatch.egress.as_ref())?;
             let decoded = decode_flake_dispatch_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             // Before flake resolution: an oversized or unencodable spec is refused at once, not after the
             // sequential dispatch loop spent up to FLAKE_RESOLVE_TIMEOUT_SECS on it (CodeRabbit on #632).
@@ -868,7 +899,7 @@ pub fn handle_dispatch(
             });
             let spec = RunSpec {
                 digests: false,
-                egress: None,
+                egress: allow.as_ref(),
                 template: &template,
                 command: &decoded.command,
                 inputs: run_inputs,

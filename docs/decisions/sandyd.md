@@ -1482,6 +1482,14 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   precedent. The bare `sandy daemon submit <manifest-file>` path needs no
   new flags — an operator writing `argv/v1` JSON by hand already has the
   object shape available.
+- A1 (#483): `sandy daemon submit --allow HOST:PORT` (repeatable) sends an egress policy, `SubmitRequest.egress`, copied
+  into `Dispatch.egress`. A policy is a message field, so an empty one (deny all) stays apart from none. A policy runs
+  the guest behind the executor's per-run egress proxy, the same `Some(AllowList)` `sandy run` builds under
+  `SANDY_EGRESS=proxy`. An executor drops a field it does not know without a word, so a policy is placed only on a host
+  that declared `egress_proxy` (operator flag `SANDY_HOST_EGRESS_PROXY=1`, and only with VM capability); with none, or
+  with no remote placement at all, the Submit is refused naming the capability, never run unfiltered locally. `sandyd`
+  and the executor both check each rule (a host, a port in 1..=65535), and the executor refuses a policy on a process
+  job. The egress receipt in the result envelope is A2.
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's

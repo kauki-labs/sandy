@@ -152,6 +152,46 @@ fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) ->
         })
 }
 
+/// Refuse a Submit whose egress policy has a rule that is not a destination (A1, #483): an empty host, or a port
+/// outside 1..=65535 (the wire carries a `u32`). The CLI parses `--allow` already, but the broker and MCP submit too,
+/// and the executor re-checks, so a bad rule never reaches a host. Names the field.
+fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
+    submit.egress.as_ref()?.rules.iter().find_map(|rule| {
+        let bad_port = !u16::try_from(rule.port).is_ok_and(|port| port != 0);
+        (rule.host.is_empty() || bad_port).then(|| {
+            format!(
+                "egress has a malformed rule (host {:?}, port {}): a rule needs a host and a TCP port in 1..=65535",
+                rule.host, rule.port
+            )
+        })
+    })
+}
+
+/// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
+/// operator knows what to declare and a submitter knows why the job cannot be placed.
+fn egress_placement_refusal() -> String {
+    "no registered host declares egress_proxy together with the required isolation class and sandbox kind; this Submit \
+     names an egress policy, and an executor that does not know it would drop it and run the job without the boundary"
+        .to_owned()
+}
+
+/// Convert `SubmitRequest.egress` into its `Dispatch` wire shape: the same rules in the same order, with absent
+/// kept apart from empty (a deny-all policy is not "no policy").
+fn to_dispatch_egress(
+    egress: Option<&sandy_control_proto::EgressPolicy>,
+) -> Option<sandy_executor_proto::EgressPolicy> {
+    egress.map(|policy| sandy_executor_proto::EgressPolicy {
+        rules: policy
+            .rules
+            .iter()
+            .map(|rule| sandy_executor_proto::EgressRule {
+                host: rule.host.clone(),
+                port: rule.port,
+            })
+            .collect(),
+    })
+}
+
 /// Name the path field that made [`submit_requires_local_dispatch`] true, for
 /// a refusal message — `control.proto`'s own doc on these fields and the
 /// manifest-parity spec both require naming the field, never a generic "a
@@ -442,6 +482,13 @@ pub async fn handle(
                     result: Some(control_response::Result::Error(ControlError { message })),
                 });
             }
+            // A1 (#483): a malformed egress rule is refused before placement, with no side effect.
+            if let Some(message) = egress_policy_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             let credential_request = submit
                 .credential
                 .clone()
@@ -461,6 +508,10 @@ pub async fn handle(
             // host (never a silent `Pending` forever, never a silent place-
             // anywhere).
             let require_local = submit_requires_local_dispatch(&submit);
+            // A1 (#483): a policy is a placement requirement of its own. The local run applies no boundary, so a
+            // policy with no capable remote host is refused rather than run unfiltered.
+            let egress_policy = submit.egress.is_some();
+            let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // Cached before `submit.manifest`/`manifest_encoding` are moved
             // out below: a partial move of one field makes rustc refuse any
             // later `&submit` borrow, even to read a different field.
@@ -470,10 +521,11 @@ pub async fn handle(
                 false
             } else {
                 host_registry
-                    .pick_host_for(
+                    .pick_host_for_egress(
                         required_isolation_class.into(),
                         required_sandbox_kind.into(),
                         require_local,
+                        egress_policy,
                     )
                     .is_some()
             };
@@ -483,6 +535,8 @@ pub async fn handle(
                     .to_owned()
             } else if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if egress_policy {
+                egress_placement_refusal()
             } else if require_local {
                 format!(
                     "no registered host declares shares_submitter_filesystem; this Submit names a `{path_field_name}` \
@@ -496,7 +550,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local,
+                require_local || egress_policy,
                 placeable,
                 &placement_reason,
             ) {
@@ -569,10 +623,11 @@ pub async fn handle(
             // `send_dispatch` call happens after, once the job is durably
             // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry.pick_host_for(
+                let candidate = host_registry.pick_host_for_egress(
                     required_isolation_class.into(),
                     required_sandbox_kind.into(),
                     require_local,
+                    egress_policy,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -631,7 +686,7 @@ pub async fn handle(
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
                             data_link_token,
-                            egress: None,
+                            egress: dispatch_egress.clone(),
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -662,6 +717,8 @@ pub async fn handle(
             // and no distinct status a caller could ever notice.
             let dispatch_plan_reason = if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if egress_policy {
+                egress_placement_refusal()
             } else if require_local {
                 format!(
                     "no registered host declaring shares_submitter_filesystem could be bound for this job's \
@@ -675,7 +732,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local,
+                require_local || egress_policy,
                 dispatch_plan.is_some(),
                 &dispatch_plan_reason,
             ) {

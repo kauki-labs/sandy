@@ -314,6 +314,12 @@ enum DaemonOp {
         /// `read-pr` | `write-pr` (repeatable; default `read-code`).
         #[arg(long = "cred-capability", requires = "credential")]
         cred_capability: Vec<String>,
+        /// `--allow HOST:PORT` egress allow-list entry (repeatable), as `sandy run --allow` (A1 of #483). Any
+        /// entry runs the job's guest behind the host's egress proxy with exactly these destinations. Needs a
+        /// host-executor that declared `egress_proxy`; `sandyd` refuses the Submit otherwise. No entry means no
+        /// policy.
+        #[arg(long = "allow")]
+        allow: Vec<String>,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -897,6 +903,19 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         return ProcessExit::InvalidPlan.code();
     }
 
+    // A malformed `--allow` is the caller's input error too, refused the same way whether or not sandyd is up.
+    let submit_egress = if let DaemonOp::Submit { allow, .. } = &op {
+        match sandy_cli::plan::egress_policy(allow) {
+            Ok(egress) => egress,
+            Err(e) => {
+                eprintln!("sandy: {e}");
+                return ProcessExit::InvalidPlan.code();
+            }
+        }
+    } else {
+        None
+    };
+
     // Same pre-connection bar as `--cap-file`/`--env` above (manifest-parity
     // #496): a malformed `--input`/`--out`/`--secret` value, or two inputs
     // colliding on the same staged name, is a pure client-side input error.
@@ -1046,6 +1065,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             secrets: _,
             credential,
             cred_capability,
+            allow: _,
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
             // pairs above guarantee exactly one of `manifest` or `flake` is
@@ -1097,7 +1117,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 secrets: submit_secrets,
                 credential,
                 cred_capabilities: cred_capability,
-                egress: None,
+                egress: submit_egress,
             })
         }
         DaemonOp::Cancel { job_id } => {
