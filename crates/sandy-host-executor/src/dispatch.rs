@@ -50,7 +50,7 @@ use serde::Deserialize;
 use crate::{
     input_pull::PullLimits,
     input_stage::{INPUT_PULL_TOTAL_SECS, StagedInputs, dial_data_link, stage_remote_inputs},
-    output_stage::{OutputStaging, send_staged_outputs},
+    output_stage::{OUTPUT_SEND_TOTAL_SECS, OutputStaging, send_staged_outputs},
 };
 
 /// The `Dispatch.manifest_encoding` tag stage 1 understands for a
@@ -548,9 +548,16 @@ fn dispatched(
     staged: Option<StagedInputs>,
     staging: Option<OutputStaging>,
     rt: &tokio::runtime::Handle,
+    control: &RunControl,
 ) -> Dispatched {
     let outputs_follow = match (staged, &staging) {
-        (Some(mut staged), Some(staging)) => send_staged_outputs(&mut staged.link, staging, rt),
+        (Some(mut staged), Some(staging)) => send_staged_outputs(
+            &mut staged.link,
+            staging,
+            rt,
+            control,
+            std::time::Duration::from_secs(OUTPUT_SEND_TOTAL_SECS),
+        ),
         _ => false,
     };
     Dispatched {
@@ -746,7 +753,7 @@ pub fn handle_dispatch(
                 control: &control,
             };
             let outcome = backend.run(&spec)?;
-            Ok(dispatched(outcome, staged, staging, &data_link_rt))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
         }
         // Defense in depth (#332, mirroring `check_isolation_class`'s own
         // re-probe discipline): `vm_available` is the caller's own fresh
@@ -841,7 +848,7 @@ pub fn handle_dispatch(
             // — held in scope here, across the call, not dropped before it.
             let outcome = backend.run(&spec)?;
             drop(_kept_topology_file);
-            Ok(dispatched(outcome, staged, staging, &data_link_rt))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
         }
         _ => Err(HandleDispatchError::UnsupportedBackend(dispatch.backend)),
     }
@@ -1486,6 +1493,66 @@ mod tests {
             ),
             "expected a data link dial error, got {err:?}"
         );
+        Ok(())
+    }
+
+    fn an_outcome() -> Outcome {
+        Outcome {
+            digests: None,
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+        }
+    }
+
+    /// `dispatched` is the one place the flag is decided: outputs follow exactly when the job has a data link AND
+    /// staged outputs. A job with a link but no outputs, and a local job, send nothing and say nothing follows.
+    #[tokio::test]
+    async fn dispatched_says_outputs_follow_only_for_a_link_with_staged_outputs() -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+
+        let rt = tokio::runtime::Handle::current();
+        let control = sandy_api::backend::RunControl::with_timeout_secs(60);
+        let declared = [sandy_executor_proto::Output {
+            name: None,
+            dest: "/submitter/all".to_owned(),
+        }];
+
+        // A local job: no link, no staging.
+        let local = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control)).await?
+        };
+        assert!(!local.outputs_follow, "a local job has nothing following");
+
+        // A link and no declared outputs: the link is dropped unused, nothing is written to it.
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let staged = StagedInputs::for_test(near).context("staged inputs")?;
+        let linked = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control)).await?
+        };
+        assert!(!linked.outputs_follow, "no outputs declared: nothing follows");
+        let mut rest = Vec::new();
+        far.read_to_end(&mut rest).await.context("read the link")?;
+        assert!(rest.is_empty(), "nothing may be written to a link with no outputs");
+
+        // A link and staged outputs: they are sent, the flag is set, and the link ends after them.
+        let parent = tempfile::tempdir().context("parent")?;
+        let staging = OutputStaging::new(parent.path(), &declared).context("stage")?;
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let staged = StagedInputs::for_test(near).context("staged inputs")?;
+        let sent = {
+            let (rt, control) = (rt.clone(), control.clone());
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control))
+                .await?
+        };
+        assert!(sent.outputs_follow, "staged outputs over a link follow");
+        let mut frames = Vec::new();
+        far.read_to_end(&mut frames).await.context("read the link")?;
+        assert!(!frames.is_empty(), "the transfer must at least end with OutputEnd");
         Ok(())
     }
 

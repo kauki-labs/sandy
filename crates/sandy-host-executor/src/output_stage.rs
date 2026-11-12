@@ -7,12 +7,16 @@
 //! `<root>/<i>` is not created here: for a named output whose staged root is a file, the backend writes that file at
 //! the destination itself, and a directory already there would break it.
 
-use std::{io, path::Path};
+use std::{io, path::Path, time::Duration};
 
-use sandy_api::backend::Output;
+use sandy_api::backend::{Output, RunControl};
 use tokio::io::AsyncWrite;
 
 use crate::output_send::{OutputSource, SendLimits, send_outputs};
+
+/// The longest the send may take, whatever the peer's pace: the same 30 minutes as the input pull. The host handles
+/// dispatches one at a time, so a peer that reads a frame every few seconds must not hold the loop for days.
+pub const OUTPUT_SEND_TOTAL_SECS: u64 = 30 * 60;
 
 /// The staging root of one dispatch's outputs, and what the run and the sender need from it. Dropping it removes the
 /// root and everything the run collected into it.
@@ -86,6 +90,8 @@ pub fn send_staged_outputs(
     link: &mut (impl AsyncWrite + Unpin),
     staging: &OutputStaging,
     rt: &tokio::runtime::Handle,
+    _control: &RunControl,
+    _total: Duration,
 ) -> bool {
     match rt.block_on(send_outputs(link, staging.sources(), SendLimits::default())) {
         Ok(sent) => tracing::info!(files = sent.files, bytes = sent.bytes, "sent the staged outputs"),
@@ -103,6 +109,14 @@ mod tests {
     use sandy_executor_proto::{DataLinkMessage, data_link_message::Op};
 
     use super::*;
+
+    fn control() -> RunControl {
+        RunControl::with_timeout_secs(600)
+    }
+
+    fn total() -> Duration {
+        Duration::from_secs(OUTPUT_SEND_TOTAL_SECS)
+    }
 
     fn declared(name: Option<&str>, dest: &str) -> sandy_executor_proto::Output {
         sandy_executor_proto::Output {
@@ -193,7 +207,7 @@ mod tests {
         let (mut near, mut far) = tokio::io::duplex(1024 * 1024);
         let rt = tokio::runtime::Handle::current();
         let follows = tokio::task::spawn_blocking(move || {
-            let followed = send_staged_outputs(&mut near, &staging, &rt);
+            let followed = send_staged_outputs(&mut near, &staging, &rt, &control(), total());
             drop(near);
             (followed, staging)
         })
@@ -242,10 +256,88 @@ mod tests {
         let (mut near, far) = tokio::io::duplex(1024);
         drop(far);
         let rt = tokio::runtime::Handle::current();
-        let follows = tokio::task::spawn_blocking(move || send_staged_outputs(&mut near, &staging, &rt))
-            .await
-            .context("the send task")?;
+        let follows =
+            tokio::task::spawn_blocking(move || send_staged_outputs(&mut near, &staging, &rt, &control(), total()))
+                .await
+                .context("the send task")?;
         assert!(follows, "a failed send must still say outputs follow");
+        Ok(())
+    }
+
+    /// A catch-all output of 8 MiB, collected into its staged destination as the backend would.
+    fn a_large_staged_output() -> anyhow::Result<(tempfile::TempDir, tempfile::TempDir, OutputStaging)> {
+        let guest = tempfile::tempdir().context("guest outputs")?;
+        std::fs::write(guest.path().join("big.bin"), vec![7u8; 8 * 1024 * 1024]).context("big file")?;
+        let parent = tempfile::tempdir().context("parent")?;
+        let staging = OutputStaging::new(parent.path(), &[declared(None, "/submitter/all")]).context("stage")?;
+        let collect_into = [sandy::Output {
+            name: None,
+            dest: staging.run_outputs()[0].dest.clone(),
+        }];
+        sandy::collect_outputs(&collect_into, guest.path(), false).context("collect")?;
+        Ok((guest, parent, staging))
+    }
+
+    /// A peer that takes a trickle holds a sender that has only a per-frame write timeout for as long as it likes:
+    /// frame after frame, days at the byte cap. The host runs dispatches one at a time, so the send has a total cap,
+    /// and a send past it ends with outputs still reported as following.
+    #[tokio::test]
+    async fn a_trickling_peer_cannot_hold_the_send_past_its_total_cap() -> anyhow::Result<()> {
+        let (_guest, _parent, staging) = a_large_staged_output()?;
+        let (mut near, mut far) = tokio::io::duplex(16 * 1024);
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+
+            let mut buf = [0u8; 1024];
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if far.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+        let rt = tokio::runtime::Handle::current();
+        let sent = tokio::task::spawn_blocking(move || {
+            send_staged_outputs(&mut near, &staging, &rt, &control(), Duration::from_millis(500))
+        });
+        let ended = tokio::time::timeout(Duration::from_secs(8), sent).await;
+        // Dropping the far end unblocks a sender that did not stop on its own.
+        reader.abort();
+        let ended = ended.context("the send must stop at its total cap, not follow the peer's pace")?;
+        assert!(ended.context("the send task")?, "outputs still follow");
+        Ok(())
+    }
+
+    /// A cancel ends the send: the orchestrator already knows the job is cancelled, and the host has nothing to wait
+    /// for.
+    #[tokio::test]
+    async fn a_cancel_ends_the_send() -> anyhow::Result<()> {
+        let (_guest, _parent, staging) = a_large_staged_output()?;
+        let (mut near, mut far) = tokio::io::duplex(16 * 1024);
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+
+            let mut buf = [0u8; 1024];
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if far.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+        let run_control = control();
+        let canceller = run_control.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            canceller.cancel();
+        });
+        let rt = tokio::runtime::Handle::current();
+        let sent =
+            tokio::task::spawn_blocking(move || send_staged_outputs(&mut near, &staging, &rt, &run_control, total()));
+        let ended = tokio::time::timeout(Duration::from_secs(8), sent).await;
+        reader.abort();
+        let ended = ended.context("a cancel must end the send")?;
+        assert!(ended.context("the send task")?, "outputs still follow");
         Ok(())
     }
 }

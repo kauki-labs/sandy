@@ -68,6 +68,18 @@ pub struct StagedInputs {
     pub link: Box<dyn DataLink>,
 }
 
+#[cfg(test)]
+impl StagedInputs {
+    /// Staged inputs around `link` with no inputs, for tests of what happens after the run.
+    pub(crate) fn for_test(link: impl DataLink + 'static) -> io::Result<Self> {
+        Ok(Self {
+            inputs: Vec::new(),
+            _root: tempfile::tempdir()?,
+            link: Box::new(link),
+        })
+    }
+}
+
 /// Dial the orchestrator's mesh listener and claim the job's data link with `data_token`.
 ///
 /// # Errors
