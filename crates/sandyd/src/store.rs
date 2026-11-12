@@ -436,6 +436,9 @@ impl JobStore {
         Ok(Transition::Applied)
     }
 
+    /// Record a terminal result for `job_id` with no result envelope: for callers that never produce one (the broker's
+    /// test fixtures). The daemon's own terminal paths use `finish_with` and record an envelope.
+    ///
     /// Record a terminal result for `job_id`: its final `status`, the guest
     /// `exit_code` (if any), and a bounded `console` tail (#292). Applies only
     /// from `Pending` or `Running`; refused from any terminal state, so a
@@ -447,8 +450,7 @@ impl JobStore {
     /// [`StoreError::Sqlite`] if the read or write fails;
     /// [`StoreError::CorruptStatus`] if the stored status string is not a
     /// recognised [`JobStatus`].
-    #[cfg(test)]
-    pub(crate) fn finish(
+    pub fn finish(
         &self,
         job_id: &str,
         status: JobStatus,
