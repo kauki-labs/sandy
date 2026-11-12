@@ -40,6 +40,10 @@ pub enum DetectError {
     /// not a separate, narrower or broader check.
     #[error("trusted-process containment is not available: {0}")]
     ContainmentUnavailable(String),
+    /// `SANDY_HOST_TRANSFER` is set to something other than a yes or a no spelling. A silent `false` would hide a
+    /// typo that the operator meant as opt-in, so the executor refuses to start.
+    #[error("SANDY_HOST_TRANSFER={0:?} is not one of 1, true, yes, 0, false, no (or empty)")]
+    InvalidTransferFlag(String),
 }
 
 /// Detect this host's architecture from the running process's own build
@@ -140,6 +144,7 @@ fn to_wire_capabilities(
     vm_available: bool,
     shares_submitter_filesystem: bool,
     egress_proxy: bool,
+    transfer: bool,
 ) -> sandy_executor_proto::Capabilities {
     let process_kind = match capabilities.kind {
         SandboxKind::Process => sandy_executor_proto::SandboxKind::Process,
@@ -195,6 +200,14 @@ fn egress_proxy_from(value: Option<&str>) -> bool {
     declared(value)
 }
 
+/// Whether the operator declared this host-executor ready to receive and send a job's inputs and outputs over the
+/// data link (`SANDY_HOST_TRANSFER`, #807, sandyd.md §22): the host has disk headroom and a temp-staging path. Never
+/// auto-detected, fail-closed like the other declarations, but a value that is neither a yes nor a no spelling is
+/// refused by name rather than read as `false`.
+fn transfer_from(value: Option<&str>) -> Result<bool, DetectError> {
+    Ok(declared(value))
+}
+
 /// An operator declaration: `1`, `true` or `yes`, case-insensitive; anything else, or unset, is not declared.
 fn declared(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
@@ -221,6 +234,7 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
         detect_vm_capability(),
         shares_submitter_filesystem_from_env(),
         egress_proxy_from(std::env::var("SANDY_HOST_EGRESS_PROXY").ok().as_deref()),
+        transfer_from(std::env::var("SANDY_HOST_TRANSFER").ok().as_deref())?,
     ))
 }
 
@@ -463,7 +477,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, false, false, false);
+        let wire = to_wire_capabilities(capabilities, &status, false, false, false, false);
         assert_eq!(
             wire.supported_isolation_classes,
             vec![i32::from(IsolationClass::Trusted)]
@@ -491,7 +505,7 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, true, false, false);
+        let wire = to_wire_capabilities(capabilities, &status, true, false, false, false);
         assert_eq!(
             wire.supported_sandbox_kinds,
             vec![
@@ -532,8 +546,53 @@ mod tests {
             arch: Arch::X86_64,
             attestation: None,
         };
-        let wire = to_wire_capabilities(capabilities, &status, false, true, false);
+        let wire = to_wire_capabilities(capabilities, &status, false, true, false, false);
         assert!(wire.shares_submitter_filesystem);
+    }
+
+    /// #807: `transfer` is an operator declaration: the yes spellings declare it, the no spellings and an unset or
+    /// empty value do not, and anything else is refused by name.
+    #[test]
+    fn transfer_from_reads_the_operator_flag() {
+        for value in ["1", "true", "TRUE", "yes"] {
+            assert_eq!(
+                transfer_from(Some(value)),
+                Ok(true),
+                "{value:?} should declare transfer"
+            );
+        }
+        for value in ["0", "false", "no", ""] {
+            assert_eq!(
+                transfer_from(Some(value)),
+                Ok(false),
+                "{value:?} should not declare transfer"
+            );
+        }
+        assert_eq!(transfer_from(None), Ok(false), "unset should not declare transfer");
+        for value in ["junk", "2", "ye5"] {
+            assert_eq!(
+                transfer_from(Some(value)),
+                Err(DetectError::InvalidTransferFlag(value.to_owned())),
+                "{value:?} should be refused"
+            );
+        }
+    }
+
+    /// #807: the registration carries `transfer` only when asked, whatever else the host declares.
+    #[test]
+    fn to_wire_capabilities_declares_transfer_only_when_asked() {
+        let capabilities = || Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        for asked in [false, true] {
+            let wire = to_wire_capabilities(capabilities(), &status, false, false, false, asked);
+            assert_eq!(wire.transfer, asked, "asked={asked}");
+        }
     }
 
     /// A1 (#483): `egress_proxy` needs both the operator's declaration and a VM path. A process-only host never
@@ -554,7 +613,7 @@ mod tests {
             (false, true, false),
             (false, false, false),
         ] {
-            let wire = to_wire_capabilities(capabilities(), &status, vm, false, flag);
+            let wire = to_wire_capabilities(capabilities(), &status, vm, false, flag, false);
             assert_eq!(wire.egress_proxy, want, "vm={vm} flag={flag}");
         }
         for value in ["1", "true", "YES", " yes "] {
