@@ -146,6 +146,20 @@ where
     if inputs.iter().any(|input| input.name.is_empty()) {
         return Err(StageError::UnnamedInput);
     }
+    // The receiver's own name rule, run before the root exists: a name joined onto the root must never leave it.
+    for input in inputs {
+        sandy_executor_proto::DataLinkMessage {
+            op: Some(sandy_executor_proto::data_link_message::Op::InputChunk(
+                sandy_executor_proto::InputChunk {
+                    name: input.name.clone(),
+                    offset: 0,
+                    bytes: Vec::new(),
+                },
+            )),
+        }
+        .validate()
+        .map_err(StageError::InvalidName)?;
+    }
     // Explicit: `tempfile` applies only the umask default (0755) unless a mode is given, and the pulled inputs are the
     // job's own files (#802).
     let root = tempfile::Builder::new()
