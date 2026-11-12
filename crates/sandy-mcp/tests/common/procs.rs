@@ -31,8 +31,8 @@ pub fn stat_is_live(stat: &str) -> bool {
 ///
 /// Take the table before `root` is signalled: a child of a dead parent is re-parented to init and the walk no
 /// longer reaches it. For the same reason a double-forked or daemonised descendant escapes the walk. That risk is
-/// inferred from how `fork` and re-parenting work, not seen in a run. Another session's processes are never
-/// descendants of this daemon, so a kill list from this walk cannot name them.
+/// inferred from how `fork` and re-parenting work, not seen in a run; [`group_members_in`] covers it. Another session's
+/// processes are never descendants of this daemon, so a kill list from this walk cannot name them.
 pub fn descendants_in(table: &[(u32, u32, u64)], root: u32) -> Vec<(u32, u64)> {
     let mut found: Vec<(u32, u64)> = Vec::new();
     let mut frontier = vec![root];
@@ -45,6 +45,24 @@ pub fn descendants_in(table: &[(u32, u32, u64)], root: u32) -> Vec<(u32, u64)> {
         }
     }
     found
+}
+
+/// The process group id from the text of `/proc/<pid>/stat`.
+pub fn parse_pgrp(stat: &str) -> Option<u32> {
+    // As in `parse_stat`: rest[0] is the state, rest[1] the ppid and rest[2] the process group.
+    let rest: Vec<&str> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+    rest.get(2)?.parse().ok()
+}
+
+/// `(pid, start time)` of every member of process group `pgid` in `table`, a list of `(pid, pgrp, start time)`.
+/// `pgid` itself is listed when it is a member. The test starts `sandyd` as the leader of its own group, so a VM part
+/// that was re-parented or double-forked still carries that group id, which the parent walk cannot see.
+pub fn group_members_in(table: &[(u32, u32, u64)], pgid: u32) -> Vec<(u32, u64)> {
+    table
+        .iter()
+        .filter(|(_, pgrp, _)| *pgrp == pgid)
+        .map(|(pid, _, start)| (*pid, *start))
+        .collect()
 }
 
 /// Whether a process name (`/proc/<pid>/comm`) is part of a VM: qemu, its virtiofs daemons or the egress proxy.

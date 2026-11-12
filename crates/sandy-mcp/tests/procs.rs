@@ -7,13 +7,20 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use common::procs::{
-    descendants_in, file_holds, files_holding, foreign_new_entries, is_vm_part, parse_stat, run_dirs_left,
-    sandy_entries, staging_base, stat_is_live,
+    descendants_in, file_holds, files_holding, foreign_new_entries, group_members_in, is_vm_part, parse_pgrp,
+    parse_stat, run_dirs_left, sandy_entries, staging_base, stat_is_live,
 };
 
-/// A `/proc/<pid>/stat` line: pid, comm, state, ppid and 17 more fields up to the start time (field 22).
+/// A `/proc/<pid>/stat` line: pid, comm, state, ppid, process group and 16 more fields up to the start time (field 22).
+fn stat_line_in_group(comm: &str, ppid: u32, pgrp: u32, start: u64) -> String {
+    format!(
+        "4242 ({comm}) S {ppid} {pgrp} 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 50 18446744073709551615"
+    )
+}
+
+/// A line in group 1.
 fn stat_line(comm: &str, ppid: u32, start: u64) -> String {
-    format!("4242 ({comm}) S {ppid} 1 1 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 {start} 1000 50 18446744073709551615")
+    stat_line_in_group(comm, ppid, 1, start)
 }
 
 #[test]
@@ -93,6 +100,48 @@ fn the_descendant_walk_ends_on_a_cyclic_table_and_never_lists_the_root() {
     let table = [(10, 11, 1), (11, 10, 2)];
     let found = descendants_in(&table, 10);
     assert_eq!(found, vec![(11, 2)]);
+}
+
+/// The process group id is field 5 of `/proc/<pid>/stat`: the third after the command name.
+#[test]
+fn the_process_group_is_read_from_the_stat_line() {
+    assert_eq!(
+        parse_pgrp(&stat_line_in_group("qemu-system-x86", 7, 31337, 9)),
+        Some(31337)
+    );
+    let tricky = stat_line_in_group("a) S (b", 7, 31337, 9);
+    assert_eq!(
+        parse_pgrp(&tricky),
+        Some(31337),
+        "a `)` in the command name does not shift the fields"
+    );
+    assert_eq!(parse_pgrp(""), None);
+    assert_eq!(parse_pgrp("4242 (sandyd"), None);
+}
+
+/// A re-parented or double-forked descendant keeps the group of the daemon that started it, so the group finds what the
+/// parent walk cannot; another session's processes have another group.
+#[test]
+fn a_group_lists_its_members_including_orphans_and_no_one_else() {
+    // (pid, pgrp, start): 10 leads group 10; 11 is its child; 12 was re-parented to init but kept the group;
+    // 20 and 21 belong to another session's group; 30 is a stray with no group relation.
+    let table = [
+        (1, 1, 1),
+        (10, 10, 100),
+        (11, 10, 110),
+        (12, 10, 120),
+        (20, 20, 200),
+        (21, 20, 210),
+        (30, 30, 300),
+    ];
+    let mut found = group_members_in(&table, 10);
+    found.sort_unstable();
+    assert_eq!(found, vec![(10, 100), (11, 110), (12, 120)]);
+    assert!(
+        group_members_in(&table, 99).is_empty(),
+        "an unknown group has no members"
+    );
+    assert_eq!(group_members_in(&table, 30), vec![(30, 300)]);
 }
 
 #[test]
