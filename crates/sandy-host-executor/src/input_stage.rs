@@ -8,7 +8,7 @@
 //! What this does NOT do: send outputs back (slice 6), or decide whether a job needs a data link (the sender's
 //! Submit-side rule, slice 7).
 
-use std::{io, net::SocketAddr, path::Path, time::Duration};
+use std::{io, net::SocketAddr, os::unix::fs::PermissionsExt as _, path::Path, time::Duration};
 
 use sandy_api::backend::{Input, RunControl};
 use sandy_executor_proto::{REMOTE_LINK_TOKEN_LEN, encode_remote_link_prefix};
@@ -141,8 +141,11 @@ where
     if inputs.iter().any(|input| input.name.is_empty()) {
         return Err(StageError::UnnamedInput);
     }
+    // Explicit: `tempfile` applies only the umask default (0755) unless a mode is given, and the pulled inputs are the
+    // job's own files (#802).
     let root = tempfile::Builder::new()
         .prefix("sandy-inputs-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(parent)
         .map_err(StageError::Root)?;
     let names: Vec<String> = inputs.iter().map(|input| input.name.clone()).collect();
@@ -309,6 +312,36 @@ mod tests {
             b"A"
         );
         assert_eq!(entries(parent.path())?, 1, "exactly one root under the parent");
+        Ok(())
+    }
+
+    /// The staging root holds a job's pulled inputs, so only its owner may enter it: mode 0700, not the umask default
+    /// (0755) `tempfile` gives a directory when no mode is asked for, which lets any local user read the inputs (#802).
+    #[tokio::test]
+    async fn the_staging_root_is_private_to_its_owner() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().context("parent")?;
+        let (staged, _peer) = stage(
+            &[chunk("data", 0, b"secret"), end()],
+            &[declared("data", None)],
+            parent.path(),
+            &live(),
+            CAP,
+        )
+        .await?;
+        let _staged = staged.context("the staging")?;
+
+        let roots: Vec<_> = std::fs::read_dir(parent.path())
+            .context("read the parent")?
+            .collect::<Result<_, _>>()
+            .context("list the parent")?;
+        assert_eq!(roots.len(), 1, "exactly one root under the parent");
+        let mode = roots[0].metadata().context("stat the root")?.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the staging root must be private to its owner, got {mode:o}"
+        );
         Ok(())
     }
 
