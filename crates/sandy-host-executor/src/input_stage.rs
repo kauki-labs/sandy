@@ -33,6 +33,11 @@ pub enum StageError {
     /// A transferred input has an empty `Input.name`, so the sender cannot name its chunks.
     #[error("a transferred input must be named")]
     UnnamedInput,
+    /// A transferred input's name is not a plain relative path the receiver would accept (too long, absolute, a `.`
+    /// or `..` component, a NUL). Refused before the root exists: a name joined onto the root must never leave it
+    /// (#764).
+    #[error("a transferred input has a name that is not a plain relative path: {0}")]
+    InvalidName(sandy_executor_proto::DataLinkViolation),
     /// The staging root could not be created.
     #[error("creating the staging root: {0}")]
     Root(#[source] io::Error),
@@ -620,6 +625,39 @@ mod tests {
             staged.err()
         );
         assert_eq!(entries(parent.path())?, 0);
+        Ok(())
+    }
+
+    /// A declared name the receiver would never match is refused before any root is made, one test row per shape
+    /// (#764).
+    #[tokio::test]
+    async fn an_input_name_that_is_not_a_plain_relative_path_is_refused_before_a_root_exists() -> anyhow::Result<()> {
+        let too_long = "a".repeat(sandy_executor_proto::MAX_CHUNK_NAME_BYTES + 1);
+        for name in [
+            too_long.as_str(),
+            "/abs",
+            "../up",
+            "a/../b",
+            "./a",
+            "a/.",
+            "a//b",
+            "a/",
+            "a\0b",
+        ] {
+            let parent = tempfile::tempdir().context("parent")?;
+            let bad = sandy_executor_proto::Input {
+                host: "/x".to_owned(),
+                name: name.to_owned(),
+                guest_path: None,
+            };
+            let (staged, _peer) = stage(&[end()], &[bad], parent.path(), &live(), CAP).await?;
+            assert!(
+                matches!(staged, Err(StageError::InvalidName(_))),
+                "name {name:?}: got {:?}",
+                staged.err()
+            );
+            assert_eq!(entries(parent.path())?, 0, "name {name:?} left a root");
+        }
         Ok(())
     }
 }
