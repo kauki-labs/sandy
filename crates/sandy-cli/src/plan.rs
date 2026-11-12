@@ -371,7 +371,7 @@ pub fn parse_env(raw: &str) -> Result<(String, String), PlanError> {
 /// The port must be a decimal `u16` (1..=65535); host must be non-empty. A
 /// missing `:`, empty host, or non-numeric / out-of-range port yields
 /// [`PlanError::Invalid`] — the allow-list is never a partial plan.
-fn parse_allow(raw: &str) -> Result<EgressRule, PlanError> {
+pub(crate) fn parse_allow(raw: &str) -> Result<EgressRule, PlanError> {
     let invalid = || PlanError::Invalid(format!("--allow `{raw}` must be HOST:PORT"));
     // `rsplit_once` keeps a colon-bearing host (e.g. an IPv6 literal) intact: only
     // the final `:PORT` is split off, and the port must parse as a `u16`.
@@ -391,11 +391,34 @@ fn parse_allow(raw: &str) -> Result<EgressRule, PlanError> {
     })
 }
 
+/// The egress policy `sandy daemon submit --allow` sends (A1, #483): no `--allow` is no policy, one or more is a
+/// policy of exactly those rules in order, each parsed and bounded the way `sandy run --allow` parses it. A policy
+/// with no rules (a deny-all proxy) is not expressible here; the daemon accepts one from other clients.
+///
+/// # Errors
+///
+/// [`PlanError::Invalid`] for the first malformed `HOST:PORT`.
+pub fn egress_policy(allow: &[String]) -> Result<Option<sandy_control_proto::EgressPolicy>, PlanError> {
+    if allow.is_empty() {
+        return Ok(None);
+    }
+    let rules = allow
+        .iter()
+        .map(|raw| {
+            parse_allow(raw).map(|rule| sandy_control_proto::EgressRule {
+                host: rule.host,
+                port: u32::from(rule.port),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(sandy_control_proto::EgressPolicy { rules }))
+}
+
 #[cfg(test)]
 mod tests {
     use sandy::{PlanError, SecretSource};
 
-    use super::{RunArgs, parse_input, parse_run};
+    use super::{RunArgs, egress_policy, parse_input, parse_run};
 
     /// #618: the stage refuses an input that is a symlink, so `--input` resolves a link the user typed (a nix
     /// `result`, say) itself, once, before the path reaches the stage.
@@ -694,5 +717,46 @@ mod tests {
             matches!(parse_run(args), Err(PlanError::Invalid(_))),
             "a malformed --secret must yield PlanError::Invalid"
         );
+    }
+
+    /// A1 (#483): the policy `daemon submit` sends has the same rules, in the same order, as the plan `sandy run`
+    /// builds from the same `--allow` values, one table row per shape.
+    #[test]
+    fn the_daemon_egress_policy_matches_the_direct_planners_allow_list() -> anyhow::Result<()> {
+        let rows: [(&str, &[&str]); 4] = [
+            ("one", &["example.com:443"]),
+            ("two", &["example.com:443", "10.0.0.5:8080"]),
+            ("ipv6 literal", &["[::1]:8443"]),
+            ("max port", &["example.com:65535"]),
+        ];
+        for (name, raw) in rows {
+            let allow: Vec<String> = raw.iter().map(|s| (*s).to_owned()).collect();
+            let plan = parse_run(RunArgs {
+                template: "t".to_owned(),
+                allow: allow.clone(),
+                ..RunArgs::default()
+            })?;
+            let policy = egress_policy(&allow)?.ok_or_else(|| anyhow::anyhow!("{name}: a policy"))?;
+            let sent: Vec<(String, u32)> = policy.rules.into_iter().map(|r| (r.host, r.port)).collect();
+            let direct: Vec<(String, u32)> = plan
+                .allow
+                .rules
+                .into_iter()
+                .map(|r| (r.host, u32::from(r.port)))
+                .collect();
+            assert_eq!(sent, direct, "{name}");
+        }
+        Ok(())
+    }
+
+    /// No `--allow` is no policy, and a malformed one is refused whole, never a partial policy.
+    #[test]
+    fn no_allow_is_no_policy_and_a_malformed_one_is_refused() -> anyhow::Result<()> {
+        assert_eq!(egress_policy(&[])?, None);
+        for bad in ["nocolon", ":443", "example.com:0", "example.com:65536", "example.com:x"] {
+            let allow = vec!["example.com:443".to_owned(), bad.to_owned()];
+            assert!(egress_policy(&allow).is_err(), "{bad}");
+        }
+        Ok(())
     }
 }

@@ -412,6 +412,20 @@ impl HostRegistry {
         required_sandbox_kind: i32,
         needs: PathNeeds,
     ) -> Option<PlacementCandidate> {
+        self.pick_host_egress(required_isolation_class, required_sandbox_kind, needs, false)
+    }
+
+    /// [`Self::pick_host`] that also requires, when `require_egress_proxy` is set, a host that declared
+    /// `egress_proxy` (A1, #483). An executor drops a `Dispatch.egress` it does not know without a word, so a job with
+    /// an egress policy is never placed on a host that did not declare it.
+    #[must_use]
+    pub fn pick_host_egress(
+        &self,
+        required_isolation_class: i32,
+        required_sandbox_kind: i32,
+        needs: PathNeeds,
+        require_egress_proxy: bool,
+    ) -> Option<PlacementCandidate> {
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
                 required_isolation_class,
@@ -452,6 +466,7 @@ impl HostRegistry {
                         .capabilities
                         .supported_sandbox_kinds
                         .contains(&required_sandbox_kind)
+                    && (!require_egress_proxy || host.capabilities.egress_proxy)
                     && match needs {
                         PathNeeds::Anywhere => true,
                         PathNeeds::SharedFilesystem => host.capabilities.shares_submitter_filesystem,

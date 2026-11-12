@@ -167,6 +167,21 @@ fn field_name_refusal(field: &str, names: &[&str]) -> Option<String> {
     None
 }
 
+/// The most `inputs`, and the most `outputs`, one Submit may declare (#807). Each is a path walked and sent over the
+/// data link, so an unbounded list is an unbounded walk before any transfer limit applies.
+pub(crate) const MAX_SUBMIT_TRANSFER_PATHS: usize = 256;
+
+/// Refuse a Submit that declares more inputs or outputs than `MAX_SUBMIT_TRANSFER_PATHS` (#807), before any side
+/// effect.
+fn submit_caps_refusal(submit: &SubmitRequest) -> Option<String> {
+    [("inputs", submit.inputs.len()), ("outputs", submit.outputs.len())]
+        .into_iter()
+        .find(|&(_, count)| count > MAX_SUBMIT_TRANSFER_PATHS)
+        .map(|(field, count)| {
+            format!("{field}: {count} declared, at most {MAX_SUBMIT_TRANSFER_PATHS} are allowed per Submit")
+        })
+}
+
 /// Refuse a Submit whose credential request this daemon cannot honor (#481), before
 /// any side effect: `cred_capabilities` with no `credential`, a credential name
 /// that is not a single file name, a credential on a daemon with no credential
@@ -197,6 +212,46 @@ fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) ->
                  rename that secret or drop the credential"
             )
         })
+}
+
+/// Refuse a Submit whose egress policy has a rule that is not a destination (A1, #483): an empty host, or a port
+/// outside 1..=65535 (the wire carries a `u32`). The CLI parses `--allow` already, but the broker and MCP submit too,
+/// and the executor re-checks, so a bad rule never reaches a host. Names the field.
+fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
+    submit.egress.as_ref()?.rules.iter().find_map(|rule| {
+        let bad_port = !u16::try_from(rule.port).is_ok_and(|port| port != 0);
+        (rule.host.is_empty() || bad_port).then(|| {
+            format!(
+                "egress has a malformed rule (host {:?}, port {}): a rule needs a host and a TCP port in 1..=65535",
+                rule.host, rule.port
+            )
+        })
+    })
+}
+
+/// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
+/// operator knows what to declare and a submitter knows why the job cannot be placed.
+fn egress_placement_refusal() -> String {
+    "no registered host declares egress_proxy together with the required isolation class and sandbox kind; this Submit \
+     names an egress policy, and an executor that does not know it would drop it and run the job without the boundary"
+        .to_owned()
+}
+
+/// Convert `SubmitRequest.egress` into its `Dispatch` wire shape: the same rules in the same order, with absent
+/// kept apart from empty (a deny-all policy is not "no policy").
+fn to_dispatch_egress(
+    egress: Option<&sandy_control_proto::EgressPolicy>,
+) -> Option<sandy_executor_proto::EgressPolicy> {
+    egress.map(|policy| sandy_executor_proto::EgressPolicy {
+        rules: policy
+            .rules
+            .iter()
+            .map(|rule| sandy_executor_proto::EgressRule {
+                host: rule.host.clone(),
+                port: rule.port,
+            })
+            .collect(),
+    })
 }
 
 /// Name the path field that made [`submit_requires_local_dispatch`] true, for
@@ -481,9 +536,37 @@ pub async fn handle(
                 });
             }
 
+            if let Some(message) = submit_caps_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             // #481: a credential request this daemon cannot honor is refused
             // before placement and before any mint.
             if let Some(message) = credential_request_refusal(&submit, registry) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
+            // A1 (#483): a policy runs the guest behind the egress proxy, so only a VM job can honor it; a process job
+            // shares the host network. Refused here, with no side effect, not after the row exists and the executor
+            // refuses the dispatch (CodeRabbit on #818).
+            if submit.egress.is_some() && required_sandbox_kind != SandboxKind::Vm {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError {
+                        message: format!(
+                            "an egress policy needs a Vm-backed manifest encoding (e.g. flake/v1); manifest_encoding \
+                             {:?} resolves to SandboxKind::{required_sandbox_kind:?}, which has no egress boundary",
+                            submit.manifest_encoding
+                        ),
+                    })),
+                });
+            }
+            // A1 (#483): a malformed egress rule is refused before placement, with no side effect.
+            if let Some(message) = egress_policy_refusal(&submit) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(ControlError { message })),
@@ -514,6 +597,10 @@ pub async fn handle(
             // host (never a silent `Pending` forever, never a silent place-
             // anywhere).
             let require_local = submit_requires_local_dispatch(&submit);
+            // A1 (#483): a policy is a placement requirement of its own. The local run applies no boundary, so a
+            // policy with no capable remote host is refused rather than run unfiltered.
+            let egress_policy = submit.egress.is_some();
+            let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
             // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
             let path_needs = if !submit.secrets.is_empty() || submit.credential.is_some() {
@@ -532,10 +619,11 @@ pub async fn handle(
                 false
             } else {
                 host_registry
-                    .pick_host(
+                    .pick_host_egress(
                         required_isolation_class.into(),
                         required_sandbox_kind.into(),
                         path_needs,
+                        egress_policy,
                     )
                     .is_some()
             };
@@ -545,6 +633,8 @@ pub async fn handle(
                     .to_owned()
             } else if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if egress_policy {
+                egress_placement_refusal()
             } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
                 format!(
                     "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
@@ -564,7 +654,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local,
+                require_local || egress_policy,
                 placeable,
                 &placement_reason,
             ) {
@@ -637,10 +727,11 @@ pub async fn handle(
             // `send_dispatch` call happens after, once the job is durably
             // recorded.
             let dispatch_plan = forward_back_addr.and_then(|forward_back| {
-                let candidate = host_registry.pick_host(
+                let candidate = host_registry.pick_host_egress(
                     required_isolation_class.into(),
                     required_sandbox_kind.into(),
                     path_needs,
+                    egress_policy,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -700,7 +791,7 @@ pub async fn handle(
                             outputs: path_outputs.clone(),
                             secrets: path_secrets.clone(),
                             data_link_token,
-                            egress: None,
+                            egress: dispatch_egress.clone(),
                         };
                         Some((candidate.host_id, candidate.registration, dispatch))
                     }
@@ -731,6 +822,8 @@ pub async fn handle(
             // and no distinct status a caller could ever notice.
             let dispatch_plan_reason = if credential_request.is_some() {
                 credential_placement_refusal()
+            } else if egress_policy {
+                egress_placement_refusal()
             } else if require_local {
                 format!(
                     "no registered host declaring shares_submitter_filesystem{} could be bound for this job's \
@@ -749,7 +842,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local,
+                require_local || egress_policy,
                 dispatch_plan.is_some(),
                 &dispatch_plan_reason,
             ) {
@@ -2927,6 +3020,49 @@ mod tests {
         Ok(())
     }
 
+    /// #807: a Submit declaring more inputs or more outputs than the cap is refused naming the field and the cap,
+    /// before placement or any job; exactly the cap passes.
+    #[tokio::test]
+    async fn a_submit_over_the_input_or_output_cap_is_refused_naming_the_field() -> anyhow::Result<()> {
+        let cap = MAX_SUBMIT_TRANSFER_PATHS;
+        for (count, field, refused) in [
+            (cap + 1, "inputs", true),
+            (cap + 1, "outputs", true),
+            (cap, "inputs", false),
+            (cap, "outputs", false),
+        ] {
+            let mut request = submit_req_with_input(1);
+            if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                submit.inputs = Vec::new();
+                submit.outputs = Vec::new();
+                if field == "inputs" {
+                    submit.inputs = (0..count)
+                        .map(|i| sandy_control_proto::Input {
+                            host: "/src".to_owned(),
+                            name: format!("in{i}"),
+                            guest_path: None,
+                        })
+                        .collect();
+                } else {
+                    submit.outputs = (0..count)
+                        .map(|i| sandy_control_proto::Output {
+                            name: Some(format!("out{i}")),
+                            dest: "/out".to_owned(),
+                        })
+                        .collect();
+                }
+            }
+            let (store, registry) = (new_store(), new_registry());
+            let response = handle(&store, &registry, &new_host_registry(), None, test_session(), request).await?;
+            let over_cap = matches!(
+                &response.result,
+                Some(control_response::Result::Error(e)) if e.message.contains(field) && e.message.contains("at most")
+            );
+            assert_eq!(over_cap, refused, "{count} {field}: got {response:?}");
+        }
+        Ok(())
+    }
+
     /// Place `request` on one registered host and return its `Dispatch` and
     /// the job, for the #482 data-link gating tests.
     async fn place_and_read(
@@ -3096,6 +3232,198 @@ mod tests {
         let (dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
         assert_eq!(dispatch.data_link_token.len(), crate::link_auth::LINK_TOKEN_LEN);
         assert!(job.data_link.is_some(), "outputs alone must bind a data link");
+        Ok(())
+    }
+
+    /// A Submit naming `egress` (`sandy daemon submit --allow`, A1 of #483). `None` is no policy; `Some(&[])` is a
+    /// policy with no rules (deny all). A rule is `(host, port)`; the port is the wire's `u32`.
+    fn submit_req_with_egress(id: u64, egress: Option<&[(&str, u32)]>) -> ControlRequest {
+        req(
+            id,
+            control_request::Op::Submit(SubmitRequest {
+                egress: egress.map(|rules| sandy_control_proto::EgressPolicy {
+                    rules: rules
+                        .iter()
+                        .map(|(host, port)| sandy_control_proto::EgressRule {
+                            host: (*host).to_owned(),
+                            port: *port,
+                        })
+                        .collect(),
+                }),
+                // A policy runs the guest behind the egress proxy, so a VM job: `flake/v1` resolves to the Vm kind.
+                manifest_encoding: "flake/v1".to_owned(),
+                manifest: flake_manifest_bytes(None),
+                ..match submit_req(id).op {
+                    Some(control_request::Op::Submit(submit)) => submit,
+                    _ => unreachable!("submit_req builds a Submit"),
+                }
+            }),
+        )
+    }
+
+    fn egress_host(egress_proxy: bool) -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
+            egress_proxy,
+            ..trusted_host_capabilities()
+        }
+    }
+
+    /// CodeRabbit on #818 (and #819 item 1): a policy is a VM-only feature, so a Submit that names one for a process
+    /// job (`argv/v1`, whatever host qualifies) is refused at Submit with the sandbox named, before any job, mint or
+    /// placement, not accepted and then refused by the executor after the row exists.
+    #[tokio::test]
+    async fn an_egress_policy_on_a_process_job_is_refused_at_submit() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "capable-host", peer_ip, egress_host(true));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let mut request = submit_req_with_egress(1, Some(&[("example.com", 443)]));
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.manifest_encoding = "argv/v1".to_owned();
+        }
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(
+                    e.message.contains("egress") && e.message.contains("Vm"),
+                    "must name the policy and the sandbox: {}",
+                    e.message
+                );
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "nothing was dispatched");
+        assert!(store.list()?.is_empty(), "no job row is left behind");
+        Ok(())
+    }
+
+    /// A1 (#483): the policy a Submit names reaches the host's `Dispatch` as the same list, and an absent policy stays
+    /// absent, an empty one stays empty (a deny-all proxy is not "no policy").
+    #[tokio::test]
+    async fn an_egress_policy_reaches_the_dispatch_unchanged() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        type Rows<'a> = Vec<(&'a str, Option<&'a [(&'a str, u32)]>)>;
+        let rows: Rows<'_> = vec![
+            ("none", None),
+            ("empty", Some(&[])),
+            ("one", Some(&[("example.com", 443)])),
+            ("two", Some(&[("example.com", 443), ("10.0.0.5", 8080)])),
+        ];
+        for (name, egress) in rows {
+            let (dispatch, _job, _registry) =
+                place_and_read(submit_req_with_egress(1, egress), egress_host(true), peer_ip).await?;
+            let want = egress.map(|rules| sandy_executor_proto::EgressPolicy {
+                rules: rules
+                    .iter()
+                    .map(|(host, port)| sandy_executor_proto::EgressRule {
+                        host: (*host).to_owned(),
+                        port: *port,
+                    })
+                    .collect(),
+            });
+            assert_eq!(dispatch.egress, want, "{name}");
+        }
+        Ok(())
+    }
+
+    /// A1 (#483): an executor that does not know `egress` drops the field silently, so a policy is placed only on a
+    /// host that declared `egress_proxy`. With none, the Submit is refused naming the capability, with no trace.
+    #[tokio::test]
+    async fn an_egress_policy_with_no_capable_host_is_refused_naming_the_capability() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "old-host", peer_ip, egress_host(false));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_with_egress(1, Some(&[("example.com", 443)])),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(
+                    e.message.contains("egress_proxy"),
+                    "must name the capability: {}",
+                    e.message
+                );
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "nothing was dispatched");
+        Ok(())
+    }
+
+    /// A1 (#483): with no remote placement reachable at all, a policy is refused too: the local run applies no
+    /// boundary, so it must not run the job unfiltered.
+    #[tokio::test]
+    async fn an_egress_policy_with_no_remote_placement_is_refused() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            None,
+            test_session(),
+            submit_req_with_egress(1, Some(&[])),
+        )
+        .await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Error(_))),
+            "a policy with nowhere to enforce it must be refused, got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
+    /// A1 (#483): the broker and MCP submit too, so the daemon re-validates the rules the CLI already parsed: a rule
+    /// needs a host and a TCP port in 1..=65535 (the wire carries a `u32`).
+    #[tokio::test]
+    async fn a_malformed_egress_rule_is_refused_at_submit() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let bad: [(&str, &[(&str, u32)]); 4] = [
+            ("empty host", &[("", 443)]),
+            ("port zero", &[("example.com", 0)]),
+            ("port above u16", &[("example.com", 65_536)]),
+            ("second rule bad", &[("example.com", 443), ("example.org", 0)]),
+        ];
+        for (name, rules) in bad {
+            let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+            let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, egress_host(true));
+            let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+            let response = handle(
+                &store,
+                &registry,
+                &host_registry,
+                Some(forward_back),
+                test_session(),
+                submit_req_with_egress(1, Some(rules)),
+            )
+            .await?;
+            match response.result {
+                Some(control_response::Result::Error(e)) => {
+                    assert!(
+                        e.message.contains("egress"),
+                        "{name}: must name the field: {}",
+                        e.message
+                    );
+                }
+                other => anyhow::bail!("{name}: expected a refusal, got {other:?}"),
+            }
+            assert!(dispatch_rx.try_recv().is_err(), "{name}: nothing was dispatched");
+        }
         Ok(())
     }
 

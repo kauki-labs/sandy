@@ -114,6 +114,49 @@ pub enum DispatchError {
     /// nftables boundary a NIC needs, so a dispatched VM never gets one (#602).
     #[error("SANDY_NETWORK is set to a guest NIC on this host, but a dispatched VM has no egress boundary: {0}")]
     NetworkProfileUnsupported(String),
+    /// The dispatch carries an egress policy, but a process job shares the host network and has no egress boundary
+    /// to apply it with (A1, #483). Refused rather than run unfiltered.
+    #[error("a process job has no egress boundary, so the dispatch's egress policy cannot be applied")]
+    EgressPolicyUnsupported,
+    /// A rule of the dispatch's egress policy is not a destination: an empty host or a port outside 1..=65535.
+    #[error("malformed egress policy: {0}")]
+    EgressPolicyInvalid(String),
+}
+
+/// The allow-list a dispatch's egress policy names (A1, #483): `None` for no policy, `Some` (an empty list included)
+/// for one. The same shape the direct planner builds, and the same checks `sandy run --allow` applies.
+///
+/// # Errors
+///
+/// [`DispatchError::EgressPolicyInvalid`] for a rule with an empty host or a port outside 1..=65535.
+fn allow_list_from_policy(
+    policy: Option<&sandy_executor_proto::EgressPolicy>,
+) -> Result<Option<sandy_api::egress::AllowList>, DispatchError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let rules = policy
+        .rules
+        .iter()
+        .map(|rule| {
+            let port = u16::try_from(rule.port).ok().filter(|port| *port != 0).ok_or_else(|| {
+                DispatchError::EgressPolicyInvalid(format!(
+                    "port {} of `{}` is not a TCP port in 1..=65535",
+                    rule.port, rule.host
+                ))
+            })?;
+            if rule.host.is_empty() {
+                return Err(DispatchError::EgressPolicyInvalid(format!(
+                    "a rule for port {port} has no host"
+                )));
+            }
+            Ok(sandy_api::egress::EgressRule {
+                host: rule.host.clone(),
+                port,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(sandy_api::egress::AllowList { rules }))
 }
 
 /// Refuse a guest NIC for a dispatched VM (#602).
@@ -734,6 +777,11 @@ pub fn handle_dispatch(
 
     match ProtoSandboxKind::try_from(dispatch.backend).ok() {
         Some(ProtoSandboxKind::Process) => {
+            // A process job shares the host network: refuse a policy before the inputs are pulled, never run it
+            // unfiltered (A1, #483).
+            if dispatch.egress.is_some() {
+                return Err(DispatchError::EgressPolicyUnsupported.into());
+            }
             let decoded = decode_argv_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             let timeout_secs = clamp_timeout_secs(decoded.timeout_secs);
             set_deadline_from_timeout_secs(&control, timeout_secs);
@@ -784,6 +832,9 @@ pub fn handle_dispatch(
         // below, exactly like an unrecognized backend value.
         Some(ProtoSandboxKind::Vm) if vm_available => {
             refuse_guest_nic(std::env::var(sandy_api::egress::NETWORK_ENV))?;
+            // A policy runs the guest behind the backend's per-run egress proxy: no NIC, exactly these destinations.
+            // Checked here with the other cheap refusals, before the slow flake resolution.
+            let allow = allow_list_from_policy(dispatch.egress.as_ref())?;
             let decoded = decode_flake_dispatch_manifest(&dispatch.manifest_encoding, &dispatch.manifest)?;
             // Before flake resolution: an oversized or unencodable spec is refused at once, not after the
             // sequential dispatch loop spent up to FLAKE_RESOLVE_TIMEOUT_SECS on it (CodeRabbit on #632).
@@ -848,7 +899,7 @@ pub fn handle_dispatch(
             });
             let spec = RunSpec {
                 digests: false,
-                egress: None,
+                egress: allow.as_ref(),
                 template: &template,
                 command: &decoded.command,
                 inputs: run_inputs,
@@ -1631,6 +1682,114 @@ mod tests {
         assert!(
             matches!(err, HandleDispatchError::Backend(_)),
             "expected a backend error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    fn policy(rules: &[(&str, u32)]) -> sandy_executor_proto::EgressPolicy {
+        sandy_executor_proto::EgressPolicy {
+            rules: rules
+                .iter()
+                .map(|(host, port)| sandy_executor_proto::EgressRule {
+                    host: (*host).to_owned(),
+                    port: *port,
+                })
+                .collect(),
+        }
+    }
+
+    /// A1 (#483): no policy is no allow-list, an empty policy is an empty one (a deny-all proxy), and rules keep their
+    /// order. The same `Option<AllowList>` the direct planner hands the backend.
+    #[test]
+    fn an_egress_policy_becomes_the_same_allow_list_the_direct_planner_builds() -> anyhow::Result<()> {
+        assert_eq!(allow_list_from_policy(None), Ok(None));
+        assert_eq!(
+            allow_list_from_policy(Some(&policy(&[])))?,
+            Some(sandy_api::egress::AllowList::default())
+        );
+        let got = allow_list_from_policy(Some(&policy(&[("example.com", 443), ("10.0.0.5", 8080)])))?
+            .context("a policy is an allow-list")?;
+        let want: Vec<_> = [("example.com", 443u16), ("10.0.0.5", 8080)]
+            .into_iter()
+            .map(|(host, port)| sandy_api::egress::EgressRule {
+                host: host.to_owned(),
+                port,
+            })
+            .collect();
+        assert_eq!(got.rules, want);
+        Ok(())
+    }
+
+    /// A1 (#483): a rule that is not a destination is refused, never clamped or skipped.
+    #[test]
+    fn a_malformed_egress_rule_is_refused_by_the_executor_too() {
+        for (name, rules) in [
+            ("empty host", vec![("", 443u32)]),
+            ("port zero", vec![("example.com", 0)]),
+            ("port above u16", vec![("example.com", 65_536)]),
+            ("second rule bad", vec![("example.com", 443), ("example.org", 0)]),
+        ] {
+            assert!(
+                matches!(
+                    allow_list_from_policy(Some(&policy(&rules))),
+                    Err(DispatchError::EgressPolicyInvalid(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// A1 (#483): a process job shares the host network, so a policy on one is refused before anything runs
+    /// (before the inputs are even pulled), not silently dropped.
+    #[tokio::test]
+    async fn a_process_dispatch_with_an_egress_policy_is_refused() -> anyhow::Result<()> {
+        let dispatch = Dispatch {
+            egress: Some(policy(&[("example.com", 443)])),
+            ..process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?
+        };
+        let err = run_blocking(dispatch).await?.expect_err("a policy cannot be applied");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::EgressPolicyUnsupported)
+            ),
+            "expected EgressPolicyUnsupported, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A1 (#483): a VM dispatch checks its policy before the slow flake resolution, so a bad rule is refused at once.
+    #[tokio::test]
+    async fn a_vm_dispatch_with_a_malformed_egress_rule_is_refused_before_flake_resolution() -> anyhow::Result<()> {
+        let dispatch = Dispatch {
+            backend: sandy_executor_proto::SandboxKind::Vm.into(),
+            manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_string(),
+            manifest: b"not a manifest".to_vec(),
+            egress: Some(policy(&[("example.com", 0)])),
+            ..process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?
+        };
+        let rt = tokio::runtime::Handle::current();
+        let containment = Box::new(sandy_test_support::FakeContainment::available());
+        let err = tokio::task::spawn_blocking(move || {
+            handle_dispatch(
+                &dispatch,
+                containment,
+                PathBuf::from("/nonexistent/sandy-agent"),
+                rt,
+                true,
+                sandy_api::backend::RunControl::with_timeout_secs(60),
+                test_mesh_tls_config(),
+            )
+        })
+        .await
+        .context("the blocking dispatch task")?
+        .expect_err("a malformed rule must be refused");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::EgressPolicyInvalid(_))
+            ),
+            "expected EgressPolicyInvalid before the manifest decode, got {err:?}"
         );
         Ok(())
     }
