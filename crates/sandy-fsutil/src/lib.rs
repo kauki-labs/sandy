@@ -19,7 +19,7 @@ pub mod beneath;
 pub mod secret;
 pub mod staging;
 
-pub use beneath::{Beneath, Entries, EntryKind};
+pub use beneath::{Beneath, Entries, EntryKind, FileId};
 pub use secret::{OwnedDir, private_staging_dir};
 pub use staging::{
     STAGING_DIR_NAME, STALE_STAGING_PREFIXES, ensure_sandy_staging_base, ensure_staging_base_in,

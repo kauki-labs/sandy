@@ -115,6 +115,9 @@ pub enum ReceiveError {
     /// A file that already completed arrived again.
     #[error("a file arrived twice")]
     Reopened,
+    /// Two files of the transfer name the same destination file (two spellings on a case-insensitive filesystem).
+    #[error("two files of the transfer name the same destination file")]
+    Alias,
     /// The transfer is past its byte cap.
     #[error("the transfer is past its byte cap")]
     TooManyBytes,
@@ -149,6 +152,7 @@ impl ReceiveError {
         match self {
             Self::Frame(_) | Self::Truncated | Self::Idle | Self::PeerError(_) => "the receiver's link failed",
             Self::Violation(_) | Self::BadIndex | Self::NameMismatch | Self::Reopened => "an output chunk broke a rule",
+            Self::Alias => "two output files name the same destination file",
             Self::Unexpected => "an unexpected message on the output transfer",
             Self::NoProgress => "an empty chunk made no progress",
             Self::TooManyBytes => "the transfer is past its byte cap",
@@ -265,6 +269,9 @@ struct Receive<'a> {
     done: HashSet<EntryKey>,
     current: Option<InFlight>,
     temp_seq: u64,
+    /// The identity of each file this receive completed, so a rename onto one of them is caught (#787).
+    #[allow(dead_code, reason = "the check that reads this arrives in the next commit")]
+    completed_ids: std::sync::Arc<std::sync::Mutex<HashSet<sandy_fsutil::FileId>>>,
 }
 
 /// The file being received: written under a temp name in its final directory, renamed into place on completion,
@@ -381,6 +388,7 @@ impl<'a> Receive<'a> {
             done: HashSet::new(),
             current: None,
             temp_seq: 0,
+            completed_ids: std::sync::Arc::default(),
         }
     }
 
@@ -1057,6 +1065,73 @@ mod tests {
             open_temp(dest.path(), &[], 0).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1000);
         drop(cleanup);
+        Ok(())
+    }
+
+    /// A rename onto a file this transfer already completed is refused, not done: on a case-insensitive destination `a`
+    /// then `A` name one file, and the second would replace the first while the receive counts two. The completed file
+    /// stays as it was and the temp file goes.
+    #[tokio::test]
+    async fn a_target_that_is_a_file_of_this_transfer_is_refused_not_replaced() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        use tokio::io::AsyncWriteExt as _;
+
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::write(dest.path().join("a"), b"first").context("first file")?;
+        let meta = std::fs::metadata(dest.path().join("a")).context("stat")?;
+        let dir = Beneath::open_dir(dest.path()).context("open dest")?;
+        let temp = OsString::from(".sandy-recv-alias-test");
+        let mut file = tokio::fs::File::from_std(dir.create_new_file(&temp).context("temp file")?);
+        file.write_all(b"second").await.context("write")?;
+
+        let mut receive = Receive::new(&[], quick());
+        receive
+            .completed_ids
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the id set is poisoned"))?
+            .insert(sandy_fsutil::FileId {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            });
+        receive.current = Some(InFlight {
+            key: (0, "a".to_owned()),
+            name: OsString::from("a"),
+            file,
+            cleanup: Cleanup::new(dir, temp.clone()),
+        });
+
+        let finished = receive.finish_file().await;
+        assert!(matches!(finished, Err(ReceiveError::Alias)), "got {finished:?}");
+        assert_eq!(
+            std::fs::read(dest.path().join("a")).context("read a")?,
+            b"first",
+            "the completed file must not be replaced"
+        );
+        assert!(!dest.path().join(&temp).exists(), "the temp file is removed");
+        Ok(())
+    }
+
+    /// Names that differ only by case: on a case-insensitive destination they are one file and the second is refused,
+    /// on a case-sensitive one they are two files and both arrive. The probe decides which this filesystem is, so the
+    /// test holds on both.
+    #[tokio::test]
+    async fn names_differing_only_by_case_follow_the_destination_filesystem() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::write(dest.path().join("probe-x"), b"").context("probe")?;
+        let folds_case = dest.path().join("PROBE-X").exists();
+        std::fs::remove_file(dest.path().join("probe-x")).context("remove probe")?;
+
+        let outputs = [out(None, dest.path())];
+        let messages = [chunk(0, "a", b"1"), chunk(0, "A", b"2"), end()];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        if folds_case {
+            assert!(matches!(received, Err(ReceiveError::Alias)), "got {received:?}");
+            assert_eq!(std::fs::read(dest.path().join("a")).context("read a")?, b"1");
+        } else {
+            assert_eq!(received.context("two distinct files")?.files, 2);
+            assert_eq!(tree(dest.path())?, files(&[("a", b"1"), ("A", b"2")]));
+        }
         Ok(())
     }
 

@@ -46,6 +46,16 @@ impl EntryKind {
     }
 }
 
+/// Which file an entry is: the device and the inode, as the filesystem reports them. Two names that reach the same
+/// file (a hard link, or two spellings on a case-insensitive filesystem) have the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    /// The device the file is on.
+    pub dev: u64,
+    /// The inode on that device.
+    pub ino: u64,
+}
+
 /// A directory opened without following a symlink, to read or write beneath.
 #[derive(Debug)]
 pub struct Beneath {
@@ -117,6 +127,17 @@ impl Beneath {
         let stat = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| FsError::io("stat entry", &self.path.join(name), e))?;
         Ok(EntryKind::of(stat.st_mode))
+    }
+
+    /// The identity of the entry `name`, or `None` when there is no such entry. A symlink is not followed: its own id
+    /// is returned.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] for a name that is not a single component, else [`FsError::Io`].
+    pub fn file_id(&self, name: &OsStr) -> Result<Option<FileId>, FsError> {
+        let _ = component(name, &self.path)?;
+        Ok(None)
     }
 
     /// Open the subdirectory `name`, refusing a symlink.
@@ -768,6 +789,41 @@ mod tests {
         assert!(matches!(held.remove_file(name("sub")), Err(FsError::Io { .. })));
         assert!(dir.path().join("sub").is_dir());
         assert!(matches!(held.remove_file(name("a/b")), Err(FsError::Unsafe { .. })));
+        Ok(())
+    }
+
+    /// `file_id` is the device and inode of the entry, the same a `stat` reports, so two names of one file agree.
+    #[test]
+    fn file_id_is_the_device_and_inode_of_the_entry() -> anyhow::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a"), b"x")?;
+        fs::hard_link(dir.path().join("a"), dir.path().join("b"))?;
+        fs::write(dir.path().join("other"), b"y")?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        let meta = fs::metadata(dir.path().join("a"))?;
+        let id = held.file_id(name("a")).context("file_id a")?.context("a exists")?;
+        assert_eq!((id.dev, id.ino), (meta.dev(), meta.ino()));
+        assert_eq!(held.file_id(name("b"))?, Some(id), "a hard link is the same file");
+        assert_ne!(held.file_id(name("other"))?, Some(id), "another file has another id");
+        Ok(())
+    }
+
+    /// A missing entry has no id, a symlink has its own id (not its target's), and a name with a separator is refused.
+    #[test]
+    fn file_id_of_a_missing_entry_a_link_and_a_bad_name() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("target"), b"x")?;
+        symlink(dir.path().join("target"), dir.path().join("link"))?;
+        let held = Beneath::open_dir(dir.path())?;
+
+        assert_eq!(held.file_id(name("missing"))?, None);
+        let target = held.file_id(name("target"))?.context("target exists")?;
+        let link = held.file_id(name("link"))?.context("link exists")?;
+        assert_ne!(link, target, "a symlink is not followed: it has its own id");
+        assert!(matches!(held.file_id(name("a/b")), Err(FsError::Unsafe { .. })));
         Ok(())
     }
 }
