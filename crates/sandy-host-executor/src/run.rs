@@ -526,6 +526,7 @@ pub fn outcome_result_message_with_egress(
 ) -> HostExecutorMessage {
     HostExecutorMessage {
         op: Some(host_executor_message::Op::Result(JobResult {
+            digests: None,
             job_id,
             booted: outcome.booted,
             exit_code: outcome.guest_exit,
@@ -548,6 +549,7 @@ pub fn outcome_result_message_with_egress(
 pub fn failure_result_message(job_id: String, reason: String) -> HostExecutorMessage {
     HostExecutorMessage {
         op: Some(host_executor_message::Op::Result(JobResult {
+            digests: None,
             job_id,
             booted: false,
             exit_code: None,

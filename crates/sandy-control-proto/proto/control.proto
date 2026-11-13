@@ -152,6 +152,10 @@ message SubmitRequest {
   // field, not a bare `repeated`, so absent and empty stay different on the wire.
   // Wire only for now: nothing sets or reads it yet.
   EgressPolicy egress = 10;
+  // `sandy run --digests` for a daemon job (A2c of #483): record a sha256 of each staged input and each collected output
+  // in the result envelope. False (also a client that predates the field) records none. Needs an executor that declared
+  // `digests`; `sandyd` refuses the Submit otherwise, because an executor drops a field it does not know without a word.
+  bool digests = 11;
 }
 
 // A job's egress allow-list: the only destinations the guest may reach.
