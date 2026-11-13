@@ -264,8 +264,8 @@ over a fake broker. Tier-3 rows need a Linux/KVM host and a real boot.
 
 `SANDY_NETWORK=nic` boots a guest with a NIC, for sandboxes that need one. On qemu it is the tap + nftables
 boundary of #29; the default stays NIC-less ([`egress-proxy.md`](../decisions/egress-proxy.md) decision 7). Tier-2
-tests pin the default, the refusals and the ruleset shape. NN2 and NN3 are live-proven on qemu; NN4 and the live
-part of NN5 are not. On vfkit a `nic` guest has no
+tests pin the default, the refusals and the ruleset shape. NN2 and NN3 were live-proven on qemu before #483 and are not yet re-proven through the daemon (#858); NN4 and the live
+part of NN5 never were. On vfkit a `nic` guest has no
 egress boundary (#603), so NN2 to NN6 apply to qemu only.
 
 | ID  | Check                 | Pass condition                                                                                                                                                 | Test                                                                                                                                                                                                                                                                                              | Backend | Status                                                                                                                                                                                                                                                                                           |
