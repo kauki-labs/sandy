@@ -781,6 +781,7 @@ pub async fn handle(
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
                         job_channel.digests_requested = wants_digests;
+                        job_channel.declared_inputs = path_inputs.iter().map(|input| input.name.clone()).collect();
                         // What the Submit declared as outputs, for the envelope's listing of what they hold (A2c).
                         job_channel.declared_outputs = path_outputs
                             .iter()
@@ -2069,6 +2070,7 @@ mod tests {
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
                 declared_outputs: Vec::new(),
+                declared_inputs: Vec::new(),
                 digests_requested: false,
                 egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
@@ -2135,6 +2137,7 @@ mod tests {
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
                 declared_outputs: Vec::new(),
+                declared_inputs: Vec::new(),
                 digests_requested: false,
                 egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
@@ -3502,6 +3505,24 @@ mod tests {
             submit.digests = digests;
         }
         request
+    }
+
+    /// #841: the channel keeps the names of the inputs the Submit declared, for a shared-filesystem placement as for
+    /// a data-link one, so the report's input digests can be checked against them.
+    #[tokio::test]
+    async fn the_channel_keeps_the_declared_input_names() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.digests = true;
+        }
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            ..digests_host(true)
+        };
+        let (_dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
+        assert_eq!(job.declared_inputs, vec!["src".to_owned()]);
+        Ok(())
     }
 
     /// A2c (#483): a Submit that asks for digests goes only to an executor that declared `digests`: an older one
