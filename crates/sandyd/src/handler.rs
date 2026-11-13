@@ -5187,7 +5187,10 @@ mod tests {
         };
         let ip_b: std::net::IpAddr = "100.64.0.8".parse().context("peer ip literal")?;
         let ip_a: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
-        let _rx_b = register_test_host(&host_registry, "b-mac", ip_b, vm_host);
+        let allowlist_b = crate::host_registry::ExecutorAllowlist::new([(ip_b, test_fp())]);
+        let mac_registration = host_registry
+            .register(&allowlist_b, ip_b, test_fp(), "b-mac".to_owned(), vm_host)
+            .context("register the mac")?;
         let _rx_a = register_test_host(&host_registry, "a-linux", ip_a, trusted_host_capabilities());
 
         let hosts = listed_hosts(&store, &registry, &host_registry).await?;
@@ -5205,6 +5208,14 @@ mod tests {
         );
         assert_eq!(hosts[0].sandbox_kinds, ["process"]);
         assert_eq!(hosts[0].arch, "x86_64");
+
+        host_registry.remove("b-mac", mac_registration.registration);
+        let ids: Vec<String> = listed_hosts(&store, &registry, &host_registry)
+            .await?
+            .into_iter()
+            .map(|h| h.host_id)
+            .collect();
+        assert_eq!(ids, ["a-linux"], "a host whose connection ended is gone");
         Ok(())
     }
 }

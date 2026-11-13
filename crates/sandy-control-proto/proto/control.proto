@@ -285,7 +285,7 @@ message HostSummary {
   repeated string sandbox_kinds = 2;
   // The isolation classes it declared it can honour.
   repeated IsolationClass isolation_classes = 3;
-  // `x86_64` or `aarch64`.
+  // `x86_64`, `aarch64`, or `unknown` for an arch this daemon does not know.
   string arch = 4;
 }
 
