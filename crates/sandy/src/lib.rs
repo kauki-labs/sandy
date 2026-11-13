@@ -5,11 +5,9 @@
 //! the injection trait seams. The capabilities, all provable without a hypervisor:
 //!
 //! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) (a `FakeBackend` double
-//!   lives in `sandy-test-support`); the LOCKED result envelope [`ResultEnvelope`] (INV-11); the [`Journal`] of one
-//!   atomic, flock-guarded record per job (INV-3/5/6); exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4); and
-//!   [`reconcile_job`] under the job's flock (INV-3). The [`Containment`] seam confines a non-VM executor's job so its
-//!   whole process tree is reaped (the process backend's isolation story, #135); [`admits_untrusted`] is the
-//!   fail-closed gate.
+//!   lives in `sandy-test-support`); the LOCKED result envelope [`ResultEnvelope`] (INV-11); exit-0-only `O_NOFOLLOW`
+//!   [`collect`]ion (INV-2/4). The [`Containment`] seam confines a non-VM executor's job so its whole process tree is
+//!   reaped (the process backend's isolation story, #135); [`admits_untrusted`] is the fail-closed gate.
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
@@ -37,18 +35,15 @@ mod cred_bracket;
 mod cred_github;
 mod discovery;
 mod egress;
-mod error;
+mod fs_type;
 mod gc;
 mod identity_profile;
-mod journal;
 mod metrics;
 mod nix;
 mod outputs;
 mod profile;
 mod provision;
-mod reconcile;
 mod result;
-mod schema;
 mod seed;
 mod shares;
 mod stage;
@@ -76,10 +71,9 @@ pub use egress::{
     NftablesApplier, enforce, is_valid_tap_name, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables,
     to_nftables_forward, validate_egress_hosts, validate_network_mode, validate_proxy_egress,
 };
-pub use error::CoreError;
+pub use fs_type::{detect_fs_type, is_networked_fs};
 pub use gc::{StagedImage, plan_eviction};
 pub use identity_profile::{IdentityProfile, IdentityProfileError, IdentityProfiles};
-pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
 pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology, topology_until};
 pub use outputs::{
@@ -91,7 +85,6 @@ pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
     provision_remote_build,
 };
-pub use reconcile::reconcile_job;
 pub use result::{
     AuditReceipt, Classification, ContentDigests, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt,
     FileDigest, GuestReported, HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit,
@@ -102,7 +95,6 @@ pub use result::{
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).
 pub(crate) use sandy_fsutil::fsync_dir;
-pub use schema::v1::{JOURNAL_SCHEMA_VERSION, JobRecord, JobState};
 pub use seed::{
     ALLOWED_IMAGE_FORMATS, ArtifactEntry, MinisignVerifier, Requirements, SeedManifest, SeedRefusal, SignatureVerifier,
     VerifiedSeed, acquire, sha256_hex,

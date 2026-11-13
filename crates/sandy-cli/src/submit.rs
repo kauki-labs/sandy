@@ -166,7 +166,6 @@ pub fn template_manifest(template: &str, plain: PlainFlags) -> Result<FlakeManif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{RunArgs, parse_run};
 
     fn plain() -> PlainFlags {
         PlainFlags {
@@ -270,79 +269,33 @@ mod tests {
         Ok(())
     }
 
-    /// Each plain flag gives the manifest the same value the direct planner puts in the plan, one table row per flag.
+    /// Each plain flag reaches the manifest unchanged, and an absent one stays absent (the host picks its default).
     #[test]
-    fn every_plain_flag_matches_the_direct_planner() -> anyhow::Result<()> {
-        type Row = (&'static str, PlainFlags, RunArgs);
-        let base = || RunArgs {
-            template: "t".to_owned(),
-            ..RunArgs::default()
-        };
-        let rows: Vec<Row> = vec![
-            (
-                "env",
-                PlainFlags {
-                    env: vec!["A=1".to_owned(), "B=two".to_owned()],
-                    ..plain()
-                },
-                RunArgs {
-                    env: vec!["A=1".to_owned(), "B=two".to_owned()],
-                    ..base()
-                },
-            ),
-            (
-                "cpu",
-                PlainFlags {
-                    cpu: Some(3),
-                    ..plain()
-                },
-                RunArgs { cpu: Some(3), ..base() },
-            ),
-            (
-                "mem",
-                PlainFlags {
-                    mem: Some(2048),
-                    ..plain()
-                },
-                RunArgs {
-                    mem: Some(2048),
-                    ..base()
-                },
-            ),
-            (
-                "timeout",
-                PlainFlags {
-                    timeout: Some(90),
-                    ..plain()
-                },
-                RunArgs {
-                    timeout: Some(90),
-                    ..base()
-                },
-            ),
-            (
-                "command",
-                PlainFlags {
-                    command: vec!["echo".to_owned(), "hi".to_owned()],
-                    ..plain()
-                },
-                RunArgs {
-                    command: vec!["echo".to_owned(), "hi".to_owned()],
-                    ..base()
-                },
-            ),
-            ("none", plain(), base()),
-        ];
-        for (name, flags, args) in rows {
-            let manifest = template_manifest("t", flags).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
-            let plan = parse_run(args).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
-            assert_eq!(manifest.env, plan.env, "{name}: env");
-            assert_eq!(manifest.cpu, plan.cpu, "{name}: cpu");
-            assert_eq!(manifest.mem, plan.mem, "{name}: mem");
-            assert_eq!(manifest.command, plan.command, "{name}: command");
-            let timeout = manifest.timeout_secs.unwrap_or(crate::plan::DEFAULT_TIMEOUT_SECS);
-            assert_eq!(timeout, plan.timeout_secs, "{name}: timeout");
-        }
+    fn every_plain_flag_reaches_the_manifest() -> anyhow::Result<()> {
+        let set = template_manifest(
+            "t",
+            PlainFlags {
+                env: vec!["A=1".to_owned(), "B=two".to_owned()],
+                cpu: Some(3),
+                mem: Some(2048),
+                timeout: Some(90),
+                command: vec!["echo".to_owned(), "hi".to_owned()],
+                ..plain()
+            },
+        )?;
+        assert_eq!(
+            set.env,
+            vec![("A".to_owned(), "1".to_owned()), ("B".to_owned(), "two".to_owned())]
+        );
+        assert_eq!(set.cpu, Some(3));
+        assert_eq!(set.mem, Some(2048));
+        assert_eq!(set.timeout_secs, Some(90));
+        assert_eq!(set.command, vec!["echo".to_owned(), "hi".to_owned()]);
+
+        let none = template_manifest("t", plain())?;
+        assert!(none.env.is_empty());
+        assert_eq!((none.cpu, none.mem, none.timeout_secs), (None, None, None));
+        assert!(none.command.is_empty());
         Ok(())
     }
 

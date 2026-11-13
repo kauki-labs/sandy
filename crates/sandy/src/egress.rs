@@ -19,19 +19,7 @@ pub use sandy_api::egress::{
     is_valid_tap_name,
 };
 
-use crate::{backend::PlanError, error::CoreError};
-
-/// Map the seam's narrow [`EgressError`] into the core's broad [`CoreError`] so a
-/// run's error channel stays `CoreError` while the egress seam keeps a tight,
-/// contract-crate error (INV-7: an egress failure is an infra fault).
-impl From<EgressError> for CoreError {
-    fn from(err: EgressError) -> Self {
-        match err {
-            EgressError::Apply(msg) => CoreError::Egress(msg),
-            EgressError::Io(io) => CoreError::Io(io),
-        }
-    }
-}
+use crate::backend::PlanError;
 
 /// Translate an [`AllowList`] into a **default-deny** nftables ruleset that
 /// permits exactly the listed `host:port` pairs (D-REQ-3 translation).

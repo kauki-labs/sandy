@@ -14,7 +14,7 @@ use std::io;
 
 use base64::Engine as _;
 use clap::ValueEnum;
-use sandy::{JobRecord, ResultEnvelope};
+use sandy::ResultEnvelope;
 use sandy_control_proto::{AttachResponse, JobStatus, ListResponse, StatusResponse, SubmitResponse};
 use serde::{Deserialize, Serialize};
 
@@ -150,13 +150,6 @@ where
     Ok(())
 }
 
-/// One job record as a human line: the id and its lifecycle state.
-impl Render for JobRecord {
-    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
-        write!(out, "{:<36}  {:?}", self.job_id, self.state)
-    }
-}
-
 /// A node's persisted mesh TLS identity fingerprint (decision 20), as
 /// printed by `sandy mesh key generate`/`fingerprint`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,25 +161,6 @@ pub struct MeshFingerprint {
 impl Render for MeshFingerprint {
     fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
         write!(out, "{}", self.fingerprint)
-    }
-}
-
-/// `ls`'s result: every job record `sandy` knows about, as one named type
-/// (not a bare `Vec`) per #512's spec — `#[serde(transparent)]` keeps the
-/// JSON an array, byte-identical to serializing the `Vec` directly.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct JobRecords(pub Vec<JobRecord>);
-
-impl Render for JobRecords {
-    fn render_plain(&self, out: &mut dyn io::Write) -> io::Result<()> {
-        for (i, record) in self.0.iter().enumerate() {
-            if i > 0 {
-                writeln!(out)?;
-            }
-            record.render_plain(out)?;
-        }
-        Ok(())
     }
 }
 
@@ -532,17 +506,13 @@ impl Render for JobSummaries {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
-
     use anyhow::Context;
     use base64::Engine as _;
-    use sandy::{
-        JOURNAL_SCHEMA_VERSION, JobRecord, JobState, Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status,
-    };
+    use sandy::{Logs, Provenance, RESULT_SCHEMA_VERSION, ResultEnvelope, Status};
     use sandy_control_proto::{AttachResponse, JobStatus, JobSummary, ListResponse, StatusResponse, SubmitResponse};
 
     use super::{
-        AttachedChannel, CancelledJob, EmitError, GcReport, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint,
+        AttachedChannel, CancelledJob, EmitError, GcReport, JobStatusReport, JobSummaries, MeshFingerprint,
         OutputFormat, Render, SubmittedJob, emit_to,
     };
 
@@ -724,18 +694,6 @@ mod tests {
         serde_json::to_string_pretty(value).expect("serializing a sample value never fails")
     }
 
-    fn sample_record(job_id: &str) -> JobRecord {
-        JobRecord {
-            schema_version: JOURNAL_SCHEMA_VERSION,
-            job_id: job_id.to_string(),
-            box_id: Some(format!("box-{job_id}")),
-            state: JobState::Succeeded,
-            writer_pid: 1,
-            started: SystemTime::UNIX_EPOCH,
-            result: None,
-        }
-    }
-
     fn sample_envelope(job_id: &str) -> ResultEnvelope {
         ResultEnvelope {
             result_schema_version: RESULT_SCHEMA_VERSION,
@@ -769,27 +727,7 @@ mod tests {
     // but matching keeps these assertions symmetric with the rest of the
     // module's tests).
     mod pre_refactor_snapshots {
-        use super::{DoctorResult, GcReport, JobRecords, json_of, plain_of, sample_envelope, sample_record};
-
-        #[test]
-        fn record_plain() {
-            insta::assert_snapshot!(plain_of(&sample_record("job-a")));
-        }
-
-        #[test]
-        fn record_json() {
-            insta::assert_snapshot!(json_of(&sample_record("job-a")));
-        }
-
-        #[test]
-        fn records_plain_empty_is_an_empty_string() {
-            insta::assert_snapshot!(plain_of(&JobRecords(vec![])));
-        }
-
-        #[test]
-        fn records_json_empty_is_an_empty_array() {
-            insta::assert_snapshot!(json_of(&JobRecords(vec![])));
-        }
+        use super::{DoctorResult, GcReport, json_of, plain_of, sample_envelope};
 
         #[test]
         fn envelope_plain() {
@@ -838,22 +776,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn json_record_round_trips_to_the_same_record() -> anyhow::Result<()> {
-        let record = sample_record("job-a");
-        let json = json_of(&record);
-        let parsed: JobRecord = serde_json::from_str(&json).context("parse json record")?;
-        assert_eq!(parsed, record, "json output must round-trip to the same record");
-        Ok(())
-    }
-
-    #[test]
-    fn plain_record_names_the_job_and_state() {
-        let plain = plain_of(&sample_record("job-a"));
-        assert!(plain.contains("job-a"), "plain must name the job id: {plain}");
-        assert!(plain.contains("Succeeded"), "plain must name the state: {plain}");
-    }
-
     /// Collected outputs appear in both formats: a `out: <path>` line in plain, and
     /// the `outputs` array in JSON.
     #[test]
@@ -898,19 +820,6 @@ mod tests {
         let json = json_of(&envelope);
         let parsed: ResultEnvelope = serde_json::from_str(&json).context("parse json envelope")?;
         assert_eq!(parsed.warnings, envelope.warnings, "json carries the warnings array");
-        Ok(())
-    }
-
-    #[test]
-    fn json_records_is_an_array_even_when_empty() -> anyhow::Result<()> {
-        let empty = json_of(&JobRecords(vec![]));
-        let parsed: Vec<JobRecord> = serde_json::from_str(&empty).context("parse empty array")?;
-        assert!(parsed.is_empty(), "empty ls must serialize to an empty JSON array");
-
-        let two = JobRecords(vec![sample_record("a"), sample_record("b")]);
-        let json = json_of(&two);
-        let parsed: Vec<JobRecord> = serde_json::from_str(&json).context("parse two")?;
-        assert_eq!(parsed.len(), 2);
         Ok(())
     }
 
@@ -1080,7 +989,7 @@ mod tests {
 
         #[test]
         fn emit_to_plain_skips_an_empty_rendering() {
-            let empty = super::JobRecords(vec![]);
+            let empty = super::JobSummaries::from(&sandy_control_proto::ListResponse { jobs: vec![] });
             let mut buf = Vec::new();
             emit_to(&empty, OutputFormat::Plain, &mut buf).expect("emit_to");
             assert!(
@@ -1091,7 +1000,7 @@ mod tests {
 
         #[test]
         fn emit_to_json_always_prints_even_when_empty() -> anyhow::Result<()> {
-            let empty = super::JobRecords(vec![]);
+            let empty = super::JobSummaries::from(&sandy_control_proto::ListResponse { jobs: vec![] });
             let mut buf = Vec::new();
             emit_to(&empty, OutputFormat::Json, &mut buf).expect("emit_to");
             let text = String::from_utf8(buf).context("emit_to output must be UTF-8")?;
@@ -1326,29 +1235,17 @@ mod tests {
         }
     }
 
-    /// A2 (#483): `daemon status -o json` of a terminal job carries the result envelope under `result`, byte for byte
-    /// the value the direct `sandy status -o json` prints under `result` of its `JobRecord`, so promoting the daemon
-    /// verbs is a rename and not a format change.
+    /// A2 (#483): `daemon status -o json` of a terminal job carries the result envelope under `result`.
     #[test]
-    fn a_terminal_status_prints_the_envelope_the_direct_record_prints() -> anyhow::Result<()> {
+    fn a_terminal_status_prints_the_envelope_under_result() -> anyhow::Result<()> {
         let envelope = sample_envelope("job-a");
         let bytes = serde_json::to_vec(&envelope)?;
         let json = format_status(&terminal_response(Some(bytes)), OutputFormat::Json).context("format status json")?;
         let daemon: serde_json::Value = serde_json::from_str(&json).context("parse status json")?;
-        let record = JobRecord {
-            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
-            job_id: "job-a".to_owned(),
-            box_id: None,
-            state: sandy::JobState::Failed,
-            writer_pid: 1,
-            started: std::time::SystemTime::UNIX_EPOCH,
-            result: Some(envelope),
-        };
-        let direct = serde_json::to_value(&record)?;
         assert_eq!(
             daemon.get("result"),
-            direct.get("result"),
-            "the same envelope under the same key"
+            Some(&serde_json::to_value(&envelope)?),
+            "the envelope under `result`"
         );
         assert_eq!(
             daemon.get("exit_code"),
@@ -1359,8 +1256,7 @@ mod tests {
         Ok(())
     }
 
-    /// A2 (#483): a job that is not terminal prints `result: null`, as the direct record does, and the plain form
-    /// stays the one line it was.
+    /// A2 (#483): a job that is not terminal prints `result: null`, and the plain form stays one line.
     #[test]
     fn a_status_without_an_envelope_prints_a_null_result_and_the_plain_line_is_unchanged() -> anyhow::Result<()> {
         let json = format_status(&terminal_response(None), OutputFormat::Json).context("format status json")?;

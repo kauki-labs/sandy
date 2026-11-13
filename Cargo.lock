@@ -2451,11 +2451,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tiny_http",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "uuid",
- "vsock",
- "zeroize",
 ]
 
 [[package]]
@@ -2693,7 +2689,6 @@ name = "sandy-lib"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "fs2",
  "hex",
  "insta",
  "libc",

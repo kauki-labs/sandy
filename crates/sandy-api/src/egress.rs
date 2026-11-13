@@ -145,9 +145,7 @@ pub enum EgressOutcome {
 
 /// The narrow error an [`EgressApplier`] returns.
 ///
-/// Kept in the contract crate so the egress seam does not drag the core's broad
-/// journal/reconcile `CoreError`; the core maps it back with a
-/// `From<EgressError> for CoreError`.
+/// Kept in the contract crate so the egress seam stays a tight, self-contained error.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
     /// Applying or reverting the ruleset on the host failed (e.g. `nft` exited
