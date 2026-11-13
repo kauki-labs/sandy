@@ -822,7 +822,7 @@ pub fn handle_dispatch(
                 on_link,
             });
             let spec = RunSpec {
-                digests: false,
+                digests: dispatch.digests,
                 egress: None,
                 template: &dispatch.job_id,
                 command: &decoded.command,
@@ -919,7 +919,7 @@ pub fn handle_dispatch(
                 on_link,
             });
             let spec = RunSpec {
-                digests: false,
+                digests: dispatch.digests,
                 egress: allow.as_ref(),
                 template: &template,
                 command: &decoded.command,

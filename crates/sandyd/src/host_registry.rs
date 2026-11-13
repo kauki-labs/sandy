@@ -427,7 +427,6 @@ impl HostRegistry {
         require_egress_proxy: bool,
         require_digests: bool,
     ) -> Option<PlacementCandidate> {
-        let _ = require_digests;
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
                 required_isolation_class,
@@ -469,6 +468,7 @@ impl HostRegistry {
                         .supported_sandbox_kinds
                         .contains(&required_sandbox_kind)
                     && (!require_egress_proxy || host.capabilities.egress_proxy)
+                    && (!require_digests || host.capabilities.digests)
                     && match needs {
                         PathNeeds::Anywhere => true,
                         PathNeeds::SharedFilesystem => host.capabilities.shares_submitter_filesystem,

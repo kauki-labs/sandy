@@ -543,8 +543,34 @@ pub fn outcome_result_message_with_egress(
 /// The wire form of the digests a backend computed for a run (#373, A2c of #483): `None` when it computed none.
 #[must_use]
 pub fn digests_report(digests: Option<&sandy_api::backend::RunDigests>) -> Option<sandy_executor_proto::RunDigests> {
-    let _ = digests;
-    None
+    use sandy_api::result::{ContentDigests, SkipReason};
+    use sandy_executor_proto::SkipReason as WireReason;
+    let side = |side: &ContentDigests| sandy_executor_proto::ContentDigests {
+        files: side
+            .files
+            .iter()
+            .map(|file| sandy_executor_proto::FileDigest {
+                path: file.path.clone(),
+                sha256: file.sha256.clone(),
+            })
+            .collect(),
+        skipped: side
+            .skipped
+            .iter()
+            .map(|entry| sandy_executor_proto::SkippedEntry {
+                path: entry.path.clone(),
+                reason: match entry.reason {
+                    SkipReason::Symlink => WireReason::Symlink,
+                    SkipReason::NonRegular => WireReason::NonRegular,
+                }
+                .into(),
+            })
+            .collect(),
+    };
+    digests.map(|digests| sandy_executor_proto::RunDigests {
+        inputs: Some(side(&digests.inputs)),
+        outputs: Some(side(&digests.outputs)),
+    })
 }
 
 /// Build the `HostExecutorMessage::Result` for a dispatch that never reached a

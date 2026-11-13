@@ -231,6 +231,14 @@ fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
 
 /// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
 /// operator knows what to declare and a submitter knows why the job cannot be placed.
+/// The refusal for a Submit that asks for digests with no host to compute them (A2c, #483). It names the capability:
+/// an executor that does not know `Dispatch.digests` would drop it and record none.
+fn digests_placement_refusal() -> String {
+    "no registered host declares digests together with the required isolation class and sandbox kind; this Submit asks \
+     for digests, and an executor that does not know the field would drop it and record none"
+        .to_owned()
+}
+
 fn egress_placement_refusal() -> String {
     "no registered host declares egress_proxy together with the required isolation class and sandbox kind; this Submit \
      names an egress policy, and an executor that does not know it would drop it and run the job without the boundary"
@@ -639,6 +647,8 @@ pub async fn handle(
                 credential_placement_refusal()
             } else if egress_policy {
                 egress_placement_refusal()
+            } else if wants_digests {
+                digests_placement_refusal()
             } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
                 format!(
                     "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
@@ -658,7 +668,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local || egress_policy,
+                require_local || egress_policy || wants_digests,
                 placeable,
                 &placement_reason,
             ) {
@@ -770,6 +780,7 @@ pub async fn handle(
                         };
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
+                        job_channel.digests_requested = wants_digests;
                         // What the Submit declared as outputs, for the envelope's listing of what they hold (A2c).
                         job_channel.declared_outputs = path_outputs
                             .iter()
@@ -789,7 +800,7 @@ pub async fn handle(
                                 .collect(),
                         });
                         let dispatch = Dispatch {
-                            digests: false,
+                            digests: wants_digests,
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
                             manifest_encoding: encoding.clone(),
@@ -848,6 +859,8 @@ pub async fn handle(
                 credential_placement_refusal()
             } else if egress_policy {
                 egress_placement_refusal()
+            } else if wants_digests {
+                digests_placement_refusal()
             } else if require_local {
                 format!(
                     "no registered host declaring shares_submitter_filesystem{} could be bound for this job's \
@@ -866,7 +879,7 @@ pub async fn handle(
             if let Some(control_error) = placement_required_error(
                 required_isolation_class,
                 required_sandbox_kind,
-                require_local || egress_policy,
+                require_local || egress_policy || wants_digests,
                 dispatch_plan.is_some(),
                 &dispatch_plan_reason,
             ) {

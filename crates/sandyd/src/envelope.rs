@@ -158,7 +158,7 @@ pub(crate) fn from_run(
         host_id,
         allow,
         declared,
-        digests_requested: _,
+        digests_requested,
     } = *placed;
     let outcome = Outcome {
         booted: facts.booted,
@@ -186,7 +186,25 @@ pub(crate) fn from_run(
         .iter()
         .map(|(name, dest)| (name.as_deref(), dest.as_path()))
         .collect();
-    let mut listed = sandy::collect_output_size_refs(&destinations, None);
+    // The digests the executor reported, for a job that asked for them (A2c of #483): validated and bounded here, so a
+    // hostile or buggy executor cannot put a bad hash, a path out of the tree or an unbounded list into the envelope.
+    let mut digest_warnings = Vec::new();
+    let mut digests = None;
+    if digests_requested {
+        match facts.digests.as_ref() {
+            None => digest_warnings.push("digests were requested but the executor reported none".to_owned()),
+            Some(report) => match ingest_digests(report) {
+                Ok((accepted, warning)) => {
+                    digests = Some(accepted);
+                    digest_warnings.extend(warning);
+                }
+                Err(why) => digest_warnings.push(format!(
+                    "digests: the executor's report is malformed ({why}); it was dropped"
+                )),
+            },
+        }
+    }
+    let mut listed = sandy::collect_output_size_refs(&destinations, digests.as_ref().map(|(_, outputs)| outputs));
     let total = listed.len();
     // Bounded by count and by path bytes: a job chooses its own output names (up to 4096 bytes a path) and each path
     // is listed twice, so a count cap alone would still overflow the frame.
@@ -231,7 +249,119 @@ pub(crate) fn from_run(
         )),
     );
     envelope.warnings.extend(cut);
+    envelope.warnings.extend(digest_warnings);
+    if let (Some((inputs, outputs)), Some(receipt)) = (digests, envelope.receipt.as_mut()) {
+        receipt.host_observed.input_digests = Some(inputs);
+        receipt.guest_reported.skipped_outputs = outputs.skipped;
+    }
     envelope
+}
+
+/// The most digest entries the daemon keeps per list (files and skipped entries, inputs and outputs each).
+const MAX_DIGEST_ENTRIES: usize = 256;
+
+/// The most bytes of digest paths the daemon keeps per list. Together with the entry cap it keeps the stored envelope,
+/// the output listing and the console inside one `Status` frame.
+const MAX_DIGEST_PATH_BYTES: usize = 8 * 1024;
+
+/// Whether `path` is a path the data link accepts: a plain relative path of at most 4096 bytes, by the receiver's own
+/// rule (`DataLinkMessage::validate`).
+fn valid_digest_path(path: &str) -> bool {
+    sandy_executor_proto::DataLinkMessage {
+        op: Some(sandy_executor_proto::data_link_message::Op::InputChunk(
+            sandy_executor_proto::InputChunk {
+                name: path.to_owned(),
+                offset: 0,
+                bytes: Vec::new(),
+            },
+        )),
+    }
+    .validate()
+    .is_ok()
+}
+
+/// One side of the executor's digests, validated: every path a plain relative path, every hash 64 lowercase hex digits,
+/// every skip reason a known one. The first failure rejects the side, so a report is never partly believed.
+fn validate_side(side: Option<&sandy_executor_proto::ContentDigests>) -> Result<sandy::ContentDigests, String> {
+    let Some(side) = side else {
+        return Ok(sandy::ContentDigests::default());
+    };
+    let mut files = Vec::with_capacity(side.files.len());
+    for file in &side.files {
+        if !valid_digest_path(&file.path) {
+            return Err(format!("a file path {:?} is not a plain relative path", file.path));
+        }
+        if file.sha256.len() != 64 || !file.sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(format!("the hash of {:?} is not 64 lowercase hex digits", file.path));
+        }
+        files.push(sandy::FileDigest {
+            path: file.path.clone(),
+            sha256: file.sha256.clone(),
+        });
+    }
+    let mut skipped = Vec::with_capacity(side.skipped.len());
+    for entry in &side.skipped {
+        if !valid_digest_path(&entry.path) {
+            return Err(format!("a skipped path {:?} is not a plain relative path", entry.path));
+        }
+        let reason = match sandy_executor_proto::SkipReason::try_from(entry.reason) {
+            Ok(sandy_executor_proto::SkipReason::Symlink) => sandy::SkipReason::Symlink,
+            Ok(sandy_executor_proto::SkipReason::NonRegular) => sandy::SkipReason::NonRegular,
+            Ok(sandy_executor_proto::SkipReason::Unspecified) | Err(_) => {
+                return Err(format!("the skip reason of {:?} is unspecified or unknown", entry.path));
+            }
+        };
+        skipped.push(sandy::SkippedEntry {
+            path: entry.path.clone(),
+            reason,
+        });
+    }
+    Ok(sandy::ContentDigests { files, skipped })
+}
+
+/// Keep the first entries of `list` while they stay inside the entry and path-byte caps; the total before the cut.
+fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
+    let total = list.len();
+    let mut bytes = 0usize;
+    let kept = list
+        .iter()
+        .take(MAX_DIGEST_ENTRIES)
+        .take_while(|entry| {
+            bytes += path(entry).len();
+            bytes <= MAX_DIGEST_PATH_BYTES
+        })
+        .count();
+    list.truncate(kept);
+    total
+}
+
+/// The executor's digests as the daemon records them: `(inputs, outputs)`, sorted by path and bounded, with a warning
+/// when something was cut. `Err` names why the report is malformed.
+fn ingest_digests(
+    report: &sandy_executor_proto::RunDigests,
+) -> Result<((sandy::ContentDigests, sandy::ContentDigests), Option<String>), String> {
+    let mut inputs = validate_side(report.inputs.as_ref()).map_err(|why| format!("inputs: {why}"))?;
+    let mut outputs = validate_side(report.outputs.as_ref()).map_err(|why| format!("outputs: {why}"))?;
+    inputs.sort();
+    outputs.sort();
+    let mut cut = Vec::new();
+    for (name, list) in [("input files", &mut inputs.files), ("output files", &mut outputs.files)] {
+        let total = bound_list(list, |entry| &entry.path);
+        if total > list.len() {
+            cut.push(format!("{total} {name}, only the first {} kept", list.len()));
+        }
+    }
+    for (name, list) in [
+        ("input entries", &mut inputs.skipped),
+        ("output entries", &mut outputs.skipped),
+    ] {
+        let total = bound_list(list, |entry| &entry.path);
+        if total > list.len() {
+            cut.push(format!("{total} skipped {name}, only the first {} kept", list.len()));
+        }
+    }
+    let warning = (!cut.is_empty()).then(|| format!("digests: the executor reported {}", cut.join(", ")));
+    Ok(((inputs, outputs), warning))
 }
 
 /// Redact, then cut, the egress reason in `envelope`'s receipt: it is the executor's own error string, as the message
