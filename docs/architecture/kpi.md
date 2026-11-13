@@ -399,6 +399,33 @@ through a VM environment, `git ls-remote` failing after delete) is not written.
 | KENVC6 | Seam              | A VM backend forwards `secret_dir` with the `secrets` grant; the process backend refuses a spec that carries one before it creates anything.                                          | `crates/sandy-environment/tests/vm.rs::a_secret_dir_is_forwarded_to_the_run_with_the_secrets_grant`, `tests/process.rs::a_spec_with_a_secret_dir_is_refused_and_nothing_runs`                                                                           | tier-2 green |
 | KENVC7 | Surfaced          | `GetEnvironment` returns `credential_degraded` and `credential_revoke_error`, healthy by default.                                                                                     | `environment.rs::tests::a_degraded_credential_and_a_revoke_failure_are_reported_and_default_to_healthy`                                                                                                                                                 | tier-2 green |
 
+## Remote data link (#482)
+
+A job's inputs and outputs crossing the mesh over the per-job data link ([`sandyd.md`](../decisions/sandyd.md)
+decision 22). Tier-2 tests cover each slice (the sender, the receiver, the executor's pull and send, the Submit
+rules, the placement predicate). The live row below was run by hand once, not by a script or in CI.
+
+| #      | Capability          | Required behaviour                                                                                                                                                                                                                                                                        |
+| ------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KXFER1 | Two-host round trip | A job with an input directory and an output destination, submitted to a `sandyd` on one host and placed on a `sandy-host-executor` on another that declared `transfer` (`SANDY_HOST_TRANSFER=1`), ends `Succeeded` with exit 0, and the collected outputs equal the inputs byte for byte. |
+
+**Run of 2026-11-13** (main at `02920cfb`, after #826, #827, #828). `sandyd` and the `sandy` CLI on the Mac
+(aarch64-darwin, mesh bound to its tailnet address only); `sandy-host-executor` and `sandy-agent` on ws01
+(x86_64-linux, `SANDY_AGENT_PATH` a Nix store path, mutual-TLS keys generated on each host and pinned in the
+allowlist and the executor's config). Input: one directory of four files (a 700 000-byte random file, a one-byte
+file nested two levels down, a 19-byte text file, a zero-byte file), `--input DIR:data --out DEST`. The job (a
+trusted `argv/v1` `sh -c`) copied `/run/sandy/inputs/data` into `/run/sandy/outputs/echo` and wrote two small files
+of its own. Result: the executor logged `sent the staged outputs files=6 bytes=700400`, `sandyd` logged `the job's
+outputs are in place files=6 bytes=700400` and recorded `Succeeded`, exit 0, and `shasum -a 256` of the four input
+files equalled that of `DEST/echo` (`cmp` on the large file agreed). The mesh connected on the first attempt.
+
+What this run did not cover: the Mac as the executor (the executor is Linux-only); a VM-backed job; a transfer that
+fails or exceeds a cap (tier-2 only); the stored result envelope through the CLI (`daemon status -o json` does not
+print it yet). To repeat it, the executor host needs `bwrap` and `tmux` on the executor's `PATH`; a first attempt
+failed only because `tmux` was missing there (`sandy-agent: starting the tmux job session: No such file or
+directory`) and, before that, because `/tmp/sandy` on that host belonged to another user, so the executor ran
+with `TMPDIR` set to a directory of its own.
+
 ## Not yet a KPI
 
 Deferred capability with no live floor yet, so a reader does not mistake its
