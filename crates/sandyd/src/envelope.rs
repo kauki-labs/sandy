@@ -181,7 +181,10 @@ pub(crate) fn from_run(
         .iter()
         .map(|(name, dest)| (name.as_deref(), dest.as_path()))
         .collect();
-    let mut listed = sandy::collect_output_size_refs(&destinations, None);
+    // The walk stops at the cap, so a destination that already holds a very large tree cannot delay the terminal record
+    // (#838). It keeps the first entries in logical-path order, and says whether there were more.
+    let capped = sandy::collect_output_size_refs_capped(&destinations, None, MAX_LISTED_OUTPUTS);
+    let (mut listed, more) = (capped.entries, capped.more);
     let total = listed.len();
     // Bounded by count and by path bytes: a job chooses its own output names (up to 4096 bytes a path) and each path
     // is listed twice, so a count cap alone would still overflow the frame.
@@ -195,11 +198,16 @@ pub(crate) fn from_run(
         })
         .count();
     let mut cut = None;
-    if kept < total {
+    if kept < total || more {
         listed.truncate(kept);
-        cut = Some(format!(
-            "outputs: {total} files were left at the declared destinations, only the first {kept} are listed"
-        ));
+        cut = Some(if more {
+            format!(
+                "outputs: more than {MAX_LISTED_OUTPUTS} files were left at the declared destinations, only the first \
+                 {kept} are listed"
+            )
+        } else {
+            format!("outputs: {total} files were left at the declared destinations, only the first {kept} are listed")
+        });
     }
     let refs = listed
         .iter()

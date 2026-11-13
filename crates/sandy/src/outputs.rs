@@ -81,10 +81,72 @@ pub fn collect_output_size_refs_capped(
     digests: Option<&ContentDigests>,
     cap: usize,
 ) -> CappedOutputs {
-    let _ = cap;
-    CappedOutputs {
-        entries: collect_output_size_refs(outputs, digests),
-        more: false,
+    let by_path: HashMap<&str, &str> = digests
+        .into_iter()
+        .flat_map(|d| d.files.iter())
+        .map(|f| (f.path.as_str(), f.sha256.as_str()))
+        .collect();
+    // Each destination yields at most `cap + 1` files in logical-path order; the first `cap` of their union are the
+    // first `cap` of the whole, and a `cap + 1`th file anywhere means there were more.
+    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (name, dest) in outputs {
+        walk_capped(dest, name.unwrap_or(""), cap.saturating_add(1), &mut found);
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let more = found.len() > cap;
+    found.truncate(cap);
+    let entries = found
+        .into_iter()
+        .filter_map(|(path, file)| {
+            let size_bytes = std::fs::metadata(file).ok()?.len();
+            let sha256 = by_path.get(path.as_str()).map(|s| (*s).to_owned());
+            Some(OutputSizeRef {
+                path,
+                size_bytes,
+                sha256,
+            })
+        })
+        .collect();
+    CappedOutputs { entries, more }
+}
+
+/// Collect up to `limit` regular files under `dir` as `(logical path, host path)`, visiting children in logical-path
+/// order: each name is compared with a trailing `/` for a directory, so a file `a.txt` comes before the children of a
+/// directory `a` exactly as the strings `a.txt` and `a/x` compare. Symlinks and special files are skipped, as in
+/// [`walk_outputs`]. Returns once `limit` files are held.
+fn walk_capped(dir: &Path, prefix: &str, limit: usize, found: &mut Vec<(String, std::path::PathBuf)>) {
+    let Ok(dir_entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<(String, std::path::PathBuf, bool)> = dir_entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            let is_dir = file_type.is_dir();
+            (is_dir || file_type.is_file()).then(|| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let key = if is_dir { format!("{name}/") } else { name };
+                (key, entry.path(), is_dir)
+            })
+        })
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    let start = found.len();
+    for (key, path, is_dir) in children {
+        if found.len().saturating_sub(start) >= limit {
+            return;
+        }
+        let name = key.trim_end_matches('/');
+        let rel = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if is_dir {
+            walk_capped(&path, &rel, limit - found.len().saturating_sub(start), found);
+        } else {
+            found.push((rel, path));
+        }
     }
 }
 
