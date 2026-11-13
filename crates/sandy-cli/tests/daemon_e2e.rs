@@ -736,3 +736,146 @@ fn a_cred_capability_without_a_credential_is_a_usage_error() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// Submit a job no host can take (it stays `Pending`) through the real `sandy`, returning its id.
+fn submit_a_pending_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Result<String> {
+    let manifest = tmp.join("manifest.bin");
+    std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
+    let submit = sandy(
+        daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "-o",
+            "json",
+        ],
+    )?;
+    anyhow::ensure!(submit.status.code() == Some(0), "submit stderr: {}", stderr_of(&submit));
+    let json: serde_json::Value = serde_json::from_slice(&submit.stdout).context("parse submit json")?;
+    Ok(json["job_id"].as_str().context("a job id")?.to_owned())
+}
+
+/// `daemon wait` on a job that has ended prints it with its result envelope and exits by band: a cancelled job is a
+/// task failure, `1`, as the direct run exits (#483, promote-and-remove prep).
+#[test]
+fn daemon_wait_on_a_cancelled_job_prints_its_envelope_and_exits_1() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let job_id = submit_a_pending_job(&daemon, tmp.path())?;
+    let cancel = sandy(&daemon, &["daemon", "cancel", &job_id])?;
+    assert_eq!(cancel.status.code(), Some(0), "cancel stderr: {}", stderr_of(&cancel));
+
+    let wait = sandy(&daemon, &["daemon", "wait", &job_id, "-o", "json"])?;
+    assert_eq!(wait.status.code(), Some(1), "wait stderr: {}", stderr_of(&wait));
+    let json: serde_json::Value = serde_json::from_slice(&wait.stdout).context("parse wait json")?;
+    assert_eq!(json["status"].as_str(), Some("JOB_STATUS_CANCELLED"));
+    assert!(
+        json["result"]["status"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("cancelled")),
+        "the envelope rides in `result`: {json}"
+    );
+    Ok(())
+}
+
+/// A job that never ends is reported after the bound, naming the state it was in, with the infra-fault band `3`.
+#[test]
+fn daemon_wait_on_a_job_that_never_ends_times_out_naming_its_state() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let job_id = submit_a_pending_job(&daemon, tmp.path())?;
+
+    let wait = sandy(&daemon, &["daemon", "wait", &job_id, "--wait-timeout", "1"])?;
+    assert_eq!(wait.status.code(), Some(3), "wait stderr: {}", stderr_of(&wait));
+    let stderr = stderr_of(&wait);
+    assert!(stderr.contains("JOB_STATUS_PENDING"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// An unknown job id is refused as the request's own fault, band `2`, not waited on.
+#[test]
+fn daemon_wait_on_an_unknown_job_is_refused() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let wait = sandy(&daemon, &["daemon", "wait", "no-such-job", "--wait-timeout", "1"])?;
+    assert_eq!(wait.status.code(), Some(2), "wait stderr: {}", stderr_of(&wait));
+    assert!(stderr_of(&wait).contains("no such job"), "stderr: {}", stderr_of(&wait));
+    Ok(())
+}
+
+/// `daemon submit --wait` blocks until the job ends, and Ctrl-C (SIGINT) cancels the job on the daemon, as the direct
+/// run does, instead of leaving it running: the job ends `Cancelled` and the client exits `1`.
+#[test]
+fn ctrl_c_during_a_submit_wait_cancels_the_job() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
+    let mut client = Command::new(env!("CARGO_BIN_EXE_sandy"))
+        .env("SANDY_SOCK", &daemon.sock)
+        .env("SANDY_HOME", tmp.path())
+        .args([
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--wait",
+            "-o",
+            "json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning sandy daemon submit --wait")?;
+
+    // The job appears on the daemon while the client waits on it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let job_id = loop {
+        let list = sandy(&daemon, &["daemon", "list", "-o", "json"])?;
+        let json: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap_or(serde_json::Value::Null);
+        if let Some(id) = json
+            .as_array()
+            .and_then(|jobs| jobs.first())
+            .and_then(|j| j["job_id"].as_str())
+        {
+            break id.to_owned();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the submitted job never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Give the client a moment to start polling, then interrupt it.
+    std::thread::sleep(Duration::from_millis(300));
+    let pid = client.id().to_string();
+    let killed = Command::new("kill")
+        .args(["-INT", &pid])
+        .status()
+        .context("sending SIGINT")?;
+    anyhow::ensure!(killed.success(), "kill -INT failed");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let code = loop {
+        if let Some(status) = client.try_wait().context("polling the client")? {
+            break status.code();
+        }
+        anyhow::ensure!(Instant::now() < deadline, "the client never exited after SIGINT");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, Some(1), "a cancelled job is a task failure");
+
+    let status = sandy(&daemon, &["daemon", "status", &job_id, "-o", "json"])?;
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).context("parse status json")?;
+    assert_eq!(
+        json["status"].as_str(),
+        Some("JOB_STATUS_CANCELLED"),
+        "the job was cancelled: {json}"
+    );
+    Ok(())
+}
