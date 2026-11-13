@@ -356,6 +356,20 @@ impl HostRegistry {
         }
     }
 
+    /// Every connected host's id and declared capabilities, ordered by id (#483: `ListHosts`).
+    #[must_use]
+    pub fn connected(&self) -> Vec<(String, Capabilities)> {
+        let mut hosts: Vec<_> = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(id, host)| (id.clone(), host.capabilities.clone()))
+            .collect();
+        hosts.sort_by(|a, b| a.0.cmp(&b.0));
+        hosts
+    }
+
     /// `host_id`'s declared capabilities, if it is currently connected.
     #[must_use]
     pub fn capabilities_of(&self, host_id: &str) -> Option<Capabilities> {
