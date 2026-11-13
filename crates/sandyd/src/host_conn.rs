@@ -2342,6 +2342,38 @@ mod tests {
         Ok(())
     }
 
+    /// A2c (#483, sandy-5e F1 on #837): a job controls the names of its outputs, up to 4096 bytes a path, and each path
+    /// is listed twice (`outputs` and the receipt). The listing is bounded by bytes as well as by count, so 256 long
+    /// paths still leave a `Status` reply that fits one frame.
+    #[tokio::test]
+    async fn long_output_paths_leave_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        // About 3.9 KiB of directories, then 256 files with 200-byte names: every path is about 4 KiB.
+        let mut dir = dest.path().to_owned();
+        for level in 0..15 {
+            dir.push(format!("{level:02}{}", "d".repeat(248)));
+        }
+        std::fs::create_dir_all(&dir)?;
+        for i in 0..256 {
+            std::fs::write(dir.join(format!("{i:03}{}", "f".repeat(197))), b"x")?;
+        }
+        let envelope = envelope_for_job_with_outputs(vec![(None, dest.path().to_owned())]).await?;
+        let json = serde_json::to_string(&envelope)?;
+        let reply = sandy_control_proto::StatusResponse {
+            job_id: "job-1".to_owned(),
+            status: i32::from(JobStatus::Succeeded),
+            exit_code: Some(0),
+            console_tail: "\u{1}".repeat(crate::envelope::MAX_CONSOLE_BYTES),
+            result_envelope: Some(json.into_bytes()),
+        };
+        assert!(
+            sandy_executor_proto::Message::encoded_len(&reply) < sandy_control_proto::MAX_FRAME_LEN as usize,
+            "the Status reply is {} bytes",
+            sandy_executor_proto::Message::encoded_len(&reply)
+        );
+        Ok(())
+    }
+
     /// A2c (#483): the list the daemon keeps is bounded (a tree of many files would push the `Status` reply past one
     /// frame): the first 256 paths, with a warning that the rest were left out.
     #[tokio::test]
