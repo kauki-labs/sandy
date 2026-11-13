@@ -412,7 +412,7 @@ impl HostRegistry {
         required_sandbox_kind: i32,
         needs: PathNeeds,
     ) -> Option<PlacementCandidate> {
-        self.pick_host_egress(required_isolation_class, required_sandbox_kind, needs, false)
+        self.pick_host_egress(required_isolation_class, required_sandbox_kind, needs, false, false)
     }
 
     /// [`Self::pick_host`] that also requires, when `require_egress_proxy` is set, a host that declared
@@ -425,7 +425,9 @@ impl HostRegistry {
         required_sandbox_kind: i32,
         needs: PathNeeds,
         require_egress_proxy: bool,
+        require_digests: bool,
     ) -> Option<PlacementCandidate> {
+        let _ = require_digests;
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
                 required_isolation_class,

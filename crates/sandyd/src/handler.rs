@@ -600,6 +600,9 @@ pub async fn handle(
             // A1 (#483): a policy is a placement requirement of its own. The local run applies no boundary, so a
             // policy with no capable remote host is refused rather than run unfiltered.
             let egress_policy = submit.egress.is_some();
+            // A2c (#483): a digest job needs an executor that declared `digests`: an older one drops the field
+            // silently.
+            let wants_digests = submit.digests;
             let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
             // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
@@ -624,6 +627,7 @@ pub async fn handle(
                         required_sandbox_kind.into(),
                         path_needs,
                         egress_policy,
+                        wants_digests,
                     )
                     .is_some()
             };
@@ -732,6 +736,7 @@ pub async fn handle(
                     required_sandbox_kind.into(),
                     path_needs,
                     egress_policy,
+                    wants_digests,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -2051,6 +2056,7 @@ mod tests {
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
                 declared_outputs: Vec::new(),
+                digests_requested: false,
                 egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
@@ -2116,6 +2122,7 @@ mod tests {
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
                 declared_outputs: Vec::new(),
+                digests_requested: false,
                 egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
@@ -3466,6 +3473,63 @@ mod tests {
                 (None, std::path::PathBuf::from("/out/rest")),
             ]
         );
+        Ok(())
+    }
+
+    fn digests_host(digests: bool) -> sandy_executor_proto::Capabilities {
+        sandy_executor_proto::Capabilities {
+            digests,
+            ..trusted_host_capabilities()
+        }
+    }
+
+    fn submit_req_with_digests(id: u64, digests: bool) -> ControlRequest {
+        let mut request = submit_req(id);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.digests = digests;
+        }
+        request
+    }
+
+    /// A2c (#483): a Submit that asks for digests goes only to an executor that declared `digests`: an older one
+    /// drops `Dispatch.digests` silently and would record none. With none, the Submit is refused naming the
+    /// capability, nothing dispatched.
+    #[tokio::test]
+    async fn a_digest_job_with_no_capable_host_is_refused_naming_the_capability() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut dispatch_rx = register_test_host(&host_registry, "old-host", peer_ip, digests_host(false));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_with_digests(1, true),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(e.message.contains("digests"), "must name the capability: {}", e.message);
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        assert!(dispatch_rx.try_recv().is_err(), "nothing was dispatched");
+        Ok(())
+    }
+
+    /// A2c (#483): the request reaches the executor and the job's channel exactly as made: `--digests` sets
+    /// `Dispatch.digests` and the channel's flag, and no flag leaves both off even on a capable host.
+    #[tokio::test]
+    async fn the_digests_request_reaches_the_dispatch_and_the_channel() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        for requested in [false, true] {
+            let (dispatch, job, _registry) =
+                place_and_read(submit_req_with_digests(1, requested), digests_host(true), peer_ip).await?;
+            assert_eq!(dispatch.digests, requested, "requested={requested}: Dispatch.digests");
+            assert_eq!(job.digests_requested, requested, "requested={requested}: the channel");
+        }
         Ok(())
     }
 

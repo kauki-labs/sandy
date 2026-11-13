@@ -601,6 +601,24 @@ mod tests {
         }
     }
 
+    /// A2c (#483): this executor's backends hash a run's inputs and outputs when asked, so every registration declares
+    /// `digests`, whatever else the host has.
+    #[test]
+    fn to_wire_capabilities_always_declares_digests() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = || Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        for vm in [false, true] {
+            let wire = to_wire_capabilities(capabilities(), &status, vm, false, false, false);
+            assert!(wire.digests, "vm={vm}: digests not declared");
+        }
+    }
+
     /// A1 (#483): `egress_proxy` needs both the operator's declaration and a VM path. A process-only host never
     /// declares it, whatever the flag says, and a VM host without the flag does not either.
     #[test]

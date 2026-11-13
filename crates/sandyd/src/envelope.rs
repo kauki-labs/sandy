@@ -46,6 +46,8 @@ pub(crate) struct RunFacts {
     /// The executor's egress report, read as the direct path's `Result<EgressOutcome, String>`: `None` when it sent
     /// none (no policy, an older executor, a run that ended before it could say) or an unspecified one.
     pub egress: Option<Result<sandy::EgressOutcome, String>>,
+    /// The executor's digests of the run, as sent (A2c of #483). Validated and bounded when the envelope is built.
+    pub digests: Option<sandy_executor_proto::RunDigests>,
     /// Whether the guest booted.
     pub booted: bool,
     /// Whether the run hit its timeout.
@@ -137,6 +139,8 @@ pub(crate) struct Placement<'a> {
     pub allow: Option<&'a AllowList>,
     /// The outputs its Submit declared, as `(name, destination)`.
     pub declared: &'a [(Option<String>, std::path::PathBuf)],
+    /// Whether the Submit asked for digests.
+    pub digests_requested: bool,
 }
 
 /// The envelope for a run that ended with `facts` and `exit_code`, once its outputs are settled to `outputs`.
@@ -154,6 +158,7 @@ pub(crate) fn from_run(
         host_id,
         allow,
         declared,
+        digests_requested: _,
     } = *placed;
     let outcome = Outcome {
         booted: facts.booted,

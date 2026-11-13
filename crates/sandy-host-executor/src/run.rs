@@ -524,9 +524,10 @@ pub fn outcome_result_message_with_egress(
     outputs_follow: bool,
     egress: Option<sandy_executor_proto::EgressReport>,
 ) -> HostExecutorMessage {
+    let digests = digests_report(outcome.digests.as_ref());
     HostExecutorMessage {
         op: Some(host_executor_message::Op::Result(JobResult {
-            digests: None,
+            digests,
             job_id,
             booted: outcome.booted,
             exit_code: outcome.guest_exit,
@@ -537,6 +538,13 @@ pub fn outcome_result_message_with_egress(
             egress,
         })),
     }
+}
+
+/// The wire form of the digests a backend computed for a run (#373, A2c of #483): `None` when it computed none.
+#[must_use]
+pub fn digests_report(digests: Option<&sandy_api::backend::RunDigests>) -> Option<sandy_executor_proto::RunDigests> {
+    let _ = digests;
+    None
 }
 
 /// Build the `HostExecutorMessage::Result` for a dispatch that never reached a
@@ -1063,6 +1071,76 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    /// A2c (#483): the run's digests travel in `JobResult.digests` in their wire shape: files, skipped entries with
+    /// their reason, both sides; a run with none sends none.
+    #[test]
+    fn a_result_message_carries_the_run_digests() {
+        use sandy_api::{
+            backend::RunDigests,
+            result::{ContentDigests, FileDigest, SkipReason, SkippedEntry},
+        };
+        let outcome = |digests: Option<RunDigests>| Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests,
+        };
+        let digests = RunDigests {
+            inputs: ContentDigests {
+                files: vec![FileDigest {
+                    path: "data/a.txt".to_owned(),
+                    sha256: "a".repeat(64),
+                }],
+                skipped: Vec::new(),
+            },
+            outputs: ContentDigests {
+                files: vec![FileDigest {
+                    path: "out/b.txt".to_owned(),
+                    sha256: "b".repeat(64),
+                }],
+                skipped: vec![
+                    SkippedEntry {
+                        path: "out/link".to_owned(),
+                        reason: SkipReason::Symlink,
+                    },
+                    SkippedEntry {
+                        path: "out/fifo".to_owned(),
+                        reason: SkipReason::NonRegular,
+                    },
+                ],
+            },
+        };
+        let sent = outcome_result_message_with_egress("job-1".to_owned(), outcome(Some(digests)), false, None);
+        let Some(host_executor_message::Op::Result(result)) = sent.op else {
+            panic!("expected a JobResult");
+        };
+        let wire = result.digests.expect("the run's digests are reported");
+        let inputs = wire.inputs.expect("inputs");
+        let outputs = wire.outputs.expect("outputs");
+        assert_eq!(inputs.files.len(), 1);
+        assert_eq!(inputs.files[0].path, "data/a.txt");
+        assert_eq!(inputs.files[0].sha256, "a".repeat(64));
+        assert_eq!(outputs.files[0].path, "out/b.txt");
+        let reasons: Vec<(String, i32)> = outputs.skipped.iter().map(|e| (e.path.clone(), e.reason)).collect();
+        assert_eq!(
+            reasons,
+            [
+                ("out/link".to_owned(), sandy_executor_proto::SkipReason::Symlink.into()),
+                (
+                    "out/fifo".to_owned(),
+                    sandy_executor_proto::SkipReason::NonRegular.into()
+                ),
+            ]
+        );
+        let none = outcome_result_message_with_egress("job-1".to_owned(), outcome(None), false, None);
+        let Some(host_executor_message::Op::Result(result)) = none.op else {
+            panic!("expected a JobResult");
+        };
+        assert_eq!(result.digests, None, "no digests computed, none sent");
     }
 
     /// A2b (#483): the result message carries the executor's egress report, and no report when the run had no policy.
