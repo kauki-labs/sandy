@@ -1331,7 +1331,7 @@ mod tests {
         let started = Instant::now();
         let report = recover(restarted(&d).with_call_timeout(Duration::from_millis(200))).await?;
 
-        assert_eq!(report.failed, [submitted.job_id.clone()], "{report:?}");
+        assert_eq!(report.failed, std::slice::from_ref(&submitted.job_id), "{report:?}");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "took {:?}",
