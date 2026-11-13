@@ -1664,7 +1664,7 @@ mod tests {
         // A local job: no link, no staging.
         let local = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control)).await?
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control, None)).await?
         };
         assert!(!local.outputs_follow, "a local job has nothing following");
 
@@ -1673,7 +1673,8 @@ mod tests {
         let staged = StagedInputs::for_test(near).context("staged inputs")?;
         let linked = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control)).await?
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control, None))
+                .await?
         };
         assert!(!linked.outputs_follow, "no outputs declared: nothing follows");
         let mut rest = Vec::new();
