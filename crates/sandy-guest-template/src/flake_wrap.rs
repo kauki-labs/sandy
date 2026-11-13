@@ -122,7 +122,8 @@ pub enum ResolvedTemplate {
 pub const BUNDLED_GUEST_FLAKE: &str = "bundled:guest";
 
 /// `flake_ref` with [`BUNDLED_GUEST_FLAKE`] replaced by this host's bundled guest flake, found under `root` (the tree
-/// that holds `nix/guest-wrapper`, see [`guest_wrapper_root`]); any other reference is returned unchanged.
+/// that holds `nix/guest-wrapper`, see [`guest_wrapper_root`]), as `{root}?dir=nix/guest`: the guest flake imports
+/// `../lib/guest.nix`, so the whole tree must be the nix source. Any other reference is returned unchanged.
 ///
 /// # Errors
 ///
@@ -140,7 +141,7 @@ pub fn resolve_bundled_flake(flake_ref: &str, root: impl FnOnce() -> Result<Path
             guest.display()
         );
     }
-    Ok(format!("path:{}", guest.display()))
+    Ok(format!("{}?dir=nix/guest", flake_ref_root_prefix(&root)))
 }
 
 /// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
@@ -1062,17 +1063,26 @@ mod tests {
         Ok(())
     }
 
-    /// The bundled guest flake resolves to `path:<root>/nix/guest` when the root ships it, and any other reference,
-    /// a `path:` one included, is left alone without asking for the root at all.
+    /// The bundled guest flake resolves under the guest-wrapper root as `{root}?dir=nix/guest`, the way the wrapper's
+    /// own installable is built: `nix/guest/flake.nix` imports `../lib/guest.nix`, which a `path:` flake of the
+    /// `nix/guest` subdirectory alone cannot reach (probed with `nix eval`: it fails, the `?dir=` form evaluates). A
+    /// non-git root (the packaged copy) gets the `path:` prefix, a git root stays bare. Any other reference, a `path:`
+    /// one included, is left alone without asking for the root at all.
     #[test]
     fn the_bundled_guest_flake_resolves_under_the_guest_wrapper_root() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         std::fs::create_dir_all(root.path().join("nix/guest"))?;
         std::fs::write(root.path().join("nix/guest/flake.nix"), "{}")?;
-        let want = format!("path:{}", root.path().join("nix/guest").display());
+        let packaged = format!("path:{}?dir=nix/guest", root.path().display());
         assert_eq!(
             resolve_bundled_flake(BUNDLED_GUEST_FLAKE, || Ok(root.path().to_owned()))?,
-            want
+            packaged
+        );
+        std::fs::create_dir(root.path().join(".git"))?;
+        let dev_tree = format!("{}?dir=nix/guest", root.path().display());
+        assert_eq!(
+            resolve_bundled_flake(BUNDLED_GUEST_FLAKE, || Ok(root.path().to_owned()))?,
+            dev_tree
         );
         for untouched in ["github:acme/guest", "./guest", "path:/srv/guest"] {
             let got = resolve_bundled_flake(untouched, || anyhow::bail!("the root must not be asked for"))?;

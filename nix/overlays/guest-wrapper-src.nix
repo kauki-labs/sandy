@@ -24,6 +24,7 @@ let
       (repo + "/impls")
       (repo + "/nix/lib")
       (repo + "/nix/overlays")
+      (repo + "/nix/guest")
       (repo + "/nix/guest-wrapper")
     ];
   };

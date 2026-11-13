@@ -291,6 +291,18 @@
             tests-e2e-cli = testsE2eCli;
             tests-daemon-e2e = sandyPackages.testsDaemonE2e;
             tests-stub-trust-root = sandyPackages.testsStubTrustRoot;
+            # The packaged guest-wrapper tree ships the bundled guest flake (`bundled:guest`, #483): `sandy-host-executor`
+            # resolves a bare `topologies.<system>.<hypervisor>` to `{root}?dir=nix/guest` under it, and that flake
+            # imports `../lib/guest.nix`.
+            guest-wrapper-ships-guest = pkgs.runCommand "guest-wrapper-ships-guest" { } ''
+              for f in nix/guest/flake.nix nix/guest/flake.lock nix/lib/guest.nix; do
+                [ -f "${pkgs.sandy-guest-wrapper}/$f" ] || {
+                  echo "the packaged guest wrapper lacks $f" >&2
+                  exit 1
+                }
+              done
+              touch $out
+            '';
             stub-trust-root-refused = sandyPackages.stubTrustRootRefused;
             project-docs = projectDocs;
           }
