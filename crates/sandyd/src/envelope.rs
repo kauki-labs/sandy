@@ -123,6 +123,17 @@ fn receipt(
     }
 }
 
+/// Where and how a job was placed, as the daemon recorded it when it dispatched the job.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placement<'a> {
+    /// The executor host that ran it.
+    pub host_id: Option<&'a str>,
+    /// The egress allow-list it was dispatched with, `None` for a job with no policy.
+    pub allow: Option<&'a AllowList>,
+    /// The outputs its Submit declared, as `(name, destination)`.
+    pub declared: &'a [(Option<String>, std::path::PathBuf)],
+}
+
 /// The envelope for a run that ended with `facts` and `exit_code`, once its outputs are settled to `outputs`.
 /// `console` is the already-redacted tail. The `message` is the executor's own words, unredacted and uncut: the caller
 /// redacts it, then cuts it to `MAX_MESSAGE_BYTES`.
@@ -132,10 +143,13 @@ pub(crate) fn from_run(
     exit_code: Option<i32>,
     outputs: OutputStatus,
     console: String,
-    host_id: Option<&str>,
-    allow: Option<&AllowList>,
-    declared: &[(Option<String>, std::path::PathBuf)],
+    placed: &Placement<'_>,
 ) -> ResultEnvelope {
+    let Placement {
+        host_id,
+        allow,
+        declared,
+    } = *placed;
     let outcome = Outcome {
         booted: facts.booted,
         guest_exit: exit_code,

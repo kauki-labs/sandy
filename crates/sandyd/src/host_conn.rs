@@ -689,9 +689,11 @@ async fn finish_job(
             exit_code,
             outputs,
             console.clone(),
-            host_id.as_deref(),
-            allow.as_ref(),
-            &declared,
+            &crate::envelope::Placement {
+                host_id: host_id.as_deref(),
+                allow: allow.as_ref(),
+                declared: &declared,
+            },
         );
         let message = redact_console(credentials.as_deref(), &jid, envelope.message);
         envelope.message = crate::envelope::tail(&message, crate::envelope::MAX_MESSAGE_BYTES).to_owned();
