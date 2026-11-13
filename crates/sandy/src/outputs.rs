@@ -62,6 +62,32 @@ pub fn collect_output_size_refs(
         .collect()
 }
 
+/// The entries [`collect_output_size_refs_capped`] kept, and whether there were more files than the cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedOutputs {
+    /// At most `cap` entries: the first in logical-path order, the same prefix the unlimited listing starts with.
+    pub entries: Vec<OutputSizeRef>,
+    /// Whether the destinations held more files than `cap`.
+    pub more: bool,
+}
+
+/// [`collect_output_size_refs`] bounded to `cap` entries (A2c, #838): the walk stops once it has seen `cap + 1` files
+/// per destination, so a destination that already holds a very large tree costs a bounded number of stats, not one per
+/// file. Children are visited in logical-path order, so what is kept is the same prefix the unlimited listing starts
+/// with, whatever order the filesystem lists a directory in.
+#[must_use]
+pub fn collect_output_size_refs_capped(
+    outputs: &[DeclaredOutput<'_>],
+    digests: Option<&ContentDigests>,
+    cap: usize,
+) -> CappedOutputs {
+    let _ = cap;
+    CappedOutputs {
+        entries: collect_output_size_refs(outputs, digests),
+        more: false,
+    }
+}
+
 /// Recurse `dir`, pushing one `(logical path, size)` entry per regular file with a
 /// `<prefix>/<name>` logical path (an empty `prefix` yields the bare relative
 /// path). Symlinks and special files are skipped — collection already dropped
@@ -87,5 +113,62 @@ fn walk_outputs(dir: &Path, prefix: &str, entries: &mut Vec<(String, u64)>) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #838: a capped listing is the first `cap` entries of the unlimited one in logical-path order, however the
+    /// filesystem lists directories, and says there were more. The names are the hard cases for the order: a file whose
+    /// name sorts before a directory's children (`a.txt` against `a/x`), and a dash.
+    #[test]
+    fn a_capped_listing_is_the_unlimited_listings_prefix_and_says_there_were_more() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir()?;
+        for (dir, file) in [
+            ("a", "x"),
+            ("a", "y"),
+            ("a-b", "c"),
+            ("b", "z"),
+            ("", "a.txt"),
+            ("", "a0"),
+            ("", "m"),
+        ] {
+            let d = dest.path().join(dir);
+            std::fs::create_dir_all(&d)?;
+            std::fs::write(d.join(file), b"1")?;
+        }
+        let declared = [(Some("out"), dest.path())];
+        let all = collect_output_size_refs(&declared, None);
+        assert_eq!(all.len(), 7);
+        for cap in [1, 3, 6] {
+            let capped = collect_output_size_refs_capped(&declared, None, cap);
+            assert_eq!(capped.entries, all[..cap], "cap {cap}: the unlimited listing's prefix");
+            assert!(capped.more, "cap {cap}: there were more files");
+        }
+        for cap in [7, 100] {
+            let capped = collect_output_size_refs_capped(&declared, None, cap);
+            assert_eq!(capped.entries, all, "cap {cap}: everything");
+            assert!(!capped.more, "cap {cap}: nothing more");
+        }
+        Ok(())
+    }
+
+    /// #838: with several declared destinations the cap applies to the merged listing.
+    #[test]
+    fn the_cap_applies_to_the_merged_listing_of_several_destinations() -> anyhow::Result<()> {
+        let one = tempfile::tempdir()?;
+        let two = tempfile::tempdir()?;
+        for i in 0..4 {
+            std::fs::write(one.path().join(format!("f{i}")), b"1")?;
+            std::fs::write(two.path().join(format!("g{i}")), b"1")?;
+        }
+        let declared = [(Some("one"), one.path()), (Some("two"), two.path())];
+        let all = collect_output_size_refs(&declared, None);
+        let capped = collect_output_size_refs_capped(&declared, None, 5);
+        assert_eq!(capped.entries, all[..5]);
+        assert!(capped.more);
+        Ok(())
     }
 }

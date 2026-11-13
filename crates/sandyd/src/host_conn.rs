@@ -2394,7 +2394,7 @@ mod tests {
             envelope
                 .warnings
                 .iter()
-                .any(|w| w.contains("outputs") && w.contains("300")),
+                .any(|w| w.contains("outputs") && w.contains("more than 256")),
             "a warning names the cut: {:?}",
             envelope.warnings
         );
