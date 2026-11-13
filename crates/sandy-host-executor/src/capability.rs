@@ -288,6 +288,33 @@ fn vm_capability_from(facts: VmProbeFacts) -> bool {
         && facts.guest_wrapper_present
 }
 
+/// The facts [`vfkit_capability_from`] derives a VM-capability verdict from on macOS, where the hypervisor is vfkit
+/// and there is no `/dev/kvm` or `/dev/vhost-vsock` to probe (the agent link rides vfkit's own vsock socket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VfkitProbeFacts {
+    /// The vfkit binary (`SANDY_VFKIT_BIN`, else `vfkit`) runs.
+    vfkit_runnable: bool,
+    /// `nix` runs: the `flake/v1` branch resolves and builds the guest with it.
+    nix_runnable: bool,
+    /// The packaged guest wrapper flake is present (see [`VmProbeFacts::guest_wrapper_present`]).
+    guest_wrapper_present: bool,
+}
+
+/// Whether `facts` satisfy declaring `SandboxKind::Vm` on a vfkit host.
+fn vfkit_capability_from(_facts: VfkitProbeFacts) -> bool {
+    false
+}
+
+/// The capability a host declares from its containment `status` and whether it can run a VM: `Process` when the
+/// containment is available, else `Vm` alone when a VM can run. A host with neither declares nothing.
+fn capabilities_for_host(
+    arch: Arch,
+    status: &ContainmentStatus,
+    _vm_available: bool,
+) -> Result<Capabilities, DetectError> {
+    capabilities_from(arch, status)
+}
+
 /// Whether `binary --version` runs successfully — a real-usability probe
 /// (not just PATH presence), matching the spirit of
 /// `SystemdRunContainment::detect`'s own "try the real thing" discipline
@@ -718,6 +745,72 @@ mod tests {
             !device_openable(&path_str),
             "a nonexistent path must not be reported as openable"
         );
+        Ok(())
+    }
+
+    fn unsupported() -> ContainmentStatus {
+        ContainmentStatus::Unsupported("process containment needs Linux cgroup v2".to_owned())
+    }
+
+    /// A macOS host runs VMs through vfkit: with vfkit, nix and the guest wrapper present it can declare `Vm`, and it
+    /// needs neither `/dev/kvm` nor `/dev/vhost-vsock`. Each missing fact refuses.
+    #[test]
+    fn a_vfkit_host_needs_vfkit_nix_and_the_wrapper_and_no_kvm() {
+        let all = VfkitProbeFacts {
+            vfkit_runnable: true,
+            nix_runnable: true,
+            guest_wrapper_present: true,
+        };
+        assert!(vfkit_capability_from(all), "every fact holds");
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            vfkit_runnable: false,
+            ..all
+        }));
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            nix_runnable: false,
+            ..all
+        }));
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            guest_wrapper_present: false,
+            ..all
+        }));
+    }
+
+    /// A host with no process containment but a working VM (a Mac) declares the VM kind alone: no `Process`, which it
+    /// could only run uncontained. With no VM either it still declares nothing, and names the containment reason.
+    #[test]
+    fn a_host_with_no_process_containment_declares_vm_only_when_a_vm_can_run() -> anyhow::Result<()> {
+        let capabilities = capabilities_for_host(Arch::Aarch64, &unsupported(), true)?;
+        assert_eq!(capabilities.kind, SandboxKind::Vm);
+        let wire = to_wire_capabilities(capabilities, &unsupported(), true, false, false, false);
+        assert_eq!(
+            wire.supported_sandbox_kinds,
+            vec![i32::from(sandy_executor_proto::SandboxKind::Vm)],
+            "no process kind without containment"
+        );
+        assert_eq!(
+            wire.supported_isolation_classes,
+            vec![i32::from(IsolationClass::Trusted), i32::from(IsolationClass::Untrusted)],
+            "a VM honours both classes"
+        );
+        let err = capabilities_for_host(Arch::Aarch64, &unsupported(), false).expect_err("neither backend can run");
+        assert!(matches!(err, DetectError::ContainmentUnavailable(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// A host with process containment keeps its declaration whatever its VM state: `Process`, plus `Vm` when a VM can
+    /// run, exactly as before.
+    #[test]
+    fn a_host_with_process_containment_still_declares_process() -> anyhow::Result<()> {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        for vm in [false, true] {
+            assert_eq!(
+                capabilities_for_host(Arch::X86_64, &status, vm)?.kind,
+                SandboxKind::Process
+            );
+        }
         Ok(())
     }
 }

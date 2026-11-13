@@ -64,9 +64,27 @@ use crate::{
 /// be guessing a shape no real sender produces).
 pub const MANIFEST_ENCODING_ARGV_V1: &str = "argv/v1";
 
+/// The hypervisor behind a `SandboxKind::Vm` dispatch on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hypervisor {
+    /// qemu/KVM, on every host that is not macOS.
+    Qemu,
+    /// vfkit over Virtualization.framework, on macOS.
+    Vfkit,
+}
+
+/// The hypervisor for `os` (a `std::env::consts::OS` value).
+pub(crate) fn hypervisor_for_os(_os: &str) -> Hypervisor {
+    Hypervisor::Qemu
+}
+
 /// A dispatch that cannot be honored, refused before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchError {
+    /// A process dispatch reached a host whose process containment is not available (a macOS host, which runs VMs
+    /// only). The process backend would run the job uncontained, so it is refused.
+    #[error("this host has no process containment, so it runs VM jobs only")]
+    ProcessContainmentUnavailable,
     /// This host's declared backend cannot provide the job's required
     /// isolation class. Fail-closed, never a silent downgrade onto
     /// trusted-process (#269's isolation-class gate, D5).
@@ -1768,6 +1786,43 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.
+    #[test]
+    fn the_hypervisor_is_vfkit_on_macos_and_qemu_elsewhere() {
+        assert_eq!(hypervisor_for_os("macos"), Hypervisor::Vfkit);
+        assert_eq!(hypervisor_for_os("linux"), Hypervisor::Qemu);
+    }
+
+    /// A host with no process containment (a Mac, which declares VM only) refuses a process dispatch instead of
+    /// running the job uncontained, even for a trusted one.
+    #[tokio::test]
+    async fn a_process_dispatch_is_refused_on_a_host_without_process_containment() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?;
+        let rt = tokio::runtime::Handle::current();
+        let err = tokio::task::spawn_blocking(move || {
+            handle_dispatch(
+                &dispatch,
+                Box::new(sandy::NoContainment),
+                PathBuf::from("/nonexistent/sandy-agent"),
+                rt,
+                true,
+                sandy_api::backend::RunControl::with_timeout_secs(60),
+                test_mesh_tls_config(),
+            )
+        })
+        .await
+        .context("the blocking dispatch task")?
+        .expect_err("no containment, no process run");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::ProcessContainmentUnavailable)
+            ),
+            "expected ProcessContainmentUnavailable, got {err:?}"
+        );
+        Ok(())
     }
 
     /// A1 (#483): a process job shares the host network, so a policy on one is refused before anything runs
