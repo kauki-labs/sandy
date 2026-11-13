@@ -1,10 +1,8 @@
-//! `sandyd`: the per-machine control-plane daemon (epic #205). This block
-//! (#212 B1 + its B2 dispatch slice) serves #211's control RPC against a
-//! sqlite-backed job store: a `Submit` mints a real per-job channel and caps
-//! (see [`dispatch`]), but nothing yet joins that channel and runs the job —
-//! there is no `sandy-agent` binary or `ProcessBackend::with_agent` (#216)
-//! for the executor to spawn. `Attach` returning a real channel/cap for a job
-//! that stays `Pending` is the honest state of that gap, not a fake success.
+//! `sandyd`: the per-machine control-plane daemon (epic #205). It serves #211's control RPC against a
+//! sqlite-backed job store: a `Submit` mints a per-job channel and caps (see [`dispatch`]), places the job on a
+//! registered host-executor through the [`host_registry`], and the executor runs it behind `sandy-agent`. The job
+//! moves `Pending`, `Running`, then terminal, and `Attach` returns its channel and a cap. A
+//! job a previous daemon left open is failed at the next start (#830).
 //!
 //! The control RPC itself stays pure request/response (`docs/decisions/
 //! sandyd.md` §1: never a retrofit into a streaming call). `Attach`'s cap is
