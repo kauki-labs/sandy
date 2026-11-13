@@ -139,6 +139,8 @@ pub(crate) struct Placement<'a> {
     pub allow: Option<&'a AllowList>,
     /// The outputs its Submit declared, as `(name, destination)`.
     pub declared: &'a [(Option<String>, std::path::PathBuf)],
+    /// The names of the inputs its Submit declared.
+    pub declared_inputs: &'a [String],
     /// Whether the Submit asked for digests.
     pub digests_requested: bool,
 }
@@ -158,6 +160,7 @@ pub(crate) fn from_run(
         host_id,
         allow,
         declared,
+        declared_inputs,
         digests_requested,
     } = *placed;
     let outcome = Outcome {
@@ -193,7 +196,7 @@ pub(crate) fn from_run(
     if digests_requested {
         match facts.digests.as_ref() {
             None => digest_warnings.push("digests were requested but the executor reported none".to_owned()),
-            Some(report) => match ingest_digests(report) {
+            Some(report) => match ingest_digests(report, declared_inputs) {
                 Ok((accepted, warning)) => {
                     digests = Some(accepted);
                     digest_warnings.extend(warning);
@@ -331,6 +334,44 @@ fn validate_side(side: Option<&sandy_executor_proto::ContentDigests>) -> Result<
     Ok(sandy::ContentDigests { files, skipped })
 }
 
+/// Every path of `side` equals the name of an input the Submit declared, or starts with it plus `/` (a name may hold
+/// a `/` itself, so a bare prefix does not count): the executor stages and hashes only those, so any other name is
+/// invented. Only the input side is checked: output paths are the executor's own listing of what the job wrote, and
+/// the daemon joins them to the destinations it walks, so an invented one matches no file and is ignored.
+fn check_declared(side: &sandy::ContentDigests, declared: &[String]) -> Result<(), String> {
+    let paths = side
+        .files
+        .iter()
+        .map(|file| &file.path)
+        .chain(side.skipped.iter().map(|entry| &entry.path));
+    for path in paths {
+        let belongs = declared.iter().any(|name| {
+            path.strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
+        if !belongs {
+            return Err(format!("the path {path:?} is not under a declared input"));
+        }
+    }
+    Ok(())
+}
+
+/// No path of `side` is reported twice, hashed or skipped: a path has one content, so a repeat is a lie or a bug.
+fn check_unique(side: &sandy::ContentDigests) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let paths = side
+        .files
+        .iter()
+        .map(|file| &file.path)
+        .chain(side.skipped.iter().map(|entry| &entry.path));
+    for path in paths {
+        if !seen.insert(path) {
+            return Err(format!("the path {path:?} is reported more than once"));
+        }
+    }
+    Ok(())
+}
+
 /// Keep the first entries of `list` while they stay inside the entry and path-byte caps; the total before the cut.
 fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
     let total = list.len();
@@ -351,9 +392,13 @@ fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
 /// when something was cut. `Err` names why the report is malformed.
 fn ingest_digests(
     report: &sandy_executor_proto::RunDigests,
+    declared_inputs: &[String],
 ) -> Result<((sandy::ContentDigests, sandy::ContentDigests), Option<String>), String> {
     let mut inputs = validate_side(report.inputs.as_ref()).map_err(|why| format!("inputs: {why}"))?;
     let mut outputs = validate_side(report.outputs.as_ref()).map_err(|why| format!("outputs: {why}"))?;
+    check_declared(&inputs, declared_inputs).map_err(|why| format!("inputs: {why}"))?;
+    check_unique(&inputs).map_err(|why| format!("inputs: {why}"))?;
+    check_unique(&outputs).map_err(|why| format!("outputs: {why}"))?;
     inputs.sort();
     outputs.sort();
     let mut cut = Vec::new();
@@ -498,5 +543,34 @@ mod tests {
             !reason.contains(&TOKEN[TOKEN.len() / 2..]),
             "a suffix of the token survived the cut"
         );
+    }
+
+    /// #841 (sandy-86 on #845): an input name may itself hold a `/` (the data link accepts `a/b/c.txt`), so a digest
+    /// path belongs to a declared name when it equals it or starts with it plus `/`, never on a bare prefix.
+    #[test]
+    fn an_input_digest_belongs_to_a_declared_name_by_whole_components() {
+        let declared = ["a/b".to_owned(), "c".to_owned()];
+        let side = |paths: &[&str]| sandy::ContentDigests {
+            files: paths
+                .iter()
+                .map(|path| sandy::FileDigest {
+                    path: (*path).to_owned(),
+                    sha256: "7".repeat(64),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        };
+        for ok in ["a/b", "a/b/x.txt", "c/y", "c"] {
+            assert!(
+                check_declared(&side(&[ok]), &declared).is_ok(),
+                "{ok} belongs to a declared input"
+            );
+        }
+        for bad in ["a/x", "a", "a/bc/x", "ab", "c2/y"] {
+            assert!(
+                check_declared(&side(&[bad]), &declared).is_err(),
+                "{bad} does not belong to a declared input"
+            );
+        }
     }
 }
