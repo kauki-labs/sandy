@@ -18,10 +18,19 @@ use sandy::{JobRecord, ResultEnvelope};
 use sandy_control_proto::{AttachResponse, JobStatus, ListResponse, StatusResponse, SubmitResponse};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    app_register::{CredDeregistered, CredImported, CredRegistered, CredVerified},
-    supervisor::GcReport,
-};
+use crate::app_register::{CredDeregistered, CredImported, CredRegistered, CredVerified};
+
+/// `gc`'s result (the direct `sandy gc` and `sandy daemon prune`): evicted job ids and swept staging-dir names, kept
+/// apart (#195). `evicted` holds job ids only, so a consumer passing its entries to
+/// `status`/`wait` never receives a staging-dir name, and the plain-text
+/// "evicted N record(s)" count never counts a directory as a record.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GcReport {
+    /// Job ids evicted under the keep-last-N + referenced policy.
+    pub evicted: Vec<String>,
+    /// Names of any `cred-*`/`verify-*` staging dirs swept past `MAX_TTL_SECS`.
+    pub swept_staging_dirs: Vec<String>,
+}
 
 /// Which representation the CLI prints on stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]

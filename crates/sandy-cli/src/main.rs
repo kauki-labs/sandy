@@ -1536,7 +1536,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         Some(control_response::Result::List(r)) => succeed_or(emit(&JobSummaries::from(&r), output)),
         // The same report and spelling `sandy gc` prints, so the promotion of `daemon prune` to `gc` changes no format.
         Some(control_response::Result::Prune(r)) => succeed_or(emit(
-            &supervisor::GcReport {
+            &sandy_cli::output::GcReport {
                 evicted: r.evicted,
                 swept_staging_dirs: r.swept_staging_dirs,
             },
