@@ -17,22 +17,22 @@ For the terse per-subsystem view read
 [`../architecture/overview.md`](../architecture/overview.md); for the live
 acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 
-| Category                                          | Covers                                                                 |
-| ------------------------------------------------- | ---------------------------------------------------------------------- |
-| [run-plane](run-plane.md)                         | native hypervisor launch, console protocol                             |
-| [process-containment](process-containment.md)     | non-VM executor cgroup reaping + the gate                              |
-| [guest-shares](guest-shares.md)                   | inputs/outputs/secrets as virtio-fs                                    |
-| [secret-channel](secret-channel.md)               | `$NAME` delivery off argv/env/store                                    |
-| [credential-seam](credential-seam.md)             | mint → stage → refresh → revoke                                        |
-| [egress](egress.md)                               | guest-scoped allow-list around the boot                                |
-| [egress-proxy](egress-proxy.md)                   | planned: NIC-less guest, vsock host proxy                              |
-| [credential-broker](credential-broker.md)         | proposed: sandy as a client of the credential-broker (modes B, then A) |
-| [result-classification](result-classification.md) | locked envelope, exit bands, rendering                                 |
-| [journal](journal.md)                             | durable records, reconcile                                             |
-| [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness                                   |
-| [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state                               |
-| [broker-api](broker-api.md)                       | HTTP API tier over sandyd                                              |
-| [t3-guest-image](t3-guest-image.md)               | history: the T3 guest image, removed from core 2026-11-11              |
+| Category                                          | Covers                                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------ |
+| [run-plane](run-plane.md)                         | native hypervisor launch, console protocol                                     |
+| [process-containment](process-containment.md)     | non-VM executor cgroup reaping + the gate                                      |
+| [guest-shares](guest-shares.md)                   | inputs/outputs/secrets as virtio-fs                                            |
+| [secret-channel](secret-channel.md)               | `$NAME` delivery off argv/env/store                                            |
+| [credential-seam](credential-seam.md)             | mint → stage → refresh → revoke                                                |
+| [egress](egress.md)                               | guest-scoped allow-list around the boot                                        |
+| [egress-proxy](egress-proxy.md)                   | planned: NIC-less guest, vsock host proxy                                      |
+| [credential-broker](credential-broker.md)         | proposed: sandy as a client of the credential-broker (modes B, then A)         |
+| [result-classification](result-classification.md) | locked envelope, exit bands, rendering                                         |
+| [journal](journal.md)                             | superseded (#483): durable records, reconcile; sandyd's `JobStore` replaces it |
+| [agent-fabric](agent-fabric.md)                   | fabric seam contracts + test harness                                           |
+| [sandyd](sandyd.md)                               | control RPC, daemon, job manifest, state                                       |
+| [broker-api](broker-api.md)                       | HTTP API tier over sandyd                                                      |
+| [t3-guest-image](t3-guest-image.md)               | history: the T3 guest image, removed from core 2026-11-11                      |
 
 Invariants referenced across these records: **INV-1** secrets never reach
 argv/env/the store; **INV-3** liveness only through `VmBackend::boxes` + the job

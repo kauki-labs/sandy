@@ -77,8 +77,8 @@ rewrites the live secret file; the guest's `git credential fill` serves the fres
 token.
 
 **Consequences.** A long job keeps working across token expiry; the value is never
-exposed on argv/console. Proven live by K11 (`live_refresh.rs`), which refuses on
-default margins rather than skip-greening (INV-S9).
+exposed on argv/console. K11 (`live_refresh.rs`) proved it live. The direct path, its refresh thread and K11
+were removed in #483: jobs get no mid-run refresh, and K11 is retired.
 
 ## 4. Trust material is written only into a private trust-roots dir
 
@@ -141,7 +141,7 @@ that. Operators who need that guarantee supply it at the deployment layer.
 
 ## 6. `gc` reclaims a leaked `cred-*`/`verify-*` staging dir by mtime, heartbeated while live
 
-**Status:** accepted.
+**Status:** accepted. The heartbeat went with the refresh loop in #483; sandyd's prune still sweeps by mtime.
 
 **Context.** `sandy run --credential` and the trust-root verify probe stage a
 token into a fresh, randomly named private dir under the sandy staging base
@@ -253,7 +253,7 @@ authoritative and free.
 
 ## 7. The terminal journal write waits for final redaction, instead of amending
 
-**Status:** accepted. **Upholds:** INV-6, M-6.
+**Status:** superseded by #483 (the Journal, `run_job` and the refresh thread were deleted; sandyd's `JobStore` is the record). The text below is history. **Upholds:** INV-6, M-6.
 
 **Context.** `run_job`'s terminal journal write (step 6, INV-6) happens right
 after its own console redaction pass, which only ever sees the credential's
@@ -301,7 +301,8 @@ in `supervisor.rs`, which uses `CountingJournal` (a `JournalWriter` test
 double) to record the write count and checks the persisted terminal record,
 and by the existing `credentialed_run_redacts_the_token_from_the_console` /
 `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` integration
-tests in `cli_jobs.rs`, which still pass unchanged.
+tests in `cli_jobs.rs`, which still pass unchanged. `supervisor.rs`, `CountingJournal` and
+`cli_jobs.rs` were removed in #483; the Journal write they proved no longer exists.
 
 **Set aside.** Keeping the amend and instead making it atomic under the job
 flock (lock, read, merge, write) was considered and rejected: it still leaves

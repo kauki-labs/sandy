@@ -2,13 +2,18 @@
 title: "Decisions: journal"
 status: accepted
 project: sandy
-updated: 2026-10-25
+updated: 2026-11-13
 ---
 
 # Decisions: journal
 
+**Superseded.** The Journal, `reconcile_job` and the owner liveness lock were deleted in #483
+with the direct execution path (#221). sandyd's `JobStore` (sqlite) is the only job record.
+The decisions below stay as the history of why the Journal was built; they describe code that
+no longer exists, and their test pointers (`live_boot.rs`, `cli_jobs.rs`) name removed files.
+
 Persisting durable job records and reconciling liveness without racing the owner.
-Subsystem spec: [`../architecture/spec.md#7-journal`](../architecture/spec.md#7-journal).
+Subsystem spec: [`../architecture/spec.md#7-journal-removed-in-483`](../architecture/spec.md#7-journal-removed-in-483).
 
 ## 1. Running before boot
 

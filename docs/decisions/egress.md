@@ -30,7 +30,7 @@ on both the ok and the error path.
 
 **Consequences.** The boundary can never lock the host off the network, never
 leaves rules up after a boot failure, and never boots unprotected. Proven live by
-K13 (`live_egress.rs`, Linux + root + `nft`).
+K13 (`live_egress.rs`, Linux + root + `nft`; the test was removed and K13 retired in #483).
 
 **Set aside.** A host-wide ruleset: rejected, it risks locking out the controller.
 

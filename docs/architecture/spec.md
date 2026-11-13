@@ -137,12 +137,11 @@ It does not guarantee:
 **KPI.**
 
 - Integration: `qemu_args` / `vfkit_args` argv assembly and the console protocol
-  (sentinel framing, `parse_exit`) as unit tests; `host_matrix` classification over
-  a real observation; `console::tests` drives `run_console` against a scripted
+  (sentinel framing, `parse_exit`) as unit tests; `console::tests` drives `run_console` against a scripted
   `Transport` and a real `RunControl` over genuine elapsed time (suspend/cancel/
   idle-vs-closed, #185).
-- End-to-end: `live_boot.rs` tests `real_boot_collect_succeeds`,
-  `cli_lifecycle_over_a_real_job`, `guest_failure_is_a_task_fault`.
+- End-to-end: K1-K3 (`live_boot.rs`) were removed with the direct path in #483. Not yet
+  re-proven through the daemon (#858).
 
 ---
 
@@ -215,10 +214,9 @@ flowchart LR
   real `qemu_args`/`vfkit_args` with the right tag and RO/RW flag (`--readonly` vs
   not), a missing host input fails closed, named + catch-all collection, the
   symlink-escape is skipped, and only the outputs share is writable.
-- End-to-end: `live_inputs.rs` (readable, write → `EROFS`); `live_outputs.rs` (named
-  and catch-all collected, listed in the envelope); and
-  `live_boot.rs::secret_share_mounts_read_only_virtiofs` (virtiofs fstype, guest
-  write denied).
+- End-to-end: K4-K7 (input readable, write → `EROFS`, outputs collected, secret share
+  read-only) were proven by `live_inputs.rs`, `live_outputs.rs` and `live_boot.rs`, removed
+  in #483. Not yet re-proven through the daemon (#858).
 - Unit: `sandy-backend/src/staging.rs`, a world-writable or symlinked base is
   rejected, an owner/mode mismatch is rejected, a clean self-owned base validates;
   `sandy/src/shares.rs::a_secret_dir_swapped_after_validation_is_never_staged_into`
@@ -247,18 +245,18 @@ argv, env, or the Nix store.
 
 - Integration: `stage/secrets.rs` unit tests (perms, atomic rename, wipe,
   world-readable rejection); `validate_no_secret_leak` tests.
-- End-to-end: `live_boot.rs::staged_secret_is_exported_to_the_job_env`.
+- End-to-end: K8 (`live_boot.rs`) was removed in #483. Not yet re-proven through the daemon (#858).
 
 ---
 
 ## 4. Credential seam (`CredentialProvider`)
 
 **Purpose.** Mint a short-lived, least-privilege forge token for a job, deliver it
-in-guest, refresh it mid-run, and revoke it at teardown.
+in-guest, and revoke it at teardown. Jobs get no mid-run refresh (#483).
 
 ```mermaid
 sequenceDiagram
-  participant S as supervisor
+  participant S as sandyd
   participant P as CredentialProvider
   participant B as VmBackend
   participant G as guest
@@ -267,61 +265,43 @@ sequenceDiagram
   S->>S: stage token 0600 in cred_dir (secret_dir)
   S->>B: run (plan + secret_dir)
   B->>G: boot; token exported as $GITHUB_TOKEN
-  loop refresh loop (margin/tick)
-    S->>P: refresh(lease)
-    P-->>S: Minted(new token)
-    S->>S: rewrite cred_dir/<NAME> (live share)
-    note over G: git credential fill serves the new token
-  end
   S->>P: revoke(lease) at teardown
 ```
 
 **Decisions.**
 
-- **Mint → stage → revoke bracket, fail-closed (INV-7).** `run_job_with_credential`
-  mints before boot; a mint failure returns an infra fault with **no boot**. The
+- **Mint → stage → revoke bracket, fail-closed (INV-7).** sandyd mints through
+  `CredentialBracket` before boot; a mint failure returns an infra fault with **no boot**. The
   lease is revoked on every path.
 - **Trust root, not a shared server.** The provider is a GitHub App whose private
   key stays on the controller (`sandy cred github register/import/verify/deregister`);
   each job mints an installation token scoped to its repos/capabilities. The minted
   token is a secret, delivered over the secret channel (§3).
-- **Mid-run refresh.** With a huge margin + short tick the refresh thread re-mints
-  and rewrites the live secret file, so a long job's `git credential fill` serves a
-  fresh token; the guest never sees the value on argv/console.
-- **Terminal journal write deferred until redaction is final (#322).** The
-  non-credentialed path still writes its terminal record inside `run_job`, right
-  after its one redaction pass. `run_job_with_credential` instead runs the shared
-  core without writing that record, joins the refresh thread, re-redacts the
-  console against every token the run ever had live, folds in a revoke-failure
-  warning if any, and only then writes the terminal record — once. Before this,
-  `run_job` wrote a terminal record redacted against only the initial token, and
-  `run_job_with_credential` amended it after the fact; a crash in that window left
-  a permanent record with a refreshed token unredacted. See INV-6 (§7).
+- **No mid-run refresh (#483).** The direct path's refresh thread (margin/tick, re-mint
+  and rewrite of the live secret file) was removed with it. A job's token is minted once
+  at Submit and lives for its TTL; the guest never sees the value on argv/console. The
+  record of why it was built stays in `docs/decisions/credential-seam.md`.
+- **Terminal record written once, after redaction (#322).** The Journal and its
+  deferred terminal write were removed in #483. sandyd's `JobStore` row is the one
+  terminal record; the bracket revokes on every terminal path before the envelope is stored.
 - **`gc` sweeps a leaked `cred-*`/`verify-*` staging dir (#195).** The drop guard
   that removes `cred_dir`/the verify probe's temp dir runs on every normal exit
-  and on panic, but not on SIGKILL or a crash before it runs; `sandy gc` sweeps any
-  such dir under the sandy staging base whose mtime is at least `MAX_TTL_SECS` old.
-  The refresh loop heartbeats `cred_dir`'s mtime every tick (not only on an actual
-  refresh), since a provider's native token TTL can outlast `MAX_TTL_SECS` between
-  refreshes; without it, `gc` could delete a live job's credential dir. The sweep
-  is best-effort: a staging base that can't be validated or listed is logged and
-  skipped, never blocking `gc`'s record eviction. A stalled refresh call could
-  itself block the heartbeat (the two run sequentially), so every GitHub API
-  call (mint, refresh, revoke, uninstall, the permissions read) runs under a single
-  wall-clock deadline, `CALL_DEADLINE = MAX_TTL_SECS / 2`, covering the whole
-  call including whatever retries octocrab makes internally, closing the gap
-  at its source rather than only at the heartbeat. `safe_heartbeat_tick` caps
-  a configured tick against `MAX_TTL_SECS - CALL_DEADLINE`, not `MAX_TTL_SECS`
-  alone, so an accepted tick always leaves room for one stalled call. See
-  decision 6 for the residual gap this doesn't close.
+  and on panic, but not on SIGKILL or a crash before it runs; the sandyd prune
+  behind `sandy gc` sweeps any such dir under the sandy staging base whose mtime is at
+  least `MAX_TTL_SECS` old. The sweep is best-effort: a staging base that can't be
+  validated or listed is logged and skipped, never blocking the prune's record
+  eviction. Every GitHub API call (mint, revoke, uninstall, the permissions read)
+  runs under a single wall-clock deadline, `CALL_DEADLINE = MAX_TTL_SECS / 2`,
+  covering the whole call including whatever retries octocrab makes internally.
+  The refresh-loop heartbeat of `cred_dir`'s mtime and `safe_heartbeat_tick` went
+  with the refresh loop (#483). See decision 6 for the residual gap this doesn't close.
 - **`cred_dir` is bound by fingerprint through mint and every refresh (CWE-367,
-  #323).** `run_credentialed` captures `cred_dir`'s `(dev, ino)` from the
+  #323).** A caller that stages a credential captures `cred_dir`'s `(dev, ino)` from the
   `OwnedDir` `private_staging_dir` returns before reducing it to a path.
-  `mint_lease_checked`/`refresh_once_checked` reopen `cred_dir` with
+  `mint_lease_checked` (and `refresh_once_checked`, kept in `cred.rs`) reopen `cred_dir` with
   `OwnedDir::open_matching` against that fingerprint instead of `mint_lease`'s/
   `refresh_once`'s plain owner/mode reopen, so a same-uid, same-mode directory
-  swapped in at `cred_dir`'s path between validation and the mint, or between
-  two refreshes, is refused rather than silently receiving the token. See
+  swapped in at `cred_dir`'s path between validation and the mint is refused rather than silently receiving the token. See
   decision 13 in `docs/decisions/guest-shares.md`.
 - **The daemon path reuses one bracket (#481).** `sandy::CredentialBracket` is the mint,
   renew and revoke lifecycle around one staged credential, with every provider call
@@ -336,30 +316,21 @@ sequenceDiagram
 - Integration: `cred.rs` unit tests (`mint_lease` clamps TTL, stages 0600, revoke
   bracket, `should_refresh`);
   `mint_lease_checked_refuses_a_dir_swapped_in_after_validation` (adversarial,
-  #323); the supervisor's mint-fails-closed test;
-  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
-  (decision 7 of `credential-seam.md`: the deferred write, exactly once, after
-  refresh redaction);
+  #323);
   `sandy-fsutil`'s `sweep_stale_staging_dirs` tests (sweeps a stale dir, keeps a
   fresh one, ignores an unrelated prefix, continues past an injected removal
   failure deterministically via `sweep_stale_staging_dirs_with`, supplemented
-  by a real-filesystem-permission variant); the supervisor's
-  `gc_sweeps_a_stale_cred_dir_past_max_ttl` / `gc_keeps_a_fresh_verify_dir`
-  (both asserting against `GcReport::swept_staging_dirs`, never `evicted`) /
-  `refresh_loop_heartbeats_the_cred_dir_mtime_every_tick` /
-  `safe_heartbeat_tick_passes_through_a_safe_tick` /
-  `safe_heartbeat_tick_falls_back_when_the_tick_reaches_max_ttl_secs` /
-  `..._exceeds_max_ttl_secs` /
-  `..._falls_back_at_max_ttl_secs_minus_call_deadline` /
-  `..._passes_through_just_below_max_ttl_secs_minus_call_deadline`;
+  by a real-filesystem-permission variant);
   `output.rs`'s `gc_json_keeps_swept_staging_dirs_out_of_evicted` /
   `gc_plain_text_evicted_count_excludes_swept_staging_dirs`; `cred_github.rs`'s
   `revoke_times_out_on_a_stalled_server` (drives the real adapter's `revoke`
   against a local listener that accepts and never responds, proving the call
-  errors out at `call_deadline` rather than hanging).
-- End-to-end: `live_cred.rs` (git-helper + mid-run refresh + revoke; the "everything"
-  scenario composing cred + secret + input + output), `live_refresh.rs` (a rotated
-  token reaches the running guest). Adapter-live (real App): `cred_e2e.rs` /
+  errors out at `call_deadline` rather than hanging). The supervisor tests (mint
+  fails closed, deferred terminal write, `gc` of a stale `cred_dir`, heartbeat)
+  were removed in #483 with the direct path.
+- End-to-end: K10 and K14's credential scenario (`live_cred.rs`) were removed in #483
+  and are not yet re-proven through the daemon (#858); K11 (`live_refresh.rs`) is
+  retired. Adapter-live (real App): `cred_e2e.rs` /
   `sandy/tests/cred_github_live.rs`, operator-gated.
 
 ---
@@ -399,7 +370,7 @@ the guest has no network device, so --allow entries have no effect (see
   address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
   port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
   DNS through the boundary, so a job must connect by IP. A hostname entry is
-  refused at plan time on the nftables (Linux) path: band 2, no journal record,
+  refused at plan time on the nftables (Linux) path: band 2, no job record,
   no boot, naming the entry and #377. nft pins a hostname to one address at
   ruleset-load time, rejects a name with several addresses, and the guest can't
   resolve names through the boundary anyway, so a hostname entry only ever helps
@@ -422,20 +393,12 @@ the guest has no network device, so --allow entries have no effect (see
 **KPI.**
 
 - Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
-  `validate_egress_hosts`); `cli_jobs`
-  `run_on_linux_applies_the_allow_list_ruleset_and_reverts_it` /
-  `run_on_macos_applies_no_boundary_but_still_succeeds` /
-  `run_on_macos_with_an_empty_allow_list_carries_no_warning` /
-  `run_on_linux_with_no_tap_and_a_nonempty_allow_list_warns` /
-  `run_on_linux_with_no_tap_and_an_empty_allow_list_carries_no_warning` /
-  `run_on_the_process_backend_with_a_nonempty_allow_list_warns_with_the_right_cause` /
-  `run_hostname_allow_on_linux_is_invalid_plan_writes_no_record_and_never_boots` /
-  `run_with_credential_hostname_allow_on_linux_is_invalid_plan_never_mints` /
-  apply-failure-fails-closed (over `FakeApplier`).
-- End-to-end: `live_egress.rs` (Linux + root + `nft`), real nftables around a boot,
-  including the host-destined case (an empty allow-list plus a host-local
-  resolver: the guest can't resolve names through it and can't connect to the
-  tap's host address).
+  `validate_egress_hosts`), apply-failure-fails-closed (over `FakeApplier`). The
+  fake-backed `cli_jobs` egress and warning tests were removed in #483 with the direct
+  path.
+- End-to-end: K13 (`live_egress.rs`, real nftables around a boot) is retired (#483):
+  the guest NIC profile is removed and `--allow` through the egress proxy (KP rows,
+  not yet re-proven through the daemon, #858) is the only network path.
 
 ---
 
@@ -462,7 +425,7 @@ flowchart TD
 
 - **Locked envelope.** `status` / `retryable` / `exit_code` are authoritative and
   cross-checked (INV-11): band 3 (infra) is the only retryable band; an invalid
-  plan is band 2 with no journal record and no boot (the silent-run guard).
+  plan is band 2 with no job record and no boot (the silent-run guard).
 - **A dead egress proxy is band 3 (#360).** A backend that finds the run's egress
   proxy exited before it killed it returns `BackendError::EgressProxyDied { status,
 booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a guest that
@@ -470,7 +433,7 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
   names the proxy's exit status and the guest exit. A backend with no proxy support
   refuses a `RunSpec` that carries an egress policy before boot (band 3, no boot).
   Design: [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md) decision 3.
-- **Outputs populated.** After a successful run the supervisor lists each declared
+- **Outputs populated.** After a successful run the executor lists each declared
   output's collected files as `OutputRef`s (`<name>/<rel>` named, `<rel>`
   catch-all), independent of the host dest. Provenance (`Provenance.template_store_path`)
   remains a placeholder.
@@ -511,7 +474,7 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
     today since no backend reports that moment, and teardown).
   - `guest_reported` (a hostile guest can shape these): the exit code
     (mirroring `ResultEnvelope.exit_code`) and collected output names/sizes.
-  - Content digests (#373, schema `4`, opt-in via `sandy run --digests`): the
+  - Content digests (#373, schema `4`, opt-in via `--digests`): the
     backend hashes each staged input (`host_observed.input_digests`, computed on
     the staged copy before boot) and each collected output
     (`guest_reported.outputs[].sha256`, hashed in the same pass as the copy),
@@ -535,23 +498,15 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
   (`an_old_schema_v3_receipt_with_no_digest_keys_deserializes_to_none`,
   `a_receipt_without_digests_serializes_no_digest_keys`,
   `digests_on_hashes_each_collected_file_by_logical_path`,
-  `digests_the_staged_copy_with_known_vectors`,
-  `run_places_reported_digests_in_the_right_receipt_sections`);
-  `cli_jobs` band tests (`run_positive`, `run_guest_failure`, `run_timeout`,
-  `run_infra_fault`, `run_invalid_plan`) and
-  `run_lists_collected_outputs_in_the_envelope`;
-  `credentialed_run_redacts_the_token_from_the_console` and
-  `credential_revoke_failure_surfaces_as_a_warning_not_a_fault` (M-6/L-12);
-  `run_job_populates_the_receipt_for_a_direct_run`,
-  `receipt_reports_unenforced_egress_with_a_reason_and_no_allow_list`,
-  `receipt_reports_enforced_egress_with_the_applied_allow_list`,
-  `receipt_reports_a_failed_egress_apply_as_unenforced`,
-  `credentialed_run_populates_the_receipts_credential_lease`, and
-  `no_token_or_secret_bytes_anywhere_in_the_serialized_envelope` (#361);
+  `digests_the_staged_copy_with_known_vectors`);
   `output.rs` format tests (default plain, both formats carry outputs and
   `both_formats_carry_warnings`).
-- End-to-end: every live test asserts the envelope `status`/`exit_code`; `live_e2e.rs`
-  asserts `envelope.outputs` and no secret leak in `logs.tail`. The receipt is not
+- The fake-backed supervisor tests (`cli_jobs` band tests, the receipt and egress-receipt
+  tests, console redaction, revoke-failure warning) were removed in #483 with the direct
+  path. `classify_outcome` stays unit-tested in `result.rs`. Re-proving the bands, receipt
+  and redaction through sandyd and the executor is #858.
+- End-to-end: the live tests that asserted the envelope (`live_e2e.rs`, K9, K14) were
+  removed in #483, not yet re-proven through the daemon (#858). The receipt is not
   yet asserted on a real boot (`kpi.md`'s "Not yet a KPI").
 - **Signing receipts relayed from remote executors (decision 6, #374).**
   Design-only (`docs/decisions/result-classification.md` decision 6): a
@@ -563,55 +518,21 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
 
 ---
 
-## 7. Journal
+## 7. Journal (removed in #483)
 
-**Purpose.** Persist durable job records and reconcile liveness without racing the
-owner.
-
-**Decisions.**
-
-- **Running before boot (INV-6).** The `Running` record is the first write, so an
-  empty journal proves the backend was never reached; the terminal record always
-  carries the envelope. The non-credentialed path writes that terminal record
-  right after its own redaction pass. The credentialed path (`run_job_with_credential`,
-  #322) defers it instead: the shared core runs without writing one, and only after
-  the refresh thread has joined and the console is re-redacted against every token
-  the run ever had live does the terminal record get written, once — never a first
-  write against the initial token alone, amended afterward.
-- **The one terminal write guards against a concurrent `kill`, not against
-  `reconcile_job`'s own liveness guess.** `write_terminal_record` (both paths)
-  persists through `JournalWriter::persist_if_still_running`: it takes the job
-  flock and re-reads before writing. It skips the write, and returns `false`,
-  only when the current record already carries a REAL envelope — `kill`'s
-  `Cancelled` — never overwriting that result. `reconcile_job`'s `Crashed`
-  carries no envelope: it is a liveness inference ("the box is gone"), and
-  `run_job_core` never updates `box_id` on the `Running` record, so that
-  inference never even reaches the box check and fires on flock-freeness
-  alone for the whole run, not only during finalization. The live owner's own
-  write — proof the inference was wrong — overwrites it rather than losing to
-  a stale guess. When the write is skipped (a real competing result), the
-  caller returns `CoreError::State`, mapped like any other journal fault to
-  `ProcessExit::InfraFault` (band 3, retryable) at the `run_job_with_credential`
-  call site (`main.rs`); it returns no envelope for this path, unlike a normal
-  run. A failed write (I/O error, not this race) is folded into the returned
-  envelope's `warnings` (L-12) as well as logged, on both paths, so the caller
-  never sees an ordinary success with a missing INV-6 record.
-- **Reconcile through the seam (INV-3).** `ls`/`status`/`wait`/`kill`/`gc` reach
-  running state via `reconcile_job` + `VmBackend::boxes` under the job flock, never
-  a direct registry read, so a crashed owner is reconciled to a terminal state.
+The Journal (`$SANDY_HOME/jobs/*.json`, the flock files, `reconcile_job`, the
+`JobRecord` schema) was deleted with the direct execution path in #483. sandyd's
+`JobStore` (sqlite) is the only job record: its row is written `Pending` before
+dispatch (INV-6) and terminal with the envelope, and `sandy ls/status/wait/kill/gc`
+are control-RPC calls to it (the CLI no longer reconciles anything). The history of why the Journal was built is in
+[`../decisions/journal.md`](../decisions/journal.md), now superseded.
 
 **KPI.**
 
-- Integration: `journal` unit tests; `cli_jobs` ops (`ls`/`status`/`wait`/`kill`/`gc`,
-  reconcile of a dead box);
-  `credentialed_run_writes_the_terminal_record_once_after_refresh_redaction`
-  (`supervisor.rs`, via `CountingJournal`: one write, after refresh redaction);
-  `persist_if_still_running_never_overwrites_an_already_terminal_record` (a
-  real `kill` `Cancelled` stands); `persist_if_still_running_overwrites_an_envelope_less_reconcile_crash`
-  (an envelope-less `reconcile_job` `Crashed` loses to the live owner's write);
-  `credentialed_run_refuses_to_report_a_result_the_journal_never_recorded`
-  (a forced skip returns `Err`, not the local result).
-- End-to-end: `live_boot.rs::cli_lifecycle_over_a_real_job` (the ops over a real job).
+- Daemon path: sandyd's `store.rs` tests and `crates/sandy-cli/tests/daemon_verbs.rs`
+  (the verbs over a scripted daemon), `daemon_e2e.rs` (over a real `sandyd`).
+- End-to-end: K3 (`live_boot.rs::cli_lifecycle_over_a_real_job`) was removed in #483,
+  not yet re-proven through the daemon (#858).
 
 ---
 
@@ -631,7 +552,7 @@ owner.
 
 **Decisions** ([`sandyd.md`](../decisions/sandyd.md) decision 26, #587):
 
-- An environment outlives any boot, so its state lives in a `sandyd` SQLite table beside `jobs`, not in the per-job journal. Invariant: INV-6 (nothing launches before a record exists).
+- An environment outlives any boot, so its state lives in a `sandyd` SQLite table beside `jobs`, not in the per-job record. Invariant: INV-6 (nothing launches before a record exists).
 - The store only records state and refuses illegal moves (`Provisioning`, `Ready`, `Stopped`, `Failed`, `Deleted`). A driver turns a move into a VM action. Resume re-enters `Provisioning`, so Ready always means a probe passed.
 - `request_id` lives as long as the row, deleted rows included: a retry returns the same environment, never a new one.
 - A level-triggered `EnvironmentDriver` converges the boxes an `EnvironmentBackend` runs to the rows: launch, probe to `Ready`, fail on a failed probe or a timeout, and kill any box that no live row names. It is also the restart reconciler (decision 28).
@@ -652,11 +573,11 @@ The two tiers are deliberately separate, and a subsystem's KPI names tests from 
 No hypervisor; run on every PR via `nix build .#checks.<sys>.test` and measured by
 the `coverage` check. They prove **wiring and classification**: the pure argv
 assemblers, the staging/collection functions, the egress ruleset generation, the
-credential mint/stage/revoke bracket, and the whole supervisor over `FakeBackend`.
+credential mint/stage/revoke bracket, and sandyd and the executor over `FakeBackend`.
 A live scenario is **never** counted green from a fake (INV-S9), `FakeBackend`
 proves the plumbing, not the boot.
 
-- Location: in-crate `#[cfg(test)]` units, plus `sandy-cli/tests/cli_jobs.rs`,
+- Location: in-crate `#[cfg(test)]` units, plus `sandy-cli/tests/daemon_verbs.rs`,
   `sandy-backend/tests/shares.rs`, `sandy-cli/src/output.rs` tests.
 - Run: `nix develop -c cargo nextest run` (or `nix flake check -L` for the full gate).
 
@@ -666,16 +587,11 @@ A real guest boots. Behind the `live` cargo feature (off by default, so CI and
 `nix flake check` never run them) and refusing off-matrix rather than skip-greening
 (INV-S9). They prove the system **behaves**: the full workflows end to end.
 
-| Test file                                        | Proves (KPI)                                                                                                                                           |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `live_boot.rs`                                   | a real boot collects output; CLI lifecycle; guest-failure fault; secret exported; secret share RO-virtiofs + write denied; git helper serves the token |
-| `live_inputs.rs`                                 | input readable in-guest; write → `EROFS`                                                                                                               |
-| `live_outputs.rs`                                | named + catch-all outputs collected to the host + in `envelope.outputs`                                                                                |
-| `live_e2e.rs`                                    | input + secret + output compose in one run; no secret leak in `logs.tail`                                                                              |
-| `live_cred.rs`                                   | credential via git helper + mid-run refresh + revoke; the "everything" scenario (cred + secret + input + output)                                       |
-| `live_refresh.rs`                                | a rotated token reaches the running guest mid-run                                                                                                      |
-| `live_egress.rs`                                 | real nftables allow-list around a boot (Linux + root)                                                                                                  |
-| `cred_e2e.rs`, `sandy/tests/cred_github_live.rs` | the real GitHub App adapter (operator-gated)                                                                                                           |
+| Test file                                                                          | Proves (KPI)                                                                                    |
+| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `live_boot.rs`, `live_inputs.rs`, `live_outputs.rs`, `live_e2e.rs`, `live_cred.rs` | removed in #483 with the direct path (K1-K10, K14); not yet re-proven through the daemon (#858) |
+| `live_refresh.rs`, `live_egress.rs`                                                | removed in #483; K11 (mid-run refresh) and K13 (nftables NIC allow-list) retired                |
+| `cred_e2e.rs`, `sandy/tests/cred_github_live.rs`                                   | the real GitHub App adapter (operator-gated)                                                    |
 
 Run on a host with a hypervisor, e.g. on Apple silicon:
 
@@ -684,9 +600,7 @@ nix shell nixpkgs#vfkit -c \
   env SANDY_LIVE=1 cargo nextest run -p sandy-cli --features live
 ```
 
-The credential refresh tests additionally need `SANDY_REFRESH_MARGIN_SECS` +
-`SANDY_REFRESH_TICK_SECS` set to force a mid-run refresh (they refuse on defaults,
-INV-S9). The real-App adapter tests need a registered trust root
+The real-App adapter tests need a registered trust root
 (`SANDY_CRED_LIVE_TRUST_ROOT`) and are operator-gated.
 
 ## Test discipline: functional red before green
