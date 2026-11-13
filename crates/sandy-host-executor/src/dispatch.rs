@@ -1829,6 +1829,18 @@ mod tests {
         assert_eq!(hypervisor_for_os("linux"), Hypervisor::Qemu);
     }
 
+    /// The VM runner builds the backend its hypervisor names. Construct-only, so the Linux gate covers the vfkit arm's
+    /// wiring (`vfkit_bin`, `with_agent`) that a run on a Mac would otherwise be the only check of.
+    #[test]
+    fn the_vm_runner_builds_the_backend_its_hypervisor_names() {
+        let agent = || AgentLaunch {
+            program: PathBuf::from("/nonexistent/sandy-agent"),
+            on_link: Arc::new(|_, _, _| {}),
+        };
+        assert!(matches!(VmRunner::new(Hypervisor::Vfkit, agent()), VmRunner::Vfkit(_)));
+        assert!(matches!(VmRunner::new(Hypervisor::Qemu, agent()), VmRunner::Qemu(_)));
+    }
+
     /// A host with no process containment (a Mac, which declares VM only) refuses a process dispatch instead of
     /// running the job uncontained, even for a trusted one.
     #[tokio::test]

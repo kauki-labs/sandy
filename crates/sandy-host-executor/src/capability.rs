@@ -243,7 +243,12 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
     let vm_available = detect_vm_capability();
-    let capabilities = capabilities_for_host(arch, &status, vm_available)?;
+    let capabilities = capabilities_for_host(
+        arch,
+        &status,
+        vm_available,
+        crate::dispatch::hypervisor_for_os(std::env::consts::OS),
+    )?;
     Ok(to_wire_capabilities(
         capabilities,
         &status,
@@ -320,6 +325,7 @@ fn capabilities_for_host(
     arch: Arch,
     status: &ContainmentStatus,
     vm_available: bool,
+    _hypervisor: crate::dispatch::Hypervisor,
 ) -> Result<Capabilities, DetectError> {
     match capabilities_from(arch, status) {
         Err(_) if vm_available => Ok(Capabilities {
@@ -412,6 +418,7 @@ fn unavailable_reason(status: &ContainmentStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::Hypervisor;
 
     #[test]
     fn detect_arch_matches_the_running_processs_own_target() -> anyhow::Result<()> {
@@ -517,18 +524,14 @@ mod tests {
         );
     }
 
-    /// Adversarial: a host with no usable containment and no VM declares no
-    /// isolation class at all — never a hardcoded `[Trusted]` for a host that
-    /// can't actually honor it. With a VM it declares both, through the VM kind
-    /// alone (#483): a Mac has no process containment but runs VMs.
+    /// Adversarial: a host with no usable containment declares no isolation
+    /// class at all — never a hardcoded `[Trusted]` for a host that can't
+    /// actually honor it — even when `vm_available` is true (no reaping
+    /// means no backend can run anything at all).
     #[test]
-    fn an_unavailable_containment_declares_no_isolation_class_unless_a_vm_can_run() {
+    fn an_unavailable_containment_declares_no_isolation_class() {
         let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
-        assert_eq!(detected_isolation_classes(&status, false), Vec::<IsolationClass>::new());
-        assert_eq!(
-            detected_isolation_classes(&status, true),
-            vec![IsolationClass::Trusted, IsolationClass::Untrusted]
-        );
+        assert_eq!(detected_isolation_classes(&status, true), Vec::<IsolationClass>::new());
     }
 
     /// The load-bearing property for #284: the wire `Capabilities` Register
@@ -813,7 +816,7 @@ mod tests {
     /// could only run uncontained. With no VM either it still declares nothing, and names the containment reason.
     #[test]
     fn a_host_with_no_process_containment_declares_vm_only_when_a_vm_can_run() -> anyhow::Result<()> {
-        let capabilities = capabilities_for_host(Arch::Aarch64, &unsupported(), true)?;
+        let capabilities = capabilities_for_host(Arch::Aarch64, &unsupported(), true, Hypervisor::Vfkit)?;
         assert_eq!(capabilities.kind, SandboxKind::Vm);
         let wire = to_wire_capabilities(capabilities, &unsupported(), true, false, false, false);
         assert_eq!(
@@ -826,9 +829,23 @@ mod tests {
             vec![i32::from(IsolationClass::Trusted), i32::from(IsolationClass::Untrusted)],
             "a VM honours both classes"
         );
-        let err = capabilities_for_host(Arch::Aarch64, &unsupported(), false).expect_err("neither backend can run");
+        let err = capabilities_for_host(Arch::Aarch64, &unsupported(), false, Hypervisor::Vfkit)
+            .expect_err("neither backend can run");
         assert!(matches!(err, DetectError::ContainmentUnavailable(_)), "{err:?}");
         Ok(())
+    }
+
+    /// A Linux host (qemu) with no process containment still refuses to start, even with a working VM: reaping gates a
+    /// Linux host, and only a vfkit host (a Mac, which has no process containment at all) declares VM alone.
+    #[test]
+    fn a_qemu_host_without_process_containment_still_refuses_to_start() {
+        let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
+        let err = capabilities_for_host(Arch::X86_64, &status, true, Hypervisor::Qemu)
+            .expect_err("a Linux host needs its containment");
+        assert_eq!(
+            err,
+            DetectError::ContainmentUnavailable("no user systemd instance".to_owned())
+        );
     }
 
     /// A host with process containment keeps its declaration whatever its VM state: `Process`, plus `Vm` when a VM can
@@ -840,7 +857,7 @@ mod tests {
         };
         for vm in [false, true] {
             assert_eq!(
-                capabilities_for_host(Arch::X86_64, &status, vm)?.kind,
+                capabilities_for_host(Arch::X86_64, &status, vm, Hypervisor::Qemu)?.kind,
                 SandboxKind::Process
             );
         }
