@@ -2173,8 +2173,7 @@ declares `transfer`; it moves its data over the link as slices 5 to 6c describe.
   publishes to the slot, which stops the send). A stalled reader ends it at the read timeout (120 s). A read that
   stalls inside the blocking call keeps its thread until the call returns. A dead link, a write timeout and a read
   timeout end the send without a `TransferError`; a reader failure sends one.
-- **Names.** A backslash in a name is accepted: it is an ordinary byte on unix, and the staging root keeps the
-  component below it.
+- **Names.** A backslash in a name is accepted: it is an ordinary byte on unix, not a separator.
 - **Stale staging roots.** At start the executor removes the `sandy-<kind>-<pid>-*` directories under its temp dir
   whose process is gone and which it owns, so a killed executor does not leave a transfer behind. It sweeps one temp
   dir: roots under a `TMPDIR` the executor no longer uses stay, and a pid reused in another pid namespace reads as
