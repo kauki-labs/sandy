@@ -784,6 +784,7 @@ pub async fn handle(
                                 .collect(),
                         });
                         let dispatch = Dispatch {
+                            digests: false,
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
                             manifest_encoding: encoding.clone(),
@@ -1442,6 +1443,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest,
                 manifest_encoding: MANIFEST_ENCODING_JSON.to_owned(),
                 submitter_caps: submitter_caps
@@ -1509,6 +1511,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -2771,6 +2774,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"opaque".to_vec(),
                 manifest_encoding: "application/octet-stream".to_owned(),
                 submitter_caps: vec![encode_cap(&submitter_cap)?],
@@ -2822,6 +2826,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: oversized,
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -2870,6 +2875,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: at_cap,
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -2896,6 +2902,7 @@ mod tests {
 
     fn trusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -2971,6 +2978,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -3306,6 +3314,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -3922,6 +3931,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let untrusted_only = sandy_executor_proto::Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -4146,6 +4156,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest,
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -4162,6 +4173,7 @@ mod tests {
 
     fn vm_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -4448,6 +4460,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: flake_manifest_bytes(None),
                 manifest_encoding: "flake/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -4466,6 +4479,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -4484,6 +4498,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -4500,6 +4515,7 @@ mod tests {
 
     fn vm_untrusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -4694,6 +4710,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: serde_json::to_vec(argv).expect("encode argv manifest"),
                 manifest_encoding: "argv/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -4819,6 +4836,7 @@ mod tests {
             &sandy_executor_proto::HostExecutorMessage {
                 op: Some(sandy_executor_proto::host_executor_message::Op::Result(
                     sandy_executor_proto::JobResult {
+                        digests: None,
                         job_id: job_id.clone(),
                         booted: true,
                         exit_code: Some(0),

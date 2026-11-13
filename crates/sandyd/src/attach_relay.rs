@@ -1597,6 +1597,7 @@ mod tests {
 
     fn host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![sandy_executor_proto::SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,

@@ -473,6 +473,7 @@ mod tests {
 
     fn capabilities(shares_submitter_filesystem: bool) -> Capabilities {
         Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -562,6 +563,7 @@ mod tests {
         ControlRequest {
             request_id: 1,
             op: Some(control_request::Op::Submit(SubmitRequest {
+                digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
                 submitter_caps: Vec::new(),
@@ -738,6 +740,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -792,6 +795,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -850,6 +854,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -895,6 +900,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: None,
@@ -947,6 +953,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: None,
@@ -1048,6 +1055,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -1332,6 +1340,7 @@ mod tests {
             &mut other,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -1373,6 +1382,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),
@@ -1442,6 +1452,7 @@ mod tests {
             &mut client,
             &HostExecutorMessage {
                 op: Some(host_executor_message::Op::Result(JobResult {
+                    digests: None,
                     job_id: submitted.job_id.clone(),
                     booted: true,
                     exit_code: Some(0),

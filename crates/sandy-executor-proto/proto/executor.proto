@@ -62,6 +62,39 @@ message JobResult {
   // egress policy. Absent means the executor reported nothing (no policy, a sender that predates the field, or a run
   // that ended before it could say), and the orchestrator must treat that as unenforced, never as applied.
   optional EgressReport egress = 8;
+  // The digests of the run's inputs and outputs, present only when the dispatch asked for them and the run produced
+  // them. Entries are bounded by the receiver; the executor's own digests are host facts about the staged copies, and
+  // the output digests are of what a possibly hostile guest wrote.
+  optional RunDigests digests = 9;
+}
+
+// The content digests of one run (#373), mirroring `sandy_api::backend::RunDigests`.
+message RunDigests {
+  ContentDigests inputs = 1;
+  ContentDigests outputs = 2;
+}
+
+message ContentDigests {
+  repeated FileDigest files = 1;
+  repeated SkippedEntry skipped = 2;
+}
+
+// Lowercase-hex sha256 of one regular file, at its logical path (`<name>/<relpath>`, or `<relpath>` for a catch-all).
+message FileDigest {
+  string path = 1;
+  string sha256 = 2;
+}
+
+// An entry the run saw but did not digest (a symlink, or neither a regular file nor a directory).
+message SkippedEntry {
+  string path = 1;
+  SkipReason reason = 2;
+}
+
+enum SkipReason {
+  SKIP_REASON_UNSPECIFIED = 0;
+  SKIP_REASON_SYMLINK = 1;
+  SKIP_REASON_NON_REGULAR = 2;
 }
 
 // The state of a job's egress boundary, mirroring `sandy::EgressOutcome` and the apply failure the direct path
@@ -166,6 +199,10 @@ message Capabilities {
   // policy only on a host that declared this. Never auto-detected. Wire only
   // for now: nothing declares or reads it yet.
   bool egress_proxy = 7;
+  // Whether this host-executor hashes a job's staged inputs and collected outputs when a `Dispatch` asks for it
+  // (`Dispatch.digests`, A2c of #483). A host that predates this field decodes false, and an executor drops an unknown
+  // field silently, so the orchestrator places a job that wants digests only on a host that declared this.
+  bool digests = 8;
 }
 
 // Declares this host's identity and what it can run.
@@ -248,6 +285,9 @@ message Dispatch {
   // executor refuses a policy on a path that cannot enforce it. Wire only for now:
   // nothing sets or reads it yet.
   EgressPolicy egress = 12;
+  // Hash each staged input before the boot and each collected output (`sandy run --digests`, #373) and report them in
+  // `JobResult.digests`. False records nothing. The orchestrator sets it only for a host that declared `digests`.
+  bool digests = 13;
 }
 
 // A job's egress allow-list: the only destinations the guest may reach.

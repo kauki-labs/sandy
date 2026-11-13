@@ -267,6 +267,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         IsolationClass::Untrusted => WireClass::Untrusted,
     };
     let submit = SubmitRequest {
+        digests: false,
         manifest,
         manifest_encoding: body.manifest_encoding,
         submitter_caps: Vec::new(),

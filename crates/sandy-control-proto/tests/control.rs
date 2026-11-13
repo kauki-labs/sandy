@@ -18,6 +18,7 @@ use sandy_control_proto::{
 /// the envelope's own fields (`request_id`) intact.
 #[rstest]
 #[case(control_request::Op::Submit(SubmitRequest {
+    digests: false,
     manifest: b"manifest-bytes".to_vec(),
     manifest_encoding: "sandy.orchestrator.v1.JobManifest".to_owned(),
     submitter_caps: vec![b"cap-a".to_vec(), b"cap-b".to_vec()],

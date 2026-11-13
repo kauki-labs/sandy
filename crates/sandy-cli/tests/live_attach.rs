@@ -154,6 +154,7 @@ fn spawn_orchestrator(tmp: &std::path::Path, allowlist: &str) -> anyhow::Result<
 
 fn trusted_process_capabilities() -> Capabilities {
     Capabilities {
+        digests: false,
         supported_sandbox_kinds: vec![SandboxKind::Process.into()],
         arch: Arch::X8664.into(),
         attestation: false,
@@ -179,6 +180,7 @@ async fn submit(
         conn,
         request_id,
         control_request::Op::Submit(SubmitRequest {
+            digests: false,
             manifest,
             manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),

@@ -159,6 +159,8 @@ fn to_wire_capabilities(
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
+        // Wire only for now: nothing hashes yet.
+        digests: false,
         supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),

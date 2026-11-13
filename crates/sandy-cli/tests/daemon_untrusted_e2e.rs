@@ -191,6 +191,7 @@ async fn register_host(
             op: Some(host_executor_message::Op::Register(Register {
                 host_id: host_id.to_owned(),
                 capabilities: Some(Capabilities {
+                    digests: false,
                     supported_sandbox_kinds: vec![kind.into()],
                     arch: Arch::X8664.into(),
                     attestation: false,
