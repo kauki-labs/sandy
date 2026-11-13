@@ -520,6 +520,7 @@ async fn record_job_result(
         booted: result.booted,
         timed_out: result.timed_out,
         transport_error: result.transport_error.clone(),
+        egress: crate::envelope::egress_from_report(result.egress.as_ref()),
     };
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
@@ -669,17 +670,30 @@ async fn finish_job(
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
     let facts = facts.clone();
-    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
+    let (host_id, allow) = job_registry
+        .get(job_id)
+        .map_or((None, None), |job| (job.host_id.clone(), job.egress_allow.clone()));
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
         let console = crate::envelope::tail(&console, crate::envelope::MAX_CONSOLE_BYTES).to_owned();
         // The envelope carries the same redacted console, and its message (the executor's own words) is redacted
         // the same way, so neither holds the token.
-        let mut envelope =
-            crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        let mut envelope = crate::envelope::from_run(
+            &jid,
+            &facts,
+            exit_code,
+            outputs,
+            console.clone(),
+            host_id.as_deref(),
+            allow.as_ref(),
+        );
         let message = redact_console(credentials.as_deref(), &jid, envelope.message);
         envelope.message = crate::envelope::tail(&message, crate::envelope::MAX_MESSAGE_BYTES).to_owned();
+        // The executor's egress reason is its own words too: redacted whole, then cut.
+        crate::envelope::bound_egress_reason(&mut envelope, |reason| {
+            redact_console(credentials.as_deref(), &jid, reason)
+        });
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;
@@ -1048,6 +1062,7 @@ mod tests {
             transport_error: None,
             console: String::new(),
             outputs_follow: false,
+            egress: None,
         };
         record_job_result(&store, &job_registry, &mut in_flight, &mut HashSet::new(), result).await;
         assert_eq!(store.status("job-1")?, Some(JobStatus::Succeeded));
@@ -1953,6 +1968,7 @@ mod tests {
             transport_error: None,
             console: String::new(),
             outputs_follow,
+            egress: None,
         }
     }
 
@@ -2120,6 +2136,7 @@ mod tests {
                 transport_error: transport_error.map(str::to_owned),
                 console: "hi\n".to_owned(),
                 outputs_follow: false,
+                egress: None,
             };
             record_job_result(
                 &store,
@@ -2242,6 +2259,206 @@ mod tests {
             sandy_executor_proto::Message::encoded_len(&reply) < sandy_control_proto::MAX_FRAME_LEN as usize,
             "the Status reply must fit one frame"
         );
+        Ok(())
+    }
+
+    /// The allow-list a test job was dispatched with.
+    fn allow() -> sandy::AllowList {
+        sandy::AllowList {
+            rules: vec![sandy::EgressRule {
+                host: "example.com".to_owned(),
+                port: 443,
+            }],
+        }
+    }
+
+    /// The egress receipt of the envelope the daemon records for a job dispatched with `allow()` whose executor sent
+    /// `report`.
+    async fn egress_receipt_for(
+        report: Option<sandy_executor_proto::EgressReport>,
+    ) -> anyhow::Result<sandy::EgressReceipt> {
+        egress_receipt_dispatched_with(report, Some(allow())).await
+    }
+
+    /// [`egress_receipt_for`] for a job dispatched with `allow` (`None` for a job with no policy).
+    async fn egress_receipt_dispatched_with(
+        report: Option<sandy_executor_proto::EgressReport>,
+        allow: Option<sandy::AllowList>,
+    ) -> anyhow::Result<sandy::EgressReceipt> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.egress_allow = allow;
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                egress: report,
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let envelope = store.envelope("job-1")?.context("a terminal job carries an envelope")?;
+        Ok(envelope
+            .receipt
+            .context("the envelope carries the audit receipt")?
+            .host_observed
+            .egress)
+    }
+
+    /// A2b (#483): the envelope's egress receipt reads the executor's report: proxied is enforced with the allow-list
+    /// the job was dispatched with; unenforced and failed carry their reason and no allow-list; no report, or an
+    /// unspecified one, is unenforced and says the executor reported nothing. Never applied without a report.
+    #[tokio::test]
+    async fn the_egress_receipt_reads_the_executors_report() -> anyhow::Result<()> {
+        use sandy::EgressEnforcement::{Enforced, Unenforced};
+        use sandy_executor_proto::{EgressReport, EgressState};
+        let report = |state: EgressState, reason: Option<&str>| {
+            Some(EgressReport {
+                state: state.into(),
+                reason: reason.map(str::to_owned),
+            })
+        };
+        let rows = vec![
+            ("proxied", report(EgressState::Proxied, None), Enforced, None, true),
+            (
+                "unenforced",
+                report(EgressState::Unenforced, Some("macOS has no boundary")),
+                Unenforced,
+                Some("macOS has no boundary"),
+                false,
+            ),
+            (
+                "failed",
+                report(EgressState::Failed, Some("proxy refused")),
+                Unenforced,
+                Some("proxy refused"),
+                false,
+            ),
+            ("no report", None, Unenforced, Some("did not report"), false),
+            (
+                "unspecified",
+                report(EgressState::Unspecified, None),
+                Unenforced,
+                Some("did not report"),
+                false,
+            ),
+        ];
+        for (name, sent, status, reason, applied) in rows {
+            let receipt = egress_receipt_for(sent).await?;
+            assert_eq!(receipt.status, status, "{name}: status");
+            if let Some(reason) = reason {
+                assert!(
+                    receipt.reason.as_deref().is_some_and(|r| r.contains(reason)),
+                    "{name}: reason {:?}",
+                    receipt.reason
+                );
+            }
+            assert_eq!(receipt.allow_list, applied.then(allow), "{name}: allow-list");
+        }
+        Ok(())
+    }
+
+    /// A2b (#483, sandy-5e F2 on #835): a report for a job dispatched with no policy is ignored. `PROXIED` would
+    /// otherwise read as `Enforced` with an empty allow-list for a job that never asked for a boundary.
+    #[tokio::test]
+    async fn an_egress_report_for_a_job_without_a_policy_is_ignored() -> anyhow::Result<()> {
+        let report = sandy_executor_proto::EgressReport {
+            state: sandy_executor_proto::EgressState::Proxied.into(),
+            reason: None,
+        };
+        let receipt = egress_receipt_dispatched_with(Some(report), None).await?;
+        assert_eq!(receipt.status, sandy::EgressEnforcement::Unenforced);
+        assert_eq!(receipt.allow_list, None);
+        Ok(())
+    }
+
+    /// A2b (#483, sandy-5e F1 on #835): the executor's egress reason can be as large as its frame, so it is cut like
+    /// the message is: a huge one leaves a `Status` reply that fits one frame.
+    #[tokio::test]
+    async fn a_huge_egress_reason_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.egress_allow = Some(allow());
+        job_registry.insert("job-1".to_owned(), job);
+        let report = sandy_executor_proto::EgressReport {
+            state: sandy_executor_proto::EgressState::Failed.into(),
+            reason: Some("\u{1}".repeat(900 * 1024)),
+        };
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                egress: Some(report),
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        assert!(
+            envelope.len() < sandy_control_proto::MAX_FRAME_LEN as usize / 2,
+            "the stored envelope is {} bytes",
+            envelope.len()
+        );
+        Ok(())
+    }
+
+    /// A2b (#483): parity with the direct path. The same run, through the executor's report and the daemon's receipt,
+    /// gives exactly the egress receipt the direct supervisor builds from `proxy_receipt_result`: one row per way a
+    /// proxy-mode run can end.
+    #[tokio::test]
+    async fn the_daemons_egress_receipt_equals_the_direct_paths() -> anyhow::Result<()> {
+        use sandy_api::backend::{BackendError, Outcome};
+        let outcome = |booted: bool| Outcome {
+            booted,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        };
+        let runs: Vec<(&str, Result<Outcome, BackendError>)> = vec![
+            ("booted guest", Ok(outcome(true))),
+            ("guest never booted", Ok(outcome(false))),
+            (
+                "refused before boot",
+                Err(BackendError::Spawn("no proxy binary".to_owned())),
+            ),
+            (
+                "proxy dead before boot",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: false,
+                    guest_exit: None,
+                }),
+            ),
+            (
+                "proxy dead after boot",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: true,
+                    guest_exit: None,
+                }),
+            ),
+        ];
+        for (name, run) in runs {
+            let direct = sandy::build_egress_receipt(&sandy::proxy_receipt_result(&run), &allow());
+            let reported = sandy_host_executor::dispatch::egress_report(&run);
+            let daemon = egress_receipt_for(Some(reported)).await?;
+            assert_eq!(daemon, direct, "{name}");
+        }
         Ok(())
     }
 

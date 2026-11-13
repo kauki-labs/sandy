@@ -765,6 +765,19 @@ pub async fn handle(
                         };
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
+                        // What the job's egress boundary is asked to enforce, for the envelope's receipt (A2b).
+                        job_channel.egress_allow = dispatch_egress.as_ref().map(|policy| sandy::AllowList {
+                            rules: policy
+                                .rules
+                                .iter()
+                                .filter_map(|rule| {
+                                    Some(sandy::EgressRule {
+                                        host: rule.host.clone(),
+                                        port: u16::try_from(rule.port).ok()?,
+                                    })
+                                })
+                                .collect(),
+                        });
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
@@ -2029,6 +2042,7 @@ mod tests {
                 data_link: None,
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
+                egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
@@ -2092,6 +2106,7 @@ mod tests {
                 data_link: None,
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
+                egress_allow: None,
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
@@ -3401,6 +3416,33 @@ mod tests {
                     .collect(),
             });
             assert_eq!(dispatch.egress, want, "{name}");
+        }
+        Ok(())
+    }
+
+    /// A2b (#483): the job's channel records the allow-list it was dispatched with, for the envelope's egress receipt,
+    /// and a job with no policy records none.
+    #[tokio::test]
+    async fn a_placed_job_records_the_allow_list_it_was_dispatched_with() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        for (egress, want) in [
+            (None, None),
+            (Some(Vec::new()), Some(Vec::new())),
+            (
+                Some(vec![("example.com", 443u32), ("10.0.0.5", 8080)]),
+                Some(vec![("example.com", 443u16), ("10.0.0.5", 8080)]),
+            ),
+        ] {
+            let request = submit_req_with_egress(1, egress.as_deref());
+            let (_dispatch, job, _registry) = place_and_read(request, egress_host(true), peer_ip).await?;
+            let got = job.egress_allow.as_ref().map(|allow| {
+                allow
+                    .rules
+                    .iter()
+                    .map(|r| (r.host.as_str(), r.port))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(got, want, "{egress:?}");
         }
         Ok(())
     }
@@ -4744,6 +4786,7 @@ mod tests {
                         transport_error: None,
                         console: "hi\n".to_owned(),
                         outputs_follow: false,
+                        egress: None,
                     },
                 )),
             },

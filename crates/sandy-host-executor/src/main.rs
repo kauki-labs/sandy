@@ -16,7 +16,7 @@ use sandy_host_executor::{
     client_config::{ExecutorConfig, parse_executor_config},
     dispatch::{Dispatched, handle_dispatch},
     run::{
-        DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, failure_result_message, outcome_result_message_with_outputs,
+        DispatchLoopExit, REGISTER_RESPONSE_TIMEOUT, failure_result_message, outcome_result_message_with_egress,
         register, run_dispatch_loop,
     },
 };
@@ -128,6 +128,7 @@ async fn main() {
                     Ok(Ok(Dispatched {
                         outcome,
                         outputs_follow,
+                        egress,
                     })) => {
                         tracing::info!(
                             job_id,
@@ -138,7 +139,7 @@ async fn main() {
                             outputs_follow,
                             "dispatch finished"
                         );
-                        outcome_result_message_with_outputs(job_id, outcome, outputs_follow)
+                        outcome_result_message_with_egress(job_id, outcome, outputs_follow, egress)
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(job_id, error = %e, "dispatch refused or failed");

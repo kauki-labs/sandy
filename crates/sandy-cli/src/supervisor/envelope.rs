@@ -6,8 +6,8 @@
 use std::time::SystemTime;
 
 use sandy::{
-    AllowList, EgressEnforcement, EgressOs, EgressOutcome, EgressReceipt, HostObserved, Location, NetworkMode,
-    SandboxKind, Timing, What, Who,
+    AllowList, EgressOs, EgressOutcome, HostObserved, Location, NetworkMode, SandboxKind, Timing, What, Who,
+    build_egress_receipt,
 };
 use zeroize::Zeroizing;
 
@@ -52,41 +52,6 @@ fn backend_kind_name(kind: SandboxKind, os: EgressOs) -> &'static str {
         (SandboxKind::Process, _) => "process",
         (SandboxKind::Vm, EgressOs::Linux) => "qemu",
         (SandboxKind::Vm, EgressOs::MacOs) => "vfkit",
-    }
-}
-
-/// Build the egress half of the receipt (#361) from the same [`EgressOutcome`]
-/// (or apply failure) that already drove `run_job`'s enforce/revert bracket —
-/// the one platform-keyed signal, not a second copy of the logic (shared with
-/// #358's warning).
-fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &AllowList) -> EgressReceipt {
-    match result {
-        Ok(EgressOutcome::Enforced) => EgressReceipt {
-            status: EgressEnforcement::Enforced,
-            reason: None,
-            allow_list: Some(allow.clone()),
-            attempts: vec![],
-        },
-        // The proxy is the boundary and it enforces `allow`; a backend that cannot run it refuses before boot.
-        Ok(EgressOutcome::Proxied) => EgressReceipt {
-            status: EgressEnforcement::Enforced,
-            reason: None,
-            allow_list: Some(allow.clone()),
-            attempts: vec![],
-        },
-        Ok(EgressOutcome::Unenforced { reason }) => EgressReceipt {
-            status: EgressEnforcement::Unenforced,
-            reason: Some(reason.clone()),
-            // Nothing was applied: never label an allow-list "applied" when it wasn't.
-            allow_list: None,
-            attempts: vec![],
-        },
-        Err(apply_error) => EgressReceipt {
-            status: EgressEnforcement::Unenforced,
-            reason: Some(format!("egress boundary not established: {apply_error}")),
-            allow_list: None,
-            attempts: vec![],
-        },
     }
 }
 

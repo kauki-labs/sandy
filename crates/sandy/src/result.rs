@@ -8,7 +8,10 @@
 
 pub use sandy_api::result::*;
 
-use crate::backend::{BackendError, Outcome, PlanError};
+use crate::{
+    backend::{BackendError, Outcome, PlanError},
+    egress::{AllowList, EgressOutcome},
+};
 
 /// Clean guest success (band 0).
 const fn succeeded() -> Classification {
@@ -132,6 +135,61 @@ pub fn build_envelope(
         // envelope is built (L-12); every other path leaves it empty.
         warnings: vec![],
         receipt,
+    }
+}
+
+/// Build the egress half of the receipt (#361) from the same [`EgressOutcome`]
+/// (or apply failure) that already drove `run_job`'s enforce/revert bracket —
+/// the one platform-keyed signal, not a second copy of the logic (shared with
+/// #358's warning).
+#[must_use]
+pub fn build_egress_receipt(result: &Result<EgressOutcome, String>, allow: &AllowList) -> EgressReceipt {
+    match result {
+        Ok(EgressOutcome::Enforced) => EgressReceipt {
+            status: EgressEnforcement::Enforced,
+            reason: None,
+            allow_list: Some(allow.clone()),
+            attempts: vec![],
+        },
+        // The proxy is the boundary and it enforces `allow`; a backend that cannot run it refuses before boot.
+        Ok(EgressOutcome::Proxied) => EgressReceipt {
+            status: EgressEnforcement::Enforced,
+            reason: None,
+            allow_list: Some(allow.clone()),
+            attempts: vec![],
+        },
+        Ok(EgressOutcome::Unenforced { reason }) => EgressReceipt {
+            status: EgressEnforcement::Unenforced,
+            reason: Some(reason.clone()),
+            // Nothing was applied: never label an allow-list "applied" when it wasn't.
+            allow_list: None,
+            attempts: vec![],
+        },
+        Err(apply_error) => EgressReceipt {
+            status: EgressEnforcement::Unenforced,
+            reason: Some(format!("egress boundary not established: {apply_error}")),
+            allow_list: None,
+            attempts: vec![],
+        },
+    }
+}
+
+/// The receipt's egress outcome for a proxy-mode run, read from what the backend did.
+///
+/// The host applies nothing in proxy mode: the backend starts the proxy and boots the
+/// guest behind it, so "enforced" is true only once a guest ran. `Spawn` means the
+/// backend refused the policy or could not start the proxy, before any boot. A guest that never
+/// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
+/// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
+/// A proxy found dead before the guest booted (`booted: false`) counts as a guest that never booted.
+pub fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
+    match run {
+        Err(BackendError::Spawn(why)) => Err(why.clone()),
+        Err(BackendError::EgressProxyDied { booted: false, .. }) => {
+            Err("the egress proxy died before the guest booted, so it served no run".to_string())
+        }
+        Ok(outcome) if !outcome.booted => Err("the guest never booted, so the egress proxy served no run".to_string()),
+        _ => Ok(EgressOutcome::Proxied),
     }
 }
 
