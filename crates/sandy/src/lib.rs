@@ -11,10 +11,9 @@
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
-//! - **Egress** — [`to_nftables`] (host OUTPUT model) and the guest-scoped [`to_nftables_forward`] translation plus
-//!   [`macos_egress_statement`]; [`plan_egress`] / [`plan_egress_scoped`] into a typed [`EgressPlan`] (Linux enforces —
-//!   the tap-scoped forward ruleset when a tap is bound — macOS is honestly unenforced), driven by [`enforce`] over the
-//!   [`EgressApplier`] seam (host-tier [`NftablesApplier`]; a `FakeApplier` double lives in `sandy-test-support`).
+//! - **Egress** — [`to_nftables`] (host OUTPUT model) translation plus [`macos_egress_statement`]; [`plan_egress`] into
+//!   a typed [`EgressPlan`] (Linux enforces, macOS is honestly unenforced), driven by [`enforce`] over the
+//!   [`EgressApplier`] seam (a `FakeApplier` double lives in `sandy-test-support`).
 //! - **Nix topology** — a typed [`Topology`] read from a guest flake attr via [`topology`] / [`parse_topology`]
 //!   (INV-TOPOLOGY).
 //! - **Credentials** — the provider-agnostic [`CredentialProvider`] seam (a `FakeProvider` double lives in
@@ -67,9 +66,8 @@ pub use cred_bracket::{CredentialBracket, SharedProvider, StagingTarget, TokenRe
 pub use cred_github::{CALL_DEADLINE, GithubAdapter, resolve_adapter, resolve_provider};
 pub use discovery::{Discovery, Placement, StaticRegistry, parse_builder_systems};
 pub use egress::{
-    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,
-    NftablesApplier, enforce, is_valid_tap_name, macos_egress_statement, plan_egress, plan_egress_scoped, to_nftables,
-    to_nftables_forward, validate_egress_hosts, validate_network_mode, validate_proxy_egress,
+    AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, enforce,
+    macos_egress_statement, plan_egress, to_nftables, validate_egress_hosts,
 };
 pub use fs_type::{detect_fs_type, is_networked_fs};
 pub use gc::{StagedImage, plan_eviction};

@@ -221,7 +221,7 @@ pub fn mac_prereq_result(verdict: MacPrereq) -> Option<DoctorResult> {
 /// guest on macOS, rather than re-probing `/etc/nix/machines` itself.
 ///
 /// The machines-file path honors `SANDY_NIX_MACHINES_FILE` (same override style
-/// as `SANDY_VFKIT_BIN`/`SANDY_TAP`), falling back to the real `/etc/nix/machines`.
+/// as `SANDY_VFKIT_BIN`), falling back to the real `/etc/nix/machines`.
 /// Together with the already-real `PATH` read in `nix_on_path`, this lets the
 /// `sandy doctor` binary-level integration test (`tests/doctor.rs`) inject both
 /// host facts into the child process it spawns, instead of depending on the

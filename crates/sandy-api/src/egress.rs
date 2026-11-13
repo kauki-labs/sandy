@@ -1,9 +1,8 @@
 //! The egress seam: the applier contract, its OS-resolved plan/outcome types, the
 //! allow-list it is computed from, and the narrow error it returns.
 //!
-//! The translation (`to_nftables`), the planners (`plan_egress`), the appliers
-//! (`NftablesApplier`, the fake), and the `enforce` driver live in the core; this
-//! crate carries only the contract.
+//! The translation (`to_nftables`), the planner (`plan_egress`), the fake applier and the `enforce` driver live in
+//! the core; this crate carries only the contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,76 +20,6 @@ pub struct EgressRule {
 pub struct AllowList {
     /// The permitted destinations; everything else is denied.
     pub rules: Vec<EgressRule>,
-}
-
-/// The guest network profile (#602): whether the guest boots with a NIC.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NetworkMode {
-    /// No NIC: the guest reaches the host only over virtio-fs and vsock (#360). The default.
-    #[default]
-    None,
-    /// A NIC, for sandboxes that need a routable guest. On Linux it needs a bound tap, and the caller applies the
-    /// nftables boundary on it; it never shares a run with the egress proxy. On macOS it is the trusted-only NAT
-    /// NIC with no boundary (#603).
-    Nic,
-}
-
-/// The environment variable that selects the guest network profile (#602), read by each VM backend
-/// like `$SANDY_TAP`. Unset or empty means [`NetworkMode::None`].
-pub const NETWORK_ENV: &str = "SANDY_NETWORK";
-
-impl NetworkMode {
-    /// Parse a [`NETWORK_ENV`] value. An unknown value is an error, so a typo can never fall back
-    /// silently to a different profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejected value when it is neither `none` nor `nic`.
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "" | "none" => Ok(Self::None),
-            "nic" => Ok(Self::Nic),
-            other => Err(format!("{NETWORK_ENV}={other:?} is not a network profile (none|nic)")),
-        }
-    }
-
-    /// Read [`NETWORK_ENV`]: unset is [`NetworkMode::None`]; a value that is not UTF-8 or not a
-    /// profile is an error, never a silent default.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason when the variable holds a non-UTF-8 or unknown value.
-    pub fn from_env() -> Result<Self, String> {
-        Self::from_var(std::env::var(NETWORK_ENV))
-    }
-
-    /// [`Self::from_env`] over an already-read variable, so the non-UTF-8 case is unit-testable.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason when the variable holds a non-UTF-8 or unknown value.
-    pub fn from_var(var: Result<String, std::env::VarError>) -> Result<Self, String> {
-        match var {
-            Ok(value) => Self::parse(&value),
-            Err(std::env::VarError::NotPresent) => Ok(Self::None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(format!("{NETWORK_ENV} is not valid UTF-8")),
-        }
-    }
-}
-
-/// Whether `tap` is a safe guest tap interface name (#602): 1 to 15 bytes (the Linux `IFNAMSIZ` limit) of ASCII
-/// letters, digits, `_`, `-` and `.`. It is interpolated into the qemu `-netdev` argument and the nftables ruleset, so
-/// a `,` or a space would let a value like `sandytap0,vhost=on` split the argument or open the ruleset.
-#[must_use]
-pub fn is_valid_tap_name(tap: &str) -> bool {
-    !tap.is_empty()
-        && tap.len() <= 15
-        && tap != "."
-        && tap != ".."
-        && tap
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 /// The target OS an egress plan is computed for — injected so the core's
@@ -176,28 +105,4 @@ pub trait EgressApplier {
     /// # Errors
     /// Returns [`EgressError`] if the teardown fails.
     fn revert(&self) -> Result<(), EgressError>;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// #602: the profile defaults to no NIC and a typo is refused, not defaulted.
-    #[test]
-    fn network_mode_parses_none_nic_and_refuses_a_typo() {
-        assert_eq!(NetworkMode::parse(""), Ok(NetworkMode::None));
-        assert_eq!(NetworkMode::parse("none"), Ok(NetworkMode::None));
-        assert_eq!(NetworkMode::parse("nic"), Ok(NetworkMode::Nic));
-        assert!(NetworkMode::parse("NIC").is_err());
-        assert_eq!(NetworkMode::default(), NetworkMode::None);
-    }
-
-    /// #602: an unset variable is `none`, a non-UTF-8 one is refused rather than defaulted.
-    #[test]
-    fn network_mode_from_var_refuses_non_utf8() {
-        use std::{env::VarError, ffi::OsString};
-        assert_eq!(NetworkMode::from_var(Err(VarError::NotPresent)), Ok(NetworkMode::None));
-        assert!(NetworkMode::from_var(Err(VarError::NotUnicode(OsString::new()))).is_err());
-        assert_eq!(NetworkMode::from_var(Ok("nic".to_string())), Ok(NetworkMode::Nic));
-    }
 }

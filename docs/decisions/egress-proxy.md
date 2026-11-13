@@ -381,39 +381,25 @@ It gets no proxy.
 **Consequences.** The egress allow-list does not apply to process-backend
 runs, which is stated, not silent.
 
-## 7. Opt-in NIC profile (#602)
+## 7. The guest NIC profile is removed (#483)
 
-The default guest has no NIC. A sandbox that needs a routable guest sets `SANDY_NETWORK=nic` (`NetworkMode::Nic`);
-an unknown or non-UTF-8 value is refused. Sandboxes that do not set it are unchanged.
+**Status:** accepted (owner ruling on #483, 2026-11-13). It replaces the opt-in NIC profile of #602 and #603.
 
-- **qemu (Linux):** `nic` is the existing tap + nftables path (#29): the operator binds a tap (`SANDY_TAP`), the guest
-  NIC attaches to it, and `sandy run` applies the guest-scoped forward ruleset around the boot. The proxy is not
-  involved: a `nic` guest and the proxy guest are exclusive. The user-mode NIC was tried and dropped: with
-  `restrict=on` it has no path in either direction, so it only added a dead interface.
-- **Plan-time refusals (band 2, no journal record, no boot):** `nic` without a tap, a tap without `nic`, and `nic`
-  with `SANDY_EGRESS=proxy` (`validate_network_mode`). A boundary-less NIC is therefore never booted by `sandy run`.
-- **Backend refusals (checked before any staging):** the qemu backend refuses the same three combinations and a tap
-  name that is not a bare interface name (1 to 15 of `A-Z a-z 0-9 _ - .`), so a value like `tap0,vhost=on` can neither
-  split the `-netdev` argument nor open the ruleset. It reads `SANDY_NETWORK` and `SANDY_TAP` itself, and it cannot
-  know whether the caller applied the ruleset. **A library caller that bypasses `sandy run` with both variables set
-  (for example an acceptance binary) boots a tap NIC with no ruleset.** Threading the profile and tap through
-  `RunSpec` closes that, and is tracked in #603.
-- **One nft table per tap:** `sandy_egress_<tap>`, so one `nic` run's revert never deletes another concurrent run's
-  boundary. Before #602 the table name was fixed and a concurrent second run lost its filter when the first exited.
-- **Dispatched VMs never get a NIC:** `sandy-host-executor` and sandyd dispatch apply no nftables ruleset, so the
-  host-executor refuses a VM dispatch while `SANDY_NETWORK` is set to anything but `none`. A tap alone is refused by
-  the backend.
-- **vfkit (macOS):** `nic` adds `virtio-net,nat` with **no egress boundary**. macOS has no nftables, and a guest-side
-  filter does not survive a guest with root. It is trusted-only: the egress proxy beside it is refused, and a plain
-  `--allow` list, empty or not, gets an "unenforced" envelope warning (it filters nothing). Enforcement is tracked in
-  #603.
-- **Limits of the nftables path:** the boundary matches IPv4 addresses and CIDRs and passes TCP only (#359), so a
-  `nic` guest cannot allow-list a provider by hostname and has no DNS until #377. The forward chain drops everything
-  not allow-listed (IPv6 and UDP included), and the input chain accepts only the guest's DHCP request (#376).
-- **No host path into the guest yet:** the tap is the host's to configure. Tailnet reachability of the guest's T3
-  port is the host's job (`tailscale serve`), not sandy's.
-- The `SANDY_NETWORK` env var is the per-run switch for `sandy run`, one process per run. A per-run `RunSpec` field is
-  tracked in #603.
+**Decision.** A guest never has a NIC. The egress proxy (`--allow`) is the only network path. The profile lived only on
+the direct `sandy run` path, and `sandy-host-executor` refused it by design, because no dispatch path applies an
+nftables boundary on a tap. With the direct path gone, the code that backed it goes too:
+
+- `SANDY_NETWORK`, `SANDY_TAP`, `NetworkMode`, `is_valid_tap_name` and the plan-time and backend refusals around them.
+- The qemu `-netdev tap` argv and the vfkit `virtio-net,nat` device. qemu always passes `-nic none`.
+- `to_nftables_forward`, `plan_egress_scoped`, `NftablesApplier` and the guest flake's `networkingModule` (decision 5,
+  step 6). The guest has no DHCP client config, no `nft` and no `getent` helper.
+- The host-executor's `refuse_guest_nic`. A stray `SANDY_NETWORK` or `SANDY_TAP` in an executor's environment is
+  ignored, and the guest still has no NIC.
+
+**Consequences.** A sandbox that needs a routable guest has no path until the NIC backlog item (#677) is built. That
+needs a `Submit` field, a capability bit and an executor that applies a tap and its boundary: a feature, not a revert.
+The host-wide `to_nftables`, `plan_egress`, `validate_egress_hosts` and the `EgressApplier` seam stay for now. Nothing
+in production applies them.
 
 ## Adversarial pass
 
@@ -422,7 +408,7 @@ Each attack assumes the #357 model: the job is root in the guest.
 | Attack                                                                                                                        | Result                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The guest opens its own vsock stream to the proxy port, bypassing the relay.                                                  | Mitigated. The relay is not a boundary. A direct stream meets the same parser, allow-list, and address filter.                                                                                                                                                                                |
-| The guest ignores the proxy and connects directly.                                                                            | Mitigated. There is no NIC, so there is no route (except under `network = nic`, section 7).                                                                                                                                                                                                   |
+| The guest ignores the proxy and connects directly.                                                                            | Mitigated. There is no NIC, so there is no route.                                                                                                                                                                                                                                             |
 | The guest kills the relay or binds `127.0.0.1:3128` itself.                                                                   | Mitigated. It denies only itself network.                                                                                                                                                                                                                                                     |
 | CONNECT to an IP literal.                                                                                                     | Mitigated. Allowed only if an IP or CIDR entry contains it with the same port. Loopback and host-interface addresses are refused even then. Non-canonical numeric forms answer `400` and are never resolved.                                                                                  |
 | CONNECT to an allowed name that resolves to a private or host-local address (DNS rebinding).                                  | Mitigated. The filter runs on the resolved addresses, and the proxy connects to the exact address it checked, so a second lookup cannot swap it. Private addresses pass only when an IP entry names them, and loopback never.                                                                 |

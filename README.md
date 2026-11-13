@@ -63,8 +63,7 @@ flowchart TD
 ```
 
 Each seam's concrete implementations (`QemuBackend`/`VfkitBackend`,
-`VirtiofsdTransport`/`VirtioFsTransport`, `GithubAdapter`,
-`NftablesApplier`), the full subsystem design, and the live acceptance matrix
+`VirtiofsdTransport`/`VirtioFsTransport`, `GithubAdapter`), the full subsystem design, and the live acceptance matrix
 are in [`docs/architecture/`](docs/architecture/overview.md).
 
 ## Usage

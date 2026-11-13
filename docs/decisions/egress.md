@@ -11,13 +11,14 @@ Bracketing the boot with an allow-list so the guest's network is filtered, never
 the host's. Subsystem spec:
 [`../architecture/spec.md#5-egress`](../architecture/spec.md#5-egress).
 
-Both decisions below stay in force until the vsock egress proxy passes its live
-parity gate. The proxy then replaces them:
-[`egress-proxy.md`](egress-proxy.md) decision 5 (#360).
+Decisions 1, 1a and 2 are superseded: the vsock egress proxy replaced the nftables
+boundary, and the guest has no NIC ([`egress-proxy.md`](egress-proxy.md) decisions 5
+and 7, #360, #483). They stay as the record of why the boundary was shaped this way.
+Decision 3 (match by IP) still describes the host-wide `to_nftables` translation.
 
 ## 1. Guest-scoped, fail-closed
 
-**Status:** accepted. **Upholds:** INV-7, #29.
+**Status:** superseded by `egress-proxy.md` decision 5. **Upholds:** INV-7, #29.
 
 **Context.** A network boundary applied host-wide could lock the controller off
 the network; a boundary that silently fails to apply would boot the guest
@@ -40,7 +41,7 @@ pass the parity gate.
 
 ## 1a. The boundary also covers host-destined traffic
 
-**Status:** accepted. **Upholds:** INV-7, #376.
+**Status:** superseded by `egress-proxy.md` decision 5. **Upholds:** INV-7, #376.
 
 **Context.** The `forward` chain only sees traffic routed through the host; a
 packet addressed to the host itself (the tap's gateway address, or any other host
@@ -71,7 +72,7 @@ one would recreate the same mismatch this fix closes.
 
 ## 2. macOS is a no-op
 
-**Status:** accepted.
+**Status:** superseded by `egress-proxy.md` decision 5.
 
 **Context.** The guest-scoped nftables mechanism is Linux-only; macOS has no
 equivalent in this path. The guest also has no network device at all:

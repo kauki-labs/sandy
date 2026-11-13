@@ -203,14 +203,8 @@ pub fn guest_share_transport_suite<T: GuestShareTransport>(make: impl Fn() -> T)
 ///
 /// Scope: this is a contract for a TRIVIAL/isolated applier (`NoEgress`, a fake, a
 /// test double) — `make` must yield a fresh, independent instance per check, with
-/// no shared host resource across instances. The real `NftablesApplier` is NOT a
-/// conformant target: its `revert` unconditionally deletes one FIXED, shared host
-/// table regardless of what `apply` loaded, so it errors on an already-reverted
-/// boundary (the opposite of this suite's idempotence rule) and risks colliding
-/// with another concurrent run's live boundary if driven outside its real
-/// mint-apply-revert bracket. The real applier's enforcement is proven instead by
-/// the dedicated, carefully root-gated live egress test (#29, removed in #483), never by this
-/// generic suite.
+/// no shared host resource across instances. A host-tier applier that deletes a shared host table on revert is not
+/// a conformant target (no such applier remains, #483).
 pub fn egress_applier_suite<A: EgressApplier>(make: impl Fn() -> A) -> Result<(), ContractViolation> {
     const SEAM: &str = "EgressApplier";
     let applier = make();
