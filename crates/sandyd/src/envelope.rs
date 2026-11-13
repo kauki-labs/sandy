@@ -10,6 +10,14 @@ use std::time::SystemTime;
 /// it, so a `Status` reply (the console twice, one of them JSON-escaped at up to six bytes per byte) fits one frame.
 pub(crate) const MAX_CONSOLE_BYTES: usize = 64 * 1024;
 
+/// The most output paths the envelope lists (with their sizes in the receipt).
+const MAX_LISTED_OUTPUTS: usize = 256;
+
+/// The most bytes of output paths the envelope lists, per copy (each path is in `outputs` and in the receipt, so the
+/// envelope holds twice this). With the console, the message and the egress reason it keeps a `Status` reply inside one
+/// frame.
+const MAX_LISTED_PATH_BYTES: usize = 32 * 1024;
+
 /// The most bytes of the envelope's `message` the daemon keeps. Applied after redaction, never before: a cut first
 /// would leave the end of a token that straddles it.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024;
@@ -76,7 +84,13 @@ pub(crate) fn egress_from_report(
     }
 }
 
-fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>, egress: EgressReceipt) -> AuditReceipt {
+fn receipt(
+    job_id: &str,
+    exit_code: Option<i32>,
+    host_id: Option<&str>,
+    outputs: Vec<sandy::OutputSizeRef>,
+    egress: EgressReceipt,
+) -> AuditReceipt {
     let now = SystemTime::now();
     AuditReceipt {
         host_observed: HostObserved {
@@ -108,10 +122,21 @@ fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>, egress: 
         },
         guest_reported: GuestReported {
             exit_code,
-            outputs: Vec::new(),
+            outputs,
             skipped_outputs: Vec::new(),
         },
     }
+}
+
+/// Where and how a job was placed, as the daemon recorded it when it dispatched the job.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Placement<'a> {
+    /// The executor host that ran it.
+    pub host_id: Option<&'a str>,
+    /// The egress allow-list it was dispatched with, `None` for a job with no policy.
+    pub allow: Option<&'a AllowList>,
+    /// The outputs its Submit declared, as `(name, destination)`.
+    pub declared: &'a [(Option<String>, std::path::PathBuf)],
 }
 
 /// The envelope for a run that ended with `facts` and `exit_code`, once its outputs are settled to `outputs`.
@@ -123,9 +148,13 @@ pub(crate) fn from_run(
     exit_code: Option<i32>,
     outputs: OutputStatus,
     console: String,
-    host_id: Option<&str>,
-    allow: Option<&AllowList>,
+    placed: &Placement<'_>,
 ) -> ResultEnvelope {
+    let Placement {
+        host_id,
+        allow,
+        declared,
+    } = *placed;
     let outcome = Outcome {
         booted: facts.booted,
         guest_exit: exit_code,
@@ -145,23 +174,59 @@ pub(crate) fn from_run(
         (None, false, Some(code)) => format!("the job exited with code {code}"),
         (None, false, None) => "the job produced no exit code".to_owned(),
     };
-    build_envelope(
+    // What the run left at the declared destinations, listed as the direct path lists it (A2c of #483). Best effort:
+    // an unreadable destination lists nothing. Bounded, so a tree of many files cannot push the `Status` reply past
+    // one frame; the cut is said in a warning.
+    let destinations: Vec<sandy::DeclaredOutput<'_>> = declared
+        .iter()
+        .map(|(name, dest)| (name.as_deref(), dest.as_path()))
+        .collect();
+    let mut listed = sandy::collect_output_size_refs(&destinations, None);
+    let total = listed.len();
+    // Bounded by count and by path bytes: a job chooses its own output names (up to 4096 bytes a path) and each path
+    // is listed twice, so a count cap alone would still overflow the frame.
+    let mut path_bytes = 0usize;
+    let kept = listed
+        .iter()
+        .take(MAX_LISTED_OUTPUTS)
+        .take_while(|output| {
+            path_bytes += output.path.len();
+            path_bytes <= MAX_LISTED_PATH_BYTES
+        })
+        .count();
+    let mut cut = None;
+    if kept < total {
+        listed.truncate(kept);
+        cut = Some(format!(
+            "outputs: {total} files were left at the declared destinations, only the first {kept} are listed"
+        ));
+    }
+    let refs = listed
+        .iter()
+        .map(|output| sandy::OutputRef {
+            path: output.path.clone(),
+        })
+        .collect();
+    let mut envelope = build_envelope(
         job_id,
         None,
         classification,
         exit_code,
         message,
         tail(&console, MAX_CONSOLE_BYTES).to_owned(),
-        Vec::new(),
+        refs,
         Some(receipt(
             job_id,
             exit_code,
             host_id,
+            listed,
             // A report is meaningful only for a job that asked for a boundary: a `PROXIED` for a job with no
             // policy would read as `Enforced` with an empty allow-list.
             egress_receipt(facts.egress.as_ref().filter(|_| allow.is_some()), allow),
         )),
-    )
+    );
+    envelope.warnings.extend(cut);
+    envelope
 }
 
 /// Redact, then cut, the egress reason in `envelope`'s receipt: it is the executor's own error string, as the message
@@ -212,7 +277,7 @@ pub(crate) fn infra_fault(job_id: &str, reason: &str, host_id: Option<&str>) -> 
         reason.to_owned(),
         String::new(),
         Vec::new(),
-        Some(receipt(job_id, None, host_id, egress_receipt(None, None))),
+        Some(receipt(job_id, None, host_id, Vec::new(), egress_receipt(None, None))),
     )
 }
 

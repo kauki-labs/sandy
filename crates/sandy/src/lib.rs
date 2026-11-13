@@ -43,6 +43,7 @@ mod identity_profile;
 mod journal;
 mod metrics;
 mod nix;
+mod outputs;
 mod profile;
 mod provision;
 mod reconcile;
@@ -81,6 +82,7 @@ pub use identity_profile::{IdentityProfile, IdentityProfileError, IdentityProfil
 pub use journal::{JobLock, Journal, detect_fs_type, ensure_local_posix_fs, is_networked_fs, new_job_id};
 pub use metrics::{RunMetrics, RunPhase};
 pub use nix::{Hypervisor, Share, StoreBacking, Topology, parse_topology, topology, topology_until};
+pub use outputs::{DeclaredOutput, collect_output_entries, collect_output_refs, collect_output_size_refs};
 pub use profile::{CredentialSource, Profile};
 pub use provision::{
     HostNixProvisioner, Job, ProvisionOutcome, RemoteArtifacts, RemoteBuilder, RemoteError, decide_fallback, provision,
