@@ -25,15 +25,33 @@ pub enum WaitError {
 /// cancel with the task failures). A job that is not terminal has no band.
 #[must_use]
 pub fn exit_band(status: &StatusResponse) -> Option<ProcessExit> {
-    let _ = status;
-    None
+    if !is_terminal(status) {
+        return None;
+    }
+    if status.status() == JobStatus::Succeeded {
+        return Some(ProcessExit::Succeeded);
+    }
+    // A failure the platform may retry is the envelope's own `retryable` flag (the infra-fault band); a row recorded
+    // before envelopes were stored has none, and reads as a task failure.
+    let retryable = status
+        .result_envelope
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<ResultEnvelope>(bytes).ok())
+        .is_some_and(|envelope| envelope.retryable);
+    Some(if status.status() == JobStatus::Failed && retryable {
+        ProcessExit::InfraFault
+    } else {
+        ProcessExit::TaskFailure
+    })
 }
 
-/// Whether `status` is a state a job can still leave.
+/// Whether `status` is a state a job can no longer leave.
 #[must_use]
 pub fn is_terminal(status: &StatusResponse) -> bool {
-    let _ = status;
-    false
+    matches!(
+        status.status(),
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+    )
 }
 
 /// Poll `fetch` every `poll` until the job is terminal or `bound` has passed.
@@ -50,8 +68,17 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<StatusResponse, String>>,
 {
-    let _ = (&mut fetch, poll, bound);
-    Err(WaitError::Call("not implemented".to_owned()))
+    let started = tokio::time::Instant::now();
+    loop {
+        let status = fetch().await.map_err(WaitError::Call)?;
+        if is_terminal(&status) {
+            return Ok(status);
+        }
+        if started.elapsed() >= bound {
+            return Err(WaitError::TimedOut(status.status().as_str_name().to_owned(), bound));
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 #[cfg(test)]
