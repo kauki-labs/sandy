@@ -765,6 +765,19 @@ pub async fn handle(
                         };
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
+                        // What the job's egress boundary is asked to enforce, for the envelope's receipt (A2b).
+                        job_channel.egress_allow = dispatch_egress.as_ref().map(|policy| sandy::AllowList {
+                            rules: policy
+                                .rules
+                                .iter()
+                                .filter_map(|rule| {
+                                    Some(sandy::EgressRule {
+                                        host: rule.host.clone(),
+                                        port: u16::try_from(rule.port).ok()?,
+                                    })
+                                })
+                                .collect(),
+                        });
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),

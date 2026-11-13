@@ -1495,7 +1495,15 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   that declared `egress_proxy` (operator flag `SANDY_HOST_EGRESS_PROXY=1`, and only with VM capability); with none, or
   with no remote placement at all, the Submit is refused naming the capability, never run unfiltered locally. `sandyd`
   and the executor both check each rule (a host, a port in 1..=65535), and the executor refuses a policy on a process
-  job. The egress receipt in the result envelope is A2.
+  job.
+- A2 (#483): `sandyd` builds the result envelope with `sandy::build_envelope` and `classify_outcome`, stores it in
+  `jobs.envelope` in the statement that makes the job terminal, and serves its JSON in `StatusResponse.result_envelope`.
+  `who` is the local-uid fallback with `authenticated: false` (verified caps are #413). A run that carried an egress
+  policy sends `JobResult.egress`, the state of its boundary read from the same facts the direct path reads
+  (`sandy::proxy_receipt_result`); the daemon turns it into the receipt with the direct path's own
+  `sandy::build_egress_receipt`, pairing `PROXIED` with the allow-list it dispatched. No report, or an unspecified one,
+  is `Unenforced` with the reason that the executor reported nothing: the receipt never says applied without a report.
+  A run that failed to start returns an error and no report.
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's

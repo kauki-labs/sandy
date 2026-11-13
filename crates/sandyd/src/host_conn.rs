@@ -516,6 +516,7 @@ async fn record_job_result(
         booted: result.booted,
         timed_out: result.timed_out,
         transport_error: result.transport_error.clone(),
+        egress: crate::envelope::egress_from_report(result.egress.as_ref()),
     };
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
@@ -665,15 +666,24 @@ async fn finish_job(
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
     let facts = facts.clone();
-    let host_id = job_registry.get(job_id).and_then(|job| job.host_id.clone());
+    let (host_id, allow) = job_registry
+        .get(job_id)
+        .map_or((None, None), |job| (job.host_id.clone(), job.egress_allow.clone()));
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
         let console = crate::envelope::tail(&console, crate::envelope::MAX_CONSOLE_BYTES).to_owned();
         // The envelope carries the same redacted console, and its message (the executor's own words) is redacted
         // the same way, so neither holds the token.
-        let mut envelope =
-            crate::envelope::from_run(&jid, &facts, exit_code, outputs, console.clone(), host_id.as_deref());
+        let mut envelope = crate::envelope::from_run(
+            &jid,
+            &facts,
+            exit_code,
+            outputs,
+            console.clone(),
+            host_id.as_deref(),
+            allow.as_ref(),
+        );
         let message = redact_console(credentials.as_deref(), &jid, envelope.message);
         envelope.message = crate::envelope::tail(&message, crate::envelope::MAX_MESSAGE_BYTES).to_owned();
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))

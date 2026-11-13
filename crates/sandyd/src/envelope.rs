@@ -27,7 +27,7 @@ pub(crate) fn tail(text: &str, max: usize) -> &str {
 }
 
 use sandy::{
-    AuditReceipt, EgressEnforcement, EgressReceipt, GuestReported, HostObserved, Location, OutputStatus,
+    AllowList, AuditReceipt, EgressEnforcement, EgressReceipt, GuestReported, HostObserved, Location, OutputStatus,
     ResultEnvelope, Timing, What, Who, build_envelope, classify_backend_error, classify_outcome,
 };
 use sandy_api::backend::{BackendError, Outcome};
@@ -35,6 +35,9 @@ use sandy_api::backend::{BackendError, Outcome};
 /// The physical facts of a run, as the executor's `JobResult` reports them.
 #[derive(Debug, Clone)]
 pub(crate) struct RunFacts {
+    /// The executor's egress report, read as the direct path's `Result<EgressOutcome, String>`: `None` when it sent
+    /// none (no policy, an older executor, a run that ended before it could say) or an unspecified one.
+    pub egress: Option<Result<sandy::EgressOutcome, String>>,
     /// Whether the guest booted.
     pub booted: bool,
     /// Whether the run hit its timeout.
@@ -43,7 +46,37 @@ pub(crate) struct RunFacts {
     pub transport_error: Option<String>,
 }
 
-fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>) -> AuditReceipt {
+/// The egress half of the receipt. With an executor report it is the direct path's own builder over the same facts, so
+/// the two agree by construction; without one nothing is claimed as applied.
+fn egress_receipt(report: Option<&Result<sandy::EgressOutcome, String>>, allow: Option<&AllowList>) -> EgressReceipt {
+    match report {
+        Some(result) => sandy::build_egress_receipt(result, &allow.cloned().unwrap_or_default()),
+        None => EgressReceipt {
+            status: EgressEnforcement::Unenforced,
+            reason: Some("the executor did not report an egress outcome".to_owned()),
+            allow_list: None,
+            attempts: Vec::new(),
+        },
+    }
+}
+
+/// The wire egress report as the direct path's `Result<EgressOutcome, String>`; `None` for no report or an unspecified
+/// one.
+pub(crate) fn egress_from_report(
+    report: Option<&sandy_executor_proto::EgressReport>,
+) -> Option<Result<sandy::EgressOutcome, String>> {
+    use sandy_executor_proto::EgressState;
+    let report = report?;
+    let reason = || report.reason.clone().unwrap_or_default();
+    match EgressState::try_from(report.state).ok()? {
+        EgressState::Proxied => Some(Ok(sandy::EgressOutcome::Proxied)),
+        EgressState::Unenforced => Some(Ok(sandy::EgressOutcome::Unenforced { reason: reason() })),
+        EgressState::Failed => Some(Err(reason())),
+        EgressState::Unspecified => None,
+    }
+}
+
+fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>, egress: EgressReceipt) -> AuditReceipt {
     let now = SystemTime::now();
     AuditReceipt {
         host_observed: HostObserved {
@@ -64,13 +97,7 @@ fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>) -> Audit
                 executor_mesh_ip: None,
             },
             credential: None,
-            // Until an executor reports its egress outcome, nothing is claimed as applied.
-            egress: EgressReceipt {
-                status: EgressEnforcement::Unenforced,
-                reason: Some("the executor did not report an egress outcome".to_owned()),
-                allow_list: None,
-                attempts: Vec::new(),
-            },
+            egress,
             // The daemon sees neither the boot nor the teardown: both are the moment it recorded the result.
             timing: Timing {
                 boot_started_at: now,
@@ -97,6 +124,7 @@ pub(crate) fn from_run(
     outputs: OutputStatus,
     console: String,
     host_id: Option<&str>,
+    allow: Option<&AllowList>,
 ) -> ResultEnvelope {
     let outcome = Outcome {
         booted: facts.booted,
@@ -125,7 +153,12 @@ pub(crate) fn from_run(
         message,
         tail(&console, MAX_CONSOLE_BYTES).to_owned(),
         Vec::new(),
-        Some(receipt(job_id, exit_code, host_id)),
+        Some(receipt(
+            job_id,
+            exit_code,
+            host_id,
+            egress_receipt(facts.egress.as_ref(), allow),
+        )),
     )
 }
 
@@ -160,6 +193,6 @@ pub(crate) fn infra_fault(job_id: &str, reason: &str, host_id: Option<&str>) -> 
         reason.to_owned(),
         String::new(),
         Vec::new(),
-        Some(receipt(job_id, None, host_id)),
+        Some(receipt(job_id, None, host_id, egress_receipt(None, None))),
     )
 }

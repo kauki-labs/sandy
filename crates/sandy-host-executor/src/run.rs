@@ -512,18 +512,7 @@ pub fn outcome_result_message_with_outputs(
     outcome: Outcome,
     outputs_follow: bool,
 ) -> HostExecutorMessage {
-    HostExecutorMessage {
-        op: Some(host_executor_message::Op::Result(JobResult {
-            job_id,
-            booted: outcome.booted,
-            exit_code: outcome.guest_exit,
-            timed_out: outcome.timed_out,
-            transport_error: outcome.transport_error,
-            console: outcome.console,
-            outputs_follow,
-            egress: None,
-        })),
-    }
+    outcome_result_message_with_egress(job_id, outcome, outputs_follow, None)
 }
 
 /// [`outcome_result_message_with_outputs`] with the egress report of a run that carried a policy (A2b of #483), in
@@ -535,8 +524,18 @@ pub fn outcome_result_message_with_egress(
     outputs_follow: bool,
     egress: Option<sandy_executor_proto::EgressReport>,
 ) -> HostExecutorMessage {
-    let _ = egress;
-    outcome_result_message_with_outputs(job_id, outcome, outputs_follow)
+    HostExecutorMessage {
+        op: Some(host_executor_message::Op::Result(JobResult {
+            job_id,
+            booted: outcome.booted,
+            exit_code: outcome.guest_exit,
+            timed_out: outcome.timed_out,
+            transport_error: outcome.transport_error,
+            console: outcome.console,
+            outputs_follow,
+            egress,
+        })),
+    }
 }
 
 /// Build the `HostExecutorMessage::Result` for a dispatch that never reached a

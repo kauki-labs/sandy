@@ -585,10 +585,15 @@ impl HandleDispatchError {
 /// proxy served a booted guest; a refusal before boot or a guest that never booted is `FAILED` with the reason.
 #[must_use]
 pub fn egress_report(run: &Result<Outcome, BackendError>) -> sandy_executor_proto::EgressReport {
-    let _ = run;
+    use sandy_executor_proto::EgressState;
+    let (state, reason) = match sandy::proxy_receipt_result(run) {
+        Ok(sandy::EgressOutcome::Proxied | sandy::EgressOutcome::Enforced) => (EgressState::Proxied, None),
+        Ok(sandy::EgressOutcome::Unenforced { reason }) => (EgressState::Unenforced, Some(reason)),
+        Err(reason) => (EgressState::Failed, Some(reason)),
+    };
     sandy_executor_proto::EgressReport {
-        state: sandy_executor_proto::EgressState::Unspecified.into(),
-        reason: None,
+        state: state.into(),
+        reason,
     }
 }
 
@@ -626,6 +631,7 @@ fn dispatched(
     staging: Option<OutputStaging>,
     rt: &tokio::runtime::Handle,
     control: &RunControl,
+    egress: Option<sandy_executor_proto::EgressReport>,
 ) -> Dispatched {
     let outputs_follow = match (staged, &staging) {
         (Some(mut staged), Some(staging)) => send_staged_outputs(
@@ -640,7 +646,7 @@ fn dispatched(
     Dispatched {
         outcome,
         outputs_follow,
-        egress: None,
+        egress,
     }
 }
 
@@ -836,7 +842,7 @@ pub fn handle_dispatch(
                 control: &control,
             };
             let outcome = backend.run(&spec)?;
-            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control, None))
         }
         // Defense in depth (#332, mirroring `check_isolation_class`'s own
         // re-probe discipline): `vm_available` is the caller's own fresh
@@ -932,9 +938,13 @@ pub fn handle_dispatch(
             // `_kept_topology_file` (the temp JSON file, for a Prebuilt
             // template) must outlive `backend.run`'s own read of `template`
             // — held in scope here, across the call, not dropped before it.
-            let outcome = backend.run(&spec)?;
+            let run = backend.run(&spec);
+            // A run that carried a policy reports what became of its boundary, read from the same facts the direct
+            // path's receipt reads (A2b of #483). A run that failed to start returns the error and no report.
+            let egress = allow.is_some().then(|| egress_report(&run));
+            let outcome = run?;
             drop(_kept_topology_file);
-            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control, egress))
         }
         _ => Err(HandleDispatchError::UnsupportedBackend(dispatch.backend)),
     }
@@ -1677,8 +1687,10 @@ mod tests {
         let staged = StagedInputs::for_test(near).context("staged inputs")?;
         let sent = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control))
-                .await?
+            tokio::task::spawn_blocking(move || {
+                dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control, None)
+            })
+            .await?
         };
         assert!(sent.outputs_follow, "staged outputs over a link follow");
         let mut frames = Vec::new();
