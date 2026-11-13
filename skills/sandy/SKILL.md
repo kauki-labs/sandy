@@ -46,7 +46,8 @@ sandy run [TEMPLATE] [OPTIONS] [-- CMD ARGS...]
   whether they are. `TEMPLATE` is `topologies.<system>.<hypervisor>` of sandy's
   bundled guest flake or `REF#topologies.<system>.<hypervisor>`. The executor
   evaluates it but does not build it: on a cold executor, build the guest runner
-  first (`nix build ./nix/guest#packages.<system>.guest-runner`).
+  of the topology you submit first (for sandy's own:
+  `nix build ./nix/guest#packages.<system>.guest-runner`).
 - No trailing `-- CMD` means "boot the template's default command."
 - **Resource/time bounds**: `--cpu N`, `--mem MiB`, `--timeout SECS`
   (defaults to 5 minutes if omitted). These are requests the host may clamp,

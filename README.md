@@ -82,8 +82,9 @@ machine works too). A VM job is untrusted: only a hypervisor boundary may run it
 `<template>` is `topologies.<system>.<hypervisor>` of sandy's bundled guest flake, or
 `REF#topologies.<system>.<hypervisor>` for your own flake `REF`. The executor picks
 its own system and hypervisor. It evaluates the topology but does not build it: on a
-cold executor run `nix build ./nix/guest#packages.<system>.guest-runner` first (qemu;
-`guest-runner-vfkit` on macOS). The job command runs inside the guest; its exit code
+cold executor build the guest runner of the topology you submit first (for sandy's
+own: `nix build ./nix/guest#packages.<system>.guest-runner`, qemu; `guest-runner-vfkit`
+on macOS). The job command runs inside the guest; its exit code
 and the guest console come back in the result envelope. Flags (repeatable where it
 makes sense):
 

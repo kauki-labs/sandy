@@ -809,6 +809,16 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
 /// own timeout. The daemon has no wait call, so the client polls `Status` within this bound.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 3600;
 
+/// What `run` adds to its job's own `--timeout` before it gives up waiting: boot, output collection and teardown.
+const RUN_WAIT_SLACK_SECS: u64 = 600;
+
+/// How long `run` waits: an hour, or its job's `--timeout` plus slack when that is longer. A fixed bound would end the
+/// wait with an infrastructure fault while a job with a long `--timeout` is still running and may succeed.
+fn run_wait_bound(job_timeout_secs: Option<u32>) -> u64 {
+    let job = u64::from(job_timeout_secs.unwrap_or(0));
+    DEFAULT_WAIT_TIMEOUT_SECS.max(job.saturating_add(RUN_WAIT_SLACK_SECS))
+}
+
 /// How often a waiting client asks the daemon for the job's status.
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1298,6 +1308,12 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // Cancel needs the job's attach token (#540), read back from where `submit` persisted it,
             // the same way `attach` does.
             let attach_token = sandy_cli::attach::read_attach_token(&job_id);
+            if attach_token.is_none() {
+                eprintln!(
+                    "sandy: no attach token saved for job {job_id} on this host; sandyd cancels a job only for the \
+                     client that submitted it"
+                );
+            }
             control_request::Op::Cancel(CancelRequest { job_id, attach_token })
         }
         DaemonOp::Attach { job_id } => {
@@ -1565,7 +1581,7 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
                 allow,
                 digests,
                 wait: true,
-                wait_timeout: DEFAULT_WAIT_TIMEOUT_SECS,
+                wait_timeout: run_wait_bound(timeout),
             },
             output,
         ),
@@ -1664,6 +1680,18 @@ mod tests {
         assert!(parse(&["--digests"])?);
         assert!(!parse(&[])?);
         Ok(())
+    }
+
+    /// `run` waits at least as long as its job may run: a `--timeout` past an hour is not cut off by the wait bound.
+    #[test]
+    fn run_waits_longer_than_its_jobs_timeout() {
+        assert_eq!(run_wait_bound(None), DEFAULT_WAIT_TIMEOUT_SECS);
+        assert_eq!(run_wait_bound(Some(300)), DEFAULT_WAIT_TIMEOUT_SECS);
+        assert_eq!(run_wait_bound(Some(7200)), 7200 + RUN_WAIT_SLACK_SECS);
+        assert_eq!(
+            run_wait_bound(Some(u32::MAX)),
+            u64::from(u32::MAX) + RUN_WAIT_SLACK_SECS
+        );
     }
 
     #[test]
