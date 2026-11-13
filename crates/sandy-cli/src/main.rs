@@ -330,6 +330,23 @@ enum DaemonOp {
         /// otherwise.
         #[arg(long)]
         digests: bool,
+        /// Block until the job ends, print its status with the result envelope and exit by band (`0` succeeded, `1`
+        /// failed or cancelled, `3` an infrastructure fault), as `sandy run` does. Ctrl-C (or SIGTERM) cancels the
+        /// job.
+        #[arg(long)]
+        wait: bool,
+        /// With `--wait`: give up after this many seconds, naming the state the job was in (exit `3`).
+        #[arg(long, requires = "wait", default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+        wait_timeout: u64,
+    },
+    /// Block until a job ends, then print it with its result envelope; exit `0` succeeded, `1` failed or cancelled, `3`
+    /// an infrastructure fault or a timeout.
+    Wait {
+        /// The job id to wait on.
+        job_id: String,
+        /// Give up after this many seconds, naming the state the job was in (exit `3`).
+        #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+        wait_timeout: u64,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -870,6 +887,125 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
 /// result, and map it to a process exit band (INV-11). A fresh connection per
 /// invocation: the control RPC is strictly one-request-one-response with no
 /// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
+/// How long `daemon wait` and `daemon submit --wait` wait by default: an hour, longer than the host ceiling on a job's
+/// own timeout. The daemon has no wait call, so the client polls `Status` within this bound.
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 3600;
+
+/// How often a waiting client asks the daemon for the job's status.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a client waits for the job to end after it cancelled it on Ctrl-C.
+const CANCEL_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One `Status` call on `stream`, as the wait loop's fetch: the daemon's answer, or a message naming what went wrong.
+async fn status_call(
+    stream: &mut tokio::net::UnixStream,
+    request_id: u64,
+    job_id: &str,
+) -> Result<sandy_control_proto::StatusResponse, String> {
+    let op = control_request::Op::Status(StatusRequest {
+        job_id: job_id.to_owned(),
+    });
+    match sandy_control_proto::client::call(stream, request_id, op).await {
+        Ok(response) => match response.result {
+            Some(control_response::Result::Status(status)) => Ok(status),
+            Some(control_response::Result::Error(e)) => Err(e.message),
+            other => Err(format!("the daemon answered a status request with {other:?}")),
+        },
+        Err(e) => Err(format!("the daemon call failed: {e}")),
+    }
+}
+
+/// Print `status` as `daemon status` does and return the exit band it gives. A job still not terminal here is an
+/// infrastructure fault (the wait gave up).
+fn report_and_band(status: &sandy_control_proto::StatusResponse, output: OutputFormat) -> i32 {
+    let band = sandy_cli::wait::exit_band(status).unwrap_or(ProcessExit::InfraFault);
+    match JobStatusReport::from_response(status) {
+        Ok(report) => {
+            if emit(&report, output).is_err() {
+                return ProcessExit::InfraFault.code();
+            }
+            band.code()
+        }
+        Err(e) => {
+            eprintln!("sandy: sandyd sent a status reply with a result envelope that does not decode: {e}");
+            ProcessExit::InfraFault.code()
+        }
+    }
+}
+
+/// Wait on `stream` for `job_id` to end, within `bound`, and report it. With `cancel_token` set (a job this client
+/// submitted) an interrupt (SIGINT or SIGTERM) cancels the job on the daemon through a fresh connection, because the
+/// interrupted poll leaves `stream` mid-conversation, and then waits a short while for it to end.
+async fn wait_and_report(
+    mut stream: tokio::net::UnixStream,
+    socket: &std::path::Path,
+    job_id: &str,
+    cancel_token: Option<Vec<u8>>,
+    bound: std::time::Duration,
+    output: OutputFormat,
+) -> i32 {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut sigint), Ok(mut sigterm)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else {
+        eprintln!("sandy: could not install the interrupt handlers");
+        return ProcessExit::InfraFault.code();
+    };
+    let ids = std::sync::atomic::AtomicU64::new(2);
+    let cell = std::cell::RefCell::new(&mut stream);
+    let mut waiting = Box::pin(sandy_cli::wait::wait_until_terminal(
+        || {
+            let id = ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let cell = &cell;
+            async move {
+                let mut stream = cell.borrow_mut();
+                status_call(&mut stream, id, job_id).await
+            }
+        },
+        WAIT_POLL,
+        bound,
+    ));
+    let interrupted = tokio::select! {
+        done = &mut waiting => Err(done),
+        _ = sigint.recv() => Ok(()),
+        _ = sigterm.recv() => Ok(()),
+    };
+    drop(waiting);
+    let done = match interrupted {
+        Err(done) => done,
+        Ok(()) => {
+            let Some(token) = cancel_token else {
+                eprintln!("sandy: interrupted; the job was not submitted by this client and keeps running");
+                return ProcessExit::TaskFailure.code();
+            };
+            eprintln!("sandy: interrupted; cancelling job {job_id}");
+            let Ok(mut fresh) = tokio::net::UnixStream::connect(socket).await else {
+                eprintln!("sandy: could not reconnect to sandyd to cancel the job");
+                return ProcessExit::InfraFault.code();
+            };
+            let cancel = control_request::Op::Cancel(CancelRequest {
+                job_id: job_id.to_owned(),
+                attach_token: Some(token),
+            });
+            if let Err(e) = sandy_control_proto::client::call(&mut fresh, 1, cancel).await {
+                eprintln!("sandy: the cancel call failed: {e}");
+            }
+            sandy_cli::wait::wait_until_terminal(
+                || async { status_call(&mut fresh, 2, job_id).await },
+                WAIT_POLL,
+                CANCEL_SETTLE,
+            )
+            .await
+        }
+    };
+    match done {
+        Ok(status) => report_and_band(&status, output),
+        Err(e) => {
+            eprintln!("sandy: {e}");
+            ProcessExit::InfraFault.code()
+        }
+    }
+}
+
 async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     // #232 (CodeRabbit on this PR): validate `--cap-file` before opening any
     // connection — a malformed or unreadable path is a pure client-side
@@ -1119,6 +1255,17 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         None
     };
 
+    // `daemon wait`, and `daemon submit --wait` after its Submit: poll Status to a terminal state within this bound.
+    let wait_bound = match &op {
+        DaemonOp::Wait { wait_timeout, .. }
+        | DaemonOp::Submit {
+            wait: true,
+            wait_timeout,
+            ..
+        } => Some(std::time::Duration::from_secs(*wait_timeout)),
+        _ => None,
+    };
+
     let request_op = match op {
         DaemonOp::Submit {
             manifest,
@@ -1192,7 +1339,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 collector: false,
             })
         }
-        DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
+        DaemonOp::Status { job_id } | DaemonOp::Wait { job_id, .. } => {
+            control_request::Op::Status(StatusRequest { job_id })
+        }
         DaemonOp::List => control_request::Op::List(ListRequest {}),
         DaemonOp::Prune { keep_last } => control_request::Op::Prune(PruneRequest {
             keep_last: u32::try_from(keep_last).unwrap_or(u32::MAX),
@@ -1214,7 +1363,13 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // `attach::persist_attach_token`'s own doc for the fallback
             // behavior on any failure here.
             sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
-            succeed_or(emit(&SubmittedJob::from(&r), output))
+            match wait_bound {
+                // `--wait`: the job is the client's own, so an interrupt cancels it; only the final report prints.
+                Some(bound) => {
+                    wait_and_report(stream, &socket, &r.job_id, Some(r.attach_token.clone()), bound, output).await
+                }
+                None => succeed_or(emit(&SubmittedJob::from(&r), output)),
+            }
         }
         Some(control_response::Result::Cancel(_)) => {
             succeed_or(emit(&CancelledJob::new(cancel_echo.as_deref().unwrap_or("?")), output))
@@ -1303,6 +1458,13 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             }
         }
+        // `daemon wait`: the first answer decides whether to keep polling; an unknown job is the `Error` arm below.
+        Some(control_response::Result::Status(r)) if wait_bound.is_some() => match wait_bound {
+            Some(bound) if !sandy_cli::wait::is_terminal(&r) => {
+                wait_and_report(stream, &socket, &r.job_id, None, bound, output).await
+            }
+            _ => report_and_band(&r, output),
+        },
         Some(control_response::Result::Status(r)) => match JobStatusReport::from_response(&r) {
             Ok(report) => succeed_or(emit(&report, output)),
             Err(e) => {
