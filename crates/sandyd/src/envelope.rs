@@ -10,6 +10,9 @@ use std::time::SystemTime;
 /// it, so a `Status` reply (the console twice, one of them JSON-escaped at up to six bytes per byte) fits one frame.
 pub(crate) const MAX_CONSOLE_BYTES: usize = 64 * 1024;
 
+/// The most output paths the envelope lists (with their sizes in the receipt).
+const MAX_LISTED_OUTPUTS: usize = 256;
+
 /// The most bytes of the envelope's `message` the daemon keeps. Applied after redaction, never before: a cut first
 /// would leave the end of a token that straddles it.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024;
@@ -43,7 +46,12 @@ pub(crate) struct RunFacts {
     pub transport_error: Option<String>,
 }
 
-fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>) -> AuditReceipt {
+fn receipt(
+    job_id: &str,
+    exit_code: Option<i32>,
+    host_id: Option<&str>,
+    outputs: Vec<sandy::OutputSizeRef>,
+) -> AuditReceipt {
     let now = SystemTime::now();
     AuditReceipt {
         host_observed: HostObserved {
@@ -81,7 +89,7 @@ fn receipt(job_id: &str, exit_code: Option<i32>, host_id: Option<&str>) -> Audit
         },
         guest_reported: GuestReported {
             exit_code,
-            outputs: Vec::new(),
+            outputs,
             skipped_outputs: Vec::new(),
         },
     }
@@ -97,6 +105,7 @@ pub(crate) fn from_run(
     outputs: OutputStatus,
     console: String,
     host_id: Option<&str>,
+    declared: &[(Option<String>, std::path::PathBuf)],
 ) -> ResultEnvelope {
     let outcome = Outcome {
         booted: facts.booted,
@@ -117,16 +126,41 @@ pub(crate) fn from_run(
         (None, false, Some(code)) => format!("the job exited with code {code}"),
         (None, false, None) => "the job produced no exit code".to_owned(),
     };
-    build_envelope(
+    // What the run left at the declared destinations, listed as the direct path lists it (A2c of #483). Best effort:
+    // an unreadable destination lists nothing. Bounded, so a tree of many files cannot push the `Status` reply past
+    // one frame; the cut is said in a warning.
+    let destinations: Vec<sandy::DeclaredOutput<'_>> = declared
+        .iter()
+        .map(|(name, dest)| (name.as_deref(), dest.as_path()))
+        .collect();
+    let mut listed = sandy::collect_output_size_refs(&destinations, None);
+    let total = listed.len();
+    let mut cut = None;
+    if total > MAX_LISTED_OUTPUTS {
+        listed.truncate(MAX_LISTED_OUTPUTS);
+        cut = Some(format!(
+            "outputs: {total} files were left at the declared destinations, only the first {MAX_LISTED_OUTPUTS} are \
+             listed"
+        ));
+    }
+    let refs = listed
+        .iter()
+        .map(|output| sandy::OutputRef {
+            path: output.path.clone(),
+        })
+        .collect();
+    let mut envelope = build_envelope(
         job_id,
         None,
         classification,
         exit_code,
         message,
         tail(&console, MAX_CONSOLE_BYTES).to_owned(),
-        Vec::new(),
-        Some(receipt(job_id, exit_code, host_id)),
-    )
+        refs,
+        Some(receipt(job_id, exit_code, host_id, listed)),
+    );
+    envelope.warnings.extend(cut);
+    envelope
 }
 
 /// The envelope for a job cancelled before a terminal guest result: the shape the direct `kill` writes (status
@@ -160,6 +194,6 @@ pub(crate) fn infra_fault(job_id: &str, reason: &str, host_id: Option<&str>) -> 
         reason.to_owned(),
         String::new(),
         Vec::new(),
-        Some(receipt(job_id, None, host_id)),
+        Some(receipt(job_id, None, host_id, Vec::new())),
     )
 }

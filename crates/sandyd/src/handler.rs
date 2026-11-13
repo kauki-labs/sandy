@@ -765,6 +765,11 @@ pub async fn handle(
                         };
                         job_channel.data_link = data_link;
                         job_channel.host_id = Some(candidate.host_id.clone());
+                        // What the Submit declared as outputs, for the envelope's listing of what they hold (A2c).
+                        job_channel.declared_outputs = path_outputs
+                            .iter()
+                            .map(|output| (output.name.clone(), std::path::PathBuf::from(&output.dest)))
+                            .collect();
                         let dispatch = Dispatch {
                             job_id: job_id.clone(),
                             manifest: manifest.clone(),
