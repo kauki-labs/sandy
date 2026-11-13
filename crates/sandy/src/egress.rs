@@ -12,7 +12,7 @@
 //! (now in `sandy-test-support`) in tests, [`NftablesApplier`] (shells `nft -f -`)
 //! on a real Linux host. The live Linux enforcement — the real `nft` load whose
 //! boundary an in-guest root flush cannot bypass — is tier-3 and is asserted by
-//! `cargo test --test live_egress` (#29); it is not exercised here.
+//! a root-gated live test (#29); it is not exercised here.
 
 pub use sandy_api::egress::{
     AllowList, EgressApplier, EgressError, EgressOs, EgressOutcome, EgressPlan, EgressRule, NetworkMode,
@@ -358,8 +358,8 @@ fn is_ipv4_or_cidr(host: &str) -> bool {
 ///
 /// This is intentionally thin and is **not** unit-tested: the behaviour that
 /// matters — that the loaded boundary holds against an in-guest root flush — is a
-/// live, root-only, host-tier assertion that binds into `cargo test --test
-/// live_egress` (#29), not something a unit test can observe.
+/// live, root-only, host-tier assertion (a live test, #29, removed in #483),
+/// not something a unit test can observe.
 #[derive(Debug, Default)]
 pub struct NftablesApplier {
     /// The table the last applied ruleset created, for [`EgressApplier::revert`] to delete.

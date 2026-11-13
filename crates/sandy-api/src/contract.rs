@@ -5,9 +5,8 @@
 //! the suite stays generic over the concrete type.
 //!
 //! This is the capstone proof the #131 restructure's seams stay interchangeable:
-//! `sandy-cli`'s `acceptance-local` binary runs these against the real
-//! `ProcessBackend` / `LocalDirTransport` / `NoEgress` (no hypervisor, CI-default);
-//! `acceptance-vm` runs them against the real VM impls (live-gated, needs a
+//! the impl crates run these against the real `ProcessBackend` / `LocalDirTransport` /
+//! `NoEgress` (no hypervisor, CI-default) and the real VM impls (live-gated, needs a
 //! hypervisor). A suite returns `Err(ContractViolation)` naming the broken rule,
 //! so a caller can assert on a violation as well as on a pass — mirrors
 //! `sandy-fabric`'s `contract` module for the (separate, #103/#104) agent-fabric
@@ -210,7 +209,7 @@ pub fn guest_share_transport_suite<T: GuestShareTransport>(make: impl Fn() -> T)
 /// boundary (the opposite of this suite's idempotence rule) and risks colliding
 /// with another concurrent run's live boundary if driven outside its real
 /// mint-apply-revert bracket. The real applier's enforcement is proven instead by
-/// the dedicated, carefully root-gated `live_egress.rs` (#29), never by this
+/// the dedicated, carefully root-gated live egress test (#29, removed in #483), never by this
 /// generic suite.
 pub fn egress_applier_suite<A: EgressApplier>(make: impl Fn() -> A) -> Result<(), ContractViolation> {
     const SEAM: &str = "EgressApplier";

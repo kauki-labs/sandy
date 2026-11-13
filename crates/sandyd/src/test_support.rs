@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// A `Vec<u8>`-backed `tracing_subscriber` writer shared with the test, so a
 /// subscriber installed for one scope can be inspected afterward. Mirrors
-/// `sandy-cli`'s `tests/cli_jobs.rs::SharedBuf`.
+/// the `SharedBuf` the removed `sandy-cli` direct-path tests used.
 #[derive(Clone, Default)]
 pub(crate) struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
