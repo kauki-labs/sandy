@@ -2763,7 +2763,13 @@ change, which also fixes the queue-time loss).
   provider (at most 8 at once, each bounded by the provider's own deadline), its staged file and `cred-*` dir are
   removed, and the record is cleared. A record past its expiry is cleared with no provider call, since a GitHub
   revoke authenticates with a token that has died. A failed revoke is logged naming the job and the handle, keeps
-  the record for the next start, and still removes the staged file; the daemon starts either way. `sandyd cancel`
+  the record, and still removes the staged file; the daemon starts either way. The kept record is the evidence and
+  the handle for a provider whose revoke needs no token; a GitHub retry cannot succeed, since its revoke
+  authenticates with the staged token that is already removed, so that token lives to its native expiry. Each
+  revoke is bounded by the provider call bound (45 s), in the recovery pass and in the offline cancel, so a hung
+  provider cannot hold either. Recovery skips a job this daemon holds live, and the records are read before the
+  daemon serves, so a Submit it takes later is never in the set. A failed record write at adopt is logged only: the
+  job runs, and a crash before its release leaves that token to its native expiry. `sandyd cancel`
   (the offline operator cancel) marks the row and revokes the same record. The record lives in the store, not in a
   file beside the token: the store is already `0600`, scoped to this daemon (a shared staging base needs no owner
   marker, and a live `sandy run`'s dirs are never touched), and the bracket's `remove_dir_on_revoke` needs the

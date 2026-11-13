@@ -295,12 +295,14 @@ async fn main() {
         }
     };
 
-    // #830: revoke the credentials a previous sandyd left behind. After the socket is bound and the rows are
-    // recovered, so no job is reported live while this runs; in the background, since each revoke is a provider call.
+    // #830: revoke the credentials a previous sandyd left behind. The records are read here, before anything is
+    // served, so a job this daemon adopts later is never in the set; the revokes run in the background after the bind,
+    // since each is a provider call.
     if let Some(credentials) = registry.credentials() {
         let credentials = Arc::clone(credentials);
+        let records = credentials.recoverable();
         tokio::task::spawn_blocking(move || {
-            let report = credentials.recover();
+            let report = credentials.recover_records(records);
             if !(report.revoked.is_empty() && report.expired.is_empty() && report.failed.is_empty()) {
                 tracing::warn!(
                     revoked = report.revoked.len(),
@@ -941,7 +943,8 @@ fn run_operator_command() -> Option<i32> {
         }
     };
     Some(
-        match sandyd::operator::cancel_offline_and_revoke(&db, &job_id, &sandyd::credential::TrustRootResolver) {
+        match sandyd::operator::cancel_offline_and_revoke(&db, &job_id, Arc::new(sandyd::credential::TrustRootResolver))
+        {
             Ok((outcome, revoked)) => {
                 match &revoked {
                     Some(Ok(())) => println!("revoked the credential of {job_id}"),

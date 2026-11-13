@@ -132,6 +132,49 @@ pub fn revoke_recorded(resolver: &dyn CredentialResolver, record: &CredentialRec
     result
 }
 
+/// Start [`revoke_recorded`] on a thread of its own and return the receiver of its outcome, so the caller can bound
+/// the wait. The thread owns the provider, which may own a runtime that must not drop on a runtime thread.
+fn spawn_revoke(
+    resolver: Arc<dyn CredentialResolver>,
+    record: CredentialRecord,
+) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("sandy-cred-recover".to_owned())
+        .spawn(move || {
+            let _ = tx.send(revoke_recorded(resolver.as_ref(), &record));
+        })
+        .map_err(|e| format!("could not start the revoke thread: {e}"))?;
+    Ok(rx)
+}
+
+/// Wait for a revoke started by [`spawn_revoke`] until `deadline`. A revoke that is still running then is reported as
+/// failed; its thread finishes (and removes the staged file) whenever the provider answers.
+fn await_revoke(
+    rx: &std::sync::mpsc::Receiver<Result<(), String>>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+        Ok(outcome) => outcome,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("the revoke did not finish within its bound".to_owned()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("the revoke thread panicked".to_owned()),
+    }
+}
+
+/// [`revoke_recorded`] on its own thread, bounded by `timeout`: for the offline `sandyd cancel`, which must not hang on
+/// a provider that never answers.
+///
+/// # Errors
+/// As [`revoke_recorded`], or a message naming the bound when the provider did not answer in time.
+pub fn revoke_recorded_bounded(
+    resolver: Arc<dyn CredentialResolver>,
+    record: &CredentialRecord,
+    timeout: Duration,
+) -> Result<(), String> {
+    let rx = spawn_revoke(resolver, record.clone())?;
+    await_revoke(&rx, std::time::Instant::now() + timeout)
+}
+
 /// Remove a recorded staged token file and its `cred-*` dir. Refuses a path that is not shaped like one the daemon
 /// stages, so a damaged record cannot point this at another file. Best effort.
 fn remove_staged(token_path: &std::path::Path) {
@@ -303,8 +346,10 @@ impl JobCredentials {
     /// [`JobCredentials::release`]. Blocking when a store is set (it records the revocation state): call it from a
     /// blocking task.
     pub fn adopt(&self, job_id: &str, trust_root: &str, bracket: CredentialBracket) {
-        self.record(job_id, trust_root, &bracket);
+        // Live first, then the record: a recovery pass that reads the record finds the job live and skips it.
+        let (handle, expires_at, source) = (bracket.handle(), bracket.expires_at(), bracket.secret_ref().source);
         let previous = self.lock_live().insert(job_id.to_owned(), bracket);
+        self.record(job_id, trust_root, handle, expires_at, source);
         if previous.is_some() {
             // Job ids are fresh UUIDs; a second adopt is a caller bug. The
             // displaced bracket revokes on drop, so it still does not leak.
@@ -369,24 +414,38 @@ impl JobCredentials {
         }
     }
 
-    /// Revoke the credentials a previous daemon left behind and forget their records (#830). Blocking: run it on a
-    /// blocking task, after the control socket is bound. A record past its expiry needs no revoke (the token is dead).
-    /// A revoke that fails leaves its record for the next start; the staged token file is removed either way. At most
-    /// [`MAX_CONCURRENT_RELEASES`] revokes run at once, each bounded by the provider's own call deadline.
+    /// The revocation records in the store: the credentials a previous daemon left behind, when read before this daemon
+    /// serves anything (every job it adopts after that has a fresh id and is not in the snapshot). Blocking.
+    #[must_use]
+    pub fn recoverable(&self) -> Vec<(String, CredentialRecord)> {
+        let Some(store) = &self.store else { return Vec::new() };
+        store.credential_records().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not read the credential records; nothing to recover");
+            Vec::new()
+        })
+    }
+
+    /// [`JobCredentials::recoverable`] then [`JobCredentials::recover_records`].
     #[must_use]
     pub fn recover(&self) -> RecoveryReport {
+        self.recover_records(self.recoverable())
+    }
+
+    /// Revoke the credentials a previous daemon left behind and forget their records (#830). Blocking: run it on a
+    /// blocking task, after the control socket is bound. A job this daemon holds live is skipped: its record is its
+    /// own. A record past its expiry needs no revoke (the token is dead). A revoke that fails or outlasts the provider
+    /// call bound leaves its record for the next start; the staged token file is removed either way once the provider
+    /// returns. At most [`MAX_CONCURRENT_RELEASES`] revokes run at once.
+    #[must_use]
+    pub fn recover_records(&self, records: Vec<(String, CredentialRecord)>) -> RecoveryReport {
         let mut report = RecoveryReport::default();
         let Some(store) = &self.store else { return report };
-        let records = match store.credential_records() {
-            Ok(records) => records,
-            Err(e) => {
-                tracing::warn!(error = %e, "could not read the credential records; nothing to recover");
-                return report;
-            }
-        };
         let now = unix_secs(std::time::SystemTime::now());
         let mut due = Vec::new();
         for (job_id, record) in records {
+            if self.lock_live().contains_key(&job_id) {
+                continue;
+            }
             if record.expires_at_unix > now {
                 due.push((job_id, record));
                 continue;
@@ -396,25 +455,16 @@ impl JobCredentials {
             report.expired.push(job_id);
         }
         for batch in due.chunks(MAX_CONCURRENT_RELEASES) {
-            // A thread of its own, not the blocking pool: a live adapter owns a tokio runtime, which must not
-            // drop inside another one.
+            let deadline = std::time::Instant::now() + self.call_timeout;
             let running: Vec<_> = batch
                 .iter()
                 .map(|(job_id, record)| {
-                    let (resolver, record) = (Arc::clone(&self.resolver), record.clone());
-                    let spawned = std::thread::Builder::new()
-                        .name("sandy-cred-recover".to_owned())
-                        .spawn(move || revoke_recorded(resolver.as_ref(), &record));
-                    (job_id, record_handle(batch, job_id), spawned)
+                    let started = spawn_revoke(Arc::clone(&self.resolver), record.clone());
+                    (job_id, record_handle(batch, job_id), started)
                 })
                 .collect();
-            for (job_id, handle, spawned) in running {
-                let outcome = match spawned {
-                    Ok(thread) => thread
-                        .join()
-                        .unwrap_or_else(|_| Err("the revoke thread panicked".to_owned())),
-                    Err(e) => Err(format!("could not start the revoke thread: {e}")),
-                };
+            for (job_id, handle, started) in running {
+                let outcome = started.and_then(|rx| await_revoke(&rx, deadline));
                 match outcome {
                     Ok(()) => {
                         tracing::info!(job_id = %job_id, handle, "revoked a credential a previous sandyd left behind");
@@ -431,12 +481,18 @@ impl JobCredentials {
         report
     }
 
-    /// Write `job_id`'s revocation record, from the live `bracket`. A failed write is logged: the job still runs,
-    /// and a crash before its release leaves the token valid until its native expiry.
-    fn record(&self, job_id: &str, trust_root: &str, bracket: &CredentialBracket) {
+    /// Write `job_id`'s revocation record. A failed write is logged: the job still runs, and a crash before its release
+    /// leaves the token valid until its native expiry.
+    fn record(
+        &self,
+        job_id: &str,
+        trust_root: &str,
+        handle: Option<sandy::CredentialHandle>,
+        expires_at: Option<std::time::SystemTime>,
+        source: sandy::SecretSource,
+    ) {
         let Some(store) = &self.store else { return };
-        let (Some(handle), Some(expires_at), sandy::SecretSource::File(token_path)) =
-            (bracket.handle(), bracket.expires_at(), bracket.secret_ref().source)
+        let (Some(handle), Some(expires_at), sandy::SecretSource::File(token_path)) = (handle, expires_at, source)
         else {
             return;
         };
@@ -1249,6 +1305,42 @@ mod tests {
         let again = recover(restarted(&d)).await?;
         assert_eq!(again, RecoveryReport::default(), "a second start finds nothing");
         assert_eq!(d.provider.revoked().len(), 1);
+        Ok(())
+    }
+
+    /// #830 (review): a provider that never answers a recovery revoke cannot hold the pass past the call bound; the
+    /// record stays for the next start.
+    #[tokio::test]
+    async fn a_hung_revoke_at_recovery_ends_at_the_bound_and_keeps_the_record() -> anyhow::Result<()> {
+        let provider = Scripted {
+            revoke_delay: Duration::from_secs(5),
+            ..Scripted::default()
+        };
+        let d = daemon_custom(
+            provider,
+            |c| c.with_call_timeout(Duration::from_millis(200)),
+            |_| Ok(JobStore::open_in_memory()?),
+        )?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+
+        let started = Instant::now();
+        let report = recover(restarted(&d).with_call_timeout(Duration::from_millis(200))).await?;
+
+        assert_eq!(report.failed, [submitted.job_id.clone()], "{report:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            d.store.credential_record(&submitted.job_id)?.is_some(),
+            "the record stays"
+        );
         Ok(())
     }
 

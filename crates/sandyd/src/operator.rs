@@ -7,10 +7,13 @@
 //! It holds the store's lock file for the whole call, so it refuses while a daemon uses that store.
 //! It only marks the row `Cancelled`: see [`cancel_offline`] for what it does not stop.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
-    credential::{CredentialResolver, revoke_recorded},
+    credential::{CredentialResolver, DAEMON_CALL_TIMEOUT, revoke_recorded_bounded},
     store::{CancelOutcome, JobStore, StoreError},
 };
 
@@ -92,15 +95,16 @@ pub fn cancel_offline(db: &Path, job_id: &str) -> Result<CancelOutcome, Operator
 }
 
 /// [`cancel_offline`], then revoke the job's recorded credential through `resolver` (#830, #719 item 1) while the
-/// store is still locked. The revoke result is `None` when the job holds no credential record, so a cancel with
-/// nothing to revoke prints nothing extra. A failed revoke keeps the record: the next daemon start tries again.
+/// store is still locked, bounded by the provider call bound. The revoke result is `None` when the job holds no
+/// credential record, so a cancel with nothing to revoke prints nothing extra. A failed revoke keeps the record: the
+/// next daemon start tries again.
 ///
 /// # Errors
 /// As [`cancel_offline`].
 pub fn cancel_offline_and_revoke(
     db: &Path,
     job_id: &str,
-    resolver: &dyn CredentialResolver,
+    resolver: Arc<dyn CredentialResolver>,
 ) -> Result<(CancelOutcome, Option<Result<(), String>>), OperatorCancelError> {
     let _lock = lock_store(db)?;
     if !db.exists() {
@@ -114,7 +118,7 @@ pub fn cancel_offline_and_revoke(
     let Some(record) = store.credential_record(job_id)? else {
         return Ok((outcome, None));
     };
-    let revoked = revoke_recorded(resolver, &record);
+    let revoked = revoke_recorded_bounded(resolver, &record, DAEMON_CALL_TIMEOUT);
     if revoked.is_ok() {
         store.clear_credential(job_id)?;
     }
@@ -252,7 +256,7 @@ mod tests {
         let (db, token) = store_with_a_credentialed_job(tmp.path())?;
         let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t"));
 
-        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", &OneProvider(provider.clone()))?;
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider.clone())))?;
 
         assert_eq!(outcome, CancelOutcome::Cancelled);
         assert!(matches!(revoked, Some(Ok(()))), "{revoked:?}");
@@ -269,7 +273,7 @@ mod tests {
         let (db, _token) = store_with_a_credentialed_job(tmp.path())?;
         let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t").with_failing_revoke());
 
-        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", &OneProvider(provider))?;
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider)))?;
 
         assert_eq!(outcome, CancelOutcome::Cancelled);
         assert!(matches!(revoked, Some(Err(_))), "{revoked:?}");
@@ -285,7 +289,7 @@ mod tests {
         JobStore::open(&db)?.insert_pending("job-1", b"m", "enc")?;
         let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t"));
 
-        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", &OneProvider(provider.clone()))?;
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider.clone())))?;
 
         assert_eq!(outcome, CancelOutcome::Cancelled);
         assert!(revoked.is_none());
