@@ -208,4 +208,56 @@ mod tests {
         .expect_err("the call fails");
         assert_eq!(err, WaitError::Call("the daemon closed the connection".to_owned()));
     }
+
+    /// A daemon that accepts the call and never answers ends the wait at the bound, naming no state when none was
+    /// seen, not after it. The outer timeout only keeps a regression from hanging the suite.
+    #[tokio::test]
+    async fn a_stalled_daemon_ends_the_wait_at_the_bound() -> anyhow::Result<()> {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_until_terminal(
+                || std::future::pending::<Result<StatusResponse, String>>(),
+                Duration::from_millis(5),
+                Duration::from_millis(60),
+            ),
+        )
+        .await
+        .context("the wait hung past its bound on a stalled call")?;
+        let WaitError::TimedOut(state, bound) = outcome.expect_err("nothing ever answers") else {
+            anyhow::bail!("expected a timeout");
+        };
+        assert!(state.contains("no answer"), "{state}");
+        assert_eq!(bound, Duration::from_millis(60));
+        Ok(())
+    }
+
+    /// A call that stalls after an answer names the last state seen.
+    #[tokio::test]
+    async fn a_stall_after_an_answer_names_the_last_state() -> anyhow::Result<()> {
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_until_terminal(
+                || {
+                    let answer = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        if answer {
+                            Ok(response(JobStatus::Running, None))
+                        } else {
+                            std::future::pending().await
+                        }
+                    }
+                },
+                Duration::from_millis(5),
+                Duration::from_millis(60),
+            ),
+        )
+        .await
+        .context("the wait hung past its bound on a stalled call")?;
+        let WaitError::TimedOut(state, _) = outcome.expect_err("the second call stalls") else {
+            anyhow::bail!("expected a timeout");
+        };
+        assert!(state.contains("RUNNING"), "{state}");
+        Ok(())
+    }
 }
