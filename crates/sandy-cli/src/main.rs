@@ -938,7 +938,15 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 *from_devshell,
                 plain,
             )),
-            (None, Some(template)) => Some(sandy_cli::submit::template_manifest(&template, plain)),
+            (None, Some(template)) => match sandy_cli::submit::template_source(&template) {
+                Ok((flake, note)) => {
+                    if let Some(note) = note {
+                        eprintln!("{note}");
+                    }
+                    Some(sandy_cli::submit::template_manifest(&flake, plain))
+                }
+                Err(e) => Some(Err(e)),
+            },
             (None, None) => None,
         };
         match built {

@@ -19,18 +19,35 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A template is a flake reference: one with a `#` is a full attr, which carries the submitter's system and is refused,
-/// naming `--flake`.
+/// `REF#topologies.<system>.<hypervisor>` is the flake `REF` (owner ruling on #483): accepted client-side, with a note
+/// that the executor picks its own system and hypervisor. Only the missing daemon fails.
 #[test]
-fn a_template_with_a_hash_is_refused_naming_flake() -> anyhow::Result<()> {
+fn a_template_with_a_topology_attr_is_accepted_with_a_note() -> anyhow::Result<()> {
     let home = tempfile::tempdir().context("home")?;
     let out = submit(
         home.path(),
         &["./guest#topologies.x86_64-linux.qemu", "--isolation-class", "trusted"],
     )?;
+    let text = stderr(&out);
+    assert_ne!(out.status.code(), Some(2), "not a usage error: {text}");
+    assert!(text.contains("its own system and hypervisor"), "{text}");
+    Ok(())
+}
+
+/// A `#` attr that is not a topology is refused, naming the template forms and `--flake`.
+#[test]
+fn a_template_with_another_attr_is_refused_naming_flake() -> anyhow::Result<()> {
+    let home = tempfile::tempdir().context("home")?;
+    let out = submit(
+        home.path(),
+        &["./guest#nixosConfigurations.dev", "--isolation-class", "trusted"],
+    )?;
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     let text = stderr(&out);
-    assert!(text.contains("has a `#`") && text.contains("--flake"), "{text}");
+    assert!(
+        text.contains("topologies.<system>.<hypervisor>") && text.contains("--flake"),
+        "{text}"
+    );
     Ok(())
 }
 

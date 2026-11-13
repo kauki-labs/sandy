@@ -129,8 +129,18 @@ pub const BUNDLED_GUEST_FLAKE: &str = "bundled:guest";
 /// An error naming `$SANDY_GUEST_WRAPPER` when the bundled flake is asked for and `root` does not hold
 /// `nix/guest/flake.nix`.
 pub fn resolve_bundled_flake(flake_ref: &str, root: impl FnOnce() -> Result<PathBuf>) -> Result<String> {
-    let _ = root;
-    Ok(flake_ref.to_owned())
+    if flake_ref != BUNDLED_GUEST_FLAKE {
+        return Ok(flake_ref.to_owned());
+    }
+    let root = root()?;
+    let guest = root.join("nix/guest");
+    if !guest.join("flake.nix").is_file() {
+        bail!(
+            "the bundled guest flake is not at {} (set $SANDY_GUEST_WRAPPER to a tree that holds nix/guest)",
+            guest.display()
+        );
+    }
+    Ok(format!("path:{}", guest.display()))
 }
 
 /// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
@@ -171,6 +181,7 @@ pub fn resolve_flake_template(
     mac_prereq_check: impl FnOnce() -> Option<String>,
     deadline: Option<std::time::Instant>,
 ) -> Result<ResolvedTemplate> {
+    let flake_ref = &resolve_bundled_flake(flake_ref, guest_wrapper_root)?;
     let host = host_target();
     let (kind, resolved_attr) = if from_devshell {
         if kind.is_some() {

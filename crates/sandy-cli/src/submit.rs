@@ -39,7 +39,7 @@ pub struct PlainFlags {
 /// # Errors
 ///
 /// [`PlanError::Invalid`] for a template that names an existing file or `-` (a forgotten `--manifest-encoding`, never
-/// a silent flake lookup) and for one that holds a `#` (use `--flake`).
+/// a silent flake lookup).
 pub fn classify_positional<'a>(
     positional: &'a str,
     manifest_encoding: Option<&str>,
@@ -51,12 +51,6 @@ pub fn classify_positional<'a>(
     if positional == "-" || exists(positional) {
         return Err(PlanError::Invalid(format!(
             "`{positional}` looks like a manifest file; pass --manifest-encoding to submit it as one"
-        )));
-    }
-    if positional.contains('#') {
-        return Err(PlanError::Invalid(format!(
-            "template `{positional}` has a `#`: a template is a flake reference, not a full attr; use --flake (with \
-             --kind) for one"
         )));
     }
     Ok(Positional::Template(positional))
@@ -79,7 +73,53 @@ pub fn classify_positional<'a>(
 /// `--kind`/`--attr`), an empty reference before the `#`, and a bare word that is neither a topology attr nor a
 /// reference.
 pub fn template_source(template: &str) -> Result<(String, Option<String>), PlanError> {
-    Ok((template.to_owned(), None))
+    let refuse = |why: String| {
+        PlanError::Invalid(format!(
+            "template `{template}`: {why}; a template is `topologies.<system>.<hypervisor>` or a flake reference (use \
+             --flake with --kind/--attr for another attr)"
+        ))
+    };
+    let note = |flake: &str| {
+        format!(
+            "sandy: note: `{template}` names a topology of {flake}, but the executor picks its own system and \
+             hypervisor, so those parts are not sent"
+        )
+    };
+    if let Some((reference, attr)) = template.split_once('#') {
+        if reference.is_empty() {
+            return Err(refuse("the flake reference before the `#` is empty".to_owned()));
+        }
+        if !is_topology_attr(attr) {
+            return Err(refuse(format!("`{attr}` is not a topology attr")));
+        }
+        return Ok((reference.to_owned(), Some(note(reference))));
+    }
+    if is_topology_attr(template) {
+        let bundled = sandy_guest_template::BUNDLED_GUEST_FLAKE;
+        return Ok((bundled.to_owned(), Some(note("sandy's guest flake"))));
+    }
+    if template.starts_with("topologies.") {
+        return Err(refuse(
+            "a topology attr has exactly a system and a hypervisor".to_owned(),
+        ));
+    }
+    if template.contains(['/', ':']) || template == "." {
+        return Ok((template.to_owned(), None));
+    }
+    Err(refuse("it is neither a topology attr nor a flake reference".to_owned()))
+}
+
+/// Whether `attr` is `topologies.<system>.<hypervisor>`: three non-empty dot-separated parts without spaces.
+fn is_topology_attr(attr: &str) -> bool {
+    let mut parts = attr.split('.');
+    parts.next() == Some("topologies")
+        && parts
+            .by_ref()
+            .take(2)
+            .filter(|p| !p.is_empty() && !p.contains(char::is_whitespace))
+            .count()
+            == 2
+        && parts.next().is_none()
 }
 
 /// The `flake/v1` manifest for a flake reference.
@@ -165,13 +205,12 @@ mod tests {
         }
     }
 
+    /// A `#` is part of a template now (ruling on #483): the positional classifies as a template and
+    /// [`template_source`] decides what it names.
     #[test]
-    fn a_template_with_a_hash_is_refused_naming_flake() {
-        let text = classify_positional("./g#topologies.x86_64-linux.qemu", None, |_| false)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(text.contains("--flake"), "{text}");
+    fn a_template_with_a_hash_classifies_as_a_template() {
+        let got = classify_positional("./g#topologies.x86_64-linux.qemu", None, |_| false);
+        assert_eq!(got, Ok(Positional::Template("./g#topologies.x86_64-linux.qemu")));
     }
 
     #[test]
