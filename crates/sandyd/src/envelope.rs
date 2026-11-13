@@ -322,6 +322,39 @@ fn validate_side(side: Option<&sandy_executor_proto::ContentDigests>) -> Result<
     Ok(sandy::ContentDigests { files, skipped })
 }
 
+/// Every path of `side` starts with the name of an input the Submit declared: the executor stages and hashes only
+/// those, so any other name is invented.
+fn check_declared(side: &sandy::ContentDigests, declared: &[String]) -> Result<(), String> {
+    let paths = side
+        .files
+        .iter()
+        .map(|file| &file.path)
+        .chain(side.skipped.iter().map(|entry| &entry.path));
+    for path in paths {
+        let name = path.split('/').next().unwrap_or_default();
+        if !declared.iter().any(|declared| declared == name) {
+            return Err(format!("the path {path:?} is not under a declared input"));
+        }
+    }
+    Ok(())
+}
+
+/// No path of `side` is reported twice, hashed or skipped: a path has one content, so a repeat is a lie or a bug.
+fn check_unique(side: &sandy::ContentDigests) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let paths = side
+        .files
+        .iter()
+        .map(|file| &file.path)
+        .chain(side.skipped.iter().map(|entry| &entry.path));
+    for path in paths {
+        if !seen.insert(path) {
+            return Err(format!("the path {path:?} is reported more than once"));
+        }
+    }
+    Ok(())
+}
+
 /// Keep the first entries of `list` while they stay inside the entry and path-byte caps; the total before the cut.
 fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
     let total = list.len();
@@ -342,10 +375,13 @@ fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
 /// when something was cut. `Err` names why the report is malformed.
 fn ingest_digests(
     report: &sandy_executor_proto::RunDigests,
-    _declared_inputs: &[String],
+    declared_inputs: &[String],
 ) -> Result<((sandy::ContentDigests, sandy::ContentDigests), Option<String>), String> {
     let mut inputs = validate_side(report.inputs.as_ref()).map_err(|why| format!("inputs: {why}"))?;
     let mut outputs = validate_side(report.outputs.as_ref()).map_err(|why| format!("outputs: {why}"))?;
+    check_declared(&inputs, declared_inputs).map_err(|why| format!("inputs: {why}"))?;
+    check_unique(&inputs).map_err(|why| format!("inputs: {why}"))?;
+    check_unique(&outputs).map_err(|why| format!("outputs: {why}"))?;
     inputs.sort();
     outputs.sort();
     let mut cut = Vec::new();
