@@ -2029,6 +2029,7 @@ mod tests {
                 data_link: None,
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
+                declared_outputs: Vec::new(),
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
@@ -2092,6 +2093,7 @@ mod tests {
                 data_link: None,
                 data_inputs: Vec::new(),
                 data_outputs: Vec::new(),
+                declared_outputs: Vec::new(),
                 outputs: crate::output_slot::OutputsSlot::new(),
                 granted_caps: job.granted_caps.clone(),
                 session: job.session,
@@ -3402,6 +3404,39 @@ mod tests {
             });
             assert_eq!(dispatch.egress, want, "{name}");
         }
+        Ok(())
+    }
+
+    /// A2c (#483): the job's channel keeps the outputs the Submit declared, for every placement, so the envelope can
+    /// list what they hold.
+    #[tokio::test]
+    async fn a_placed_job_records_the_outputs_it_declared() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let mut request = submit_req(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.outputs = vec![
+                sandy_control_proto::Output {
+                    name: Some("report".to_owned()),
+                    dest: "/out/report".to_owned(),
+                },
+                sandy_control_proto::Output {
+                    name: None,
+                    dest: "/out/rest".to_owned(),
+                },
+            ];
+        }
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            ..trusted_host_capabilities()
+        };
+        let (_dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
+        assert_eq!(
+            job.declared_outputs,
+            [
+                (Some("report".to_owned()), std::path::PathBuf::from("/out/report")),
+                (None, std::path::PathBuf::from("/out/rest")),
+            ]
+        );
         Ok(())
     }
 

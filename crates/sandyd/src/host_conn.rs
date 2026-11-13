@@ -2245,6 +2245,100 @@ mod tests {
         Ok(())
     }
 
+    /// A job registered with `declared` outputs, run to a clean terminal result.
+    async fn envelope_for_job_with_outputs(
+        declared: Vec<(Option<String>, std::path::PathBuf)>,
+    ) -> anyhow::Result<sandy::ResultEnvelope> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.declared_outputs = declared;
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            result_for("job-1", 0, false),
+        )
+        .await;
+        store.envelope("job-1")?.context("a terminal job carries an envelope")
+    }
+
+    /// A2c (#483): the envelope lists what the run left at the declared destinations, as the direct path does: the
+    /// paths in `outputs`, and the paths with sizes in the receipt's `guest_reported.outputs`. A named output is
+    /// prefixed with its name, a catch-all is not, and the list is sorted.
+    #[tokio::test]
+    async fn the_envelope_lists_the_outputs_left_at_the_declared_destinations() -> anyhow::Result<()> {
+        let named = tempfile::tempdir().context("named dest")?;
+        std::fs::write(named.path().join("a.txt"), b"abc")?;
+        std::fs::create_dir(named.path().join("sub"))?;
+        std::fs::write(named.path().join("sub").join("b.txt"), b"hello")?;
+        let catch_all = tempfile::tempdir().context("catch-all dest")?;
+        std::fs::write(catch_all.path().join("c.bin"), b"")?;
+        let envelope = envelope_for_job_with_outputs(vec![
+            (Some("out".to_owned()), named.path().to_owned()),
+            (None, catch_all.path().to_owned()),
+        ])
+        .await?;
+        let paths: Vec<&str> = envelope.outputs.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, ["c.bin", "out/a.txt", "out/sub/b.txt"]);
+        let sizes: Vec<(String, u64)> = envelope
+            .receipt
+            .context("the audit receipt")?
+            .guest_reported
+            .outputs
+            .into_iter()
+            .map(|o| (o.path, o.size_bytes))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                ("c.bin".to_owned(), 0),
+                ("out/a.txt".to_owned(), 3),
+                ("out/sub/b.txt".to_owned(), 5)
+            ]
+        );
+        Ok(())
+    }
+
+    /// A2c (#483): a job that declared no outputs lists none, and an unreadable destination lists none rather than
+    /// failing the job.
+    #[tokio::test]
+    async fn a_job_without_readable_outputs_lists_none() -> anyhow::Result<()> {
+        let none = envelope_for_job_with_outputs(Vec::new()).await?;
+        assert!(none.outputs.is_empty());
+        let missing =
+            envelope_for_job_with_outputs(vec![(None, std::path::PathBuf::from("/nonexistent/sandy-dest"))]).await?;
+        assert!(missing.outputs.is_empty());
+        assert_eq!(missing.status, sandy::Status::Succeeded, "the job itself is unaffected");
+        Ok(())
+    }
+
+    /// A2c (#483): the list the daemon keeps is bounded (a tree of many files would push the `Status` reply past one
+    /// frame): the first 256 paths, with a warning that the rest were left out.
+    #[tokio::test]
+    async fn a_long_output_list_is_cut_with_a_warning() -> anyhow::Result<()> {
+        let dest = tempfile::tempdir().context("dest")?;
+        for i in 0..300 {
+            std::fs::write(dest.path().join(format!("f{i:03}.txt")), b"x")?;
+        }
+        let envelope = envelope_for_job_with_outputs(vec![(None, dest.path().to_owned())]).await?;
+        assert_eq!(envelope.outputs.len(), 256);
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|w| w.contains("outputs") && w.contains("300")),
+            "a warning names the cut: {:?}",
+            envelope.warnings
+        );
+        Ok(())
+    }
+
     /// A2 (#483): a job that is not terminal has no envelope, and one whose host disconnected gets a failed,
     /// retryable one, so every terminal path leaves exactly what a direct run would.
     #[tokio::test]
