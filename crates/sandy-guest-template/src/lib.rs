@@ -22,5 +22,6 @@ pub mod host_target;
 pub mod manifest;
 
 pub use flake_wrap::{
-    ResolvedTemplate, TemplateKind, guest_wrapper_present, nix_bin, parse_kind, resolve_flake_template,
+    BUNDLED_GUEST_FLAKE, ResolvedTemplate, TemplateKind, guest_wrapper_present, nix_bin, parse_kind,
+    resolve_bundled_flake, resolve_flake_template,
 };
