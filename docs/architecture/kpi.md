@@ -427,6 +427,24 @@ failed only because `tmux` was missing there (`sandy-agent: starting the tmux jo
 directory`) and, before that, because `/tmp/sandy` on that host belonged to another user, so the executor ran
 with `TMPDIR` set to a directory of its own.
 
+## Executor on macOS (#483)
+
+A Mac runs `sandy-host-executor` and executes a VM job through vfkit
+([`process-containment.md`](../decisions/process-containment.md) decision 7). Tier-2 tests cover the declaration, the
+hypervisor choice and the refusal of an uncontained process dispatch. The live row was run by hand once.
+
+| #     | Capability          | Required behaviour                                                                                                                                                                                                                                                           | Test                                                | Hypervisor | Status           |
+| ----- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ---------- | ---------------- |
+| KEXM1 | Mac executor VM job | `sandyd` and `sandy-host-executor` on one Mac, the executor registers `Vm` only, an untrusted `--flake --kind topology` job dispatched by `sandyd` boots a vfkit guest, runs `echo`, and `sandy daemon status -o json` shows `Succeeded`, exit 0 and a `succeeded` envelope. | by hand (`docs/design/host-executor/spec.md` macOS) | vfkit      | green 2026-11-13 |
+
+**Run of 2026-11-13** (aarch64-darwin, mesh on loopback, ports in the 47000s, mutual-TLS keys generated per process).
+The executor logged `registered with the orchestrator`, then `spawned vfkit under PTY console`, then `dispatch
+finished booted=true guest_exit=0`; the guest printed `hello-from-vfkit` and `sandyd` recorded `Succeeded`, exit 0.
+Two first attempts failed for setup reasons only: `vfkit` was not on `PATH` (set `SANDY_VFKIT_BIN`; the executor then
+refused to register, as designed), and the guest runner was not yet built on this host (`failed to open file
+/nix/store/...-microvm-store-disk.erofs`). Not covered: a job with inputs or outputs, an egress policy, or a
+`nixos-module` flake on a Mac.
+
 ## Not yet a KPI
 
 Deferred capability with no live floor yet, so a reader does not mistake its

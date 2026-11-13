@@ -216,3 +216,31 @@ binary's runtime dependencies must be in the rootfs, and it brings ongoing
 maintenance. Splitting `isolates_untrusted` into execution containment and read
 confidentiality: a seam change with no consumer, because no job needs untrusted
 execution without read confidentiality.
+
+## 7. A host with no process containment declares the VM kind alone, and the executor refuses a process dispatch there (#483)
+
+**Status:** accepted (owner ruling on #483, 2026-11-13: a Mac executor runs VM jobs through vfkit before the direct path
+is deleted). **Refines:** decisions 4 and 6.
+
+**Context.** Decision 4 makes macOS report containment `Unsupported`. The host-executor read that as "declare
+nothing", so it refused to start on a Mac and a Mac could run no job through `sandyd`. A Mac does have a boundary: the
+vfkit VM (decision 6).
+
+**Decision.** The executor's declaration follows what the host can run, not the containment status alone.
+
+- Process containment available: `Process`, plus `Vm` when a VM can run. Unchanged.
+- No process containment but a VM can run, on a vfkit host (macOS, which has no process containment at all): `Vm`
+  alone, and both isolation classes (a VM honours `Trusted` and `Untrusted`). Any other host with no process
+  containment still declares nothing and refuses to start, qemu or not: reaping gates a Linux host (decision 6), and a
+  Linux host that lost its user systemd is a fault to fix, not a VM-only host. A host with neither refuses to start.
+- `check_isolation_class` admits a `Trusted` job on any host, so on its own it would let a process dispatch run
+  uncontained on that Mac. `handle_dispatch` therefore refuses a `Process` dispatch when its own fresh containment
+  probe is not available (`ProcessContainmentUnavailable`), mirroring the VM arm's `vm_available` re-check.
+- A VM dispatch picks its hypervisor by OS: vfkit on macOS (`SANDY_VFKIT_BIN`, else `vfkit` on `PATH`, the lookup `sandy
+run` uses), qemu elsewhere. The VM probe on macOS needs vfkit, nix and the guest wrapper, and no `/dev/kvm` or
+  `/dev/vhost-vsock`.
+
+**Consequences.** A topology (`--kind topology`) is evaluated, not built: its store paths must be realised on the
+executor host first (`nix build <guest>#packages.aarch64-darwin.guest-runner-vfkit`, which goes through the
+linux-builder). A `nixos-module` or `nixos-configuration` flake is built by the guest wrapper. A missing linux-builder
+surfaces as the `FlakeResolve` error with nix's own message; `sandy doctor` stays the place that checks it up front.

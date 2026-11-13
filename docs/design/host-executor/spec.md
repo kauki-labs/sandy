@@ -232,6 +232,19 @@ every knob below from environment variables — there is no CLI flag form.
    This covers `argv/v1` trusted-process execution only (`ProcessBackend::with_agent`). It does
    not exercise `flake/v1`'s VM dispatch, untrusted-job execution, or per-job egress isolation.
 
+   **macOS executor (VM only).** A Mac has no process containment, so its executor declares `Vm` alone
+   (`process-containment.md` decision 7) and refuses an `argv/v1` dispatch. It needs `vfkit` (put it on `PATH` or set
+   `SANDY_VFKIT_BIN`), `nix` and a running linux-builder. Realise the guest first, then run the same three processes
+   with `sandyd`'s mesh on loopback and submit a VM job:
+
+   ```
+   nix build --no-link ./nix/guest#packages.aarch64-darwin.guest-runner-vfkit
+   sandy daemon submit --flake ./nix/guest --kind topology --isolation-class untrusted -- echo hello
+   ```
+
+   `SANDY_AGENT_PATH` is still required by the executor's config but a VM job does not use it (the topology names the
+   guest's agent).
+
 ## Out of scope now (seam ready, implementations deferred)
 
 - Other targets: KVM/qemu/vfkit, FaaS, Proxmox. The capability-declaration and dispatch

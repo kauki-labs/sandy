@@ -97,7 +97,9 @@ fn capabilities_from(arch: Arch, status: &ContainmentStatus) -> Result<Capabilit
 /// `ContainmentStatus::is_untrusted_boundary()` alone (as this function did
 /// before #381) would advertise a capability the re-check could never honor.
 /// A non-available status honors neither — the empty list is the correct,
-/// fail-closed declaration for a host that can't contain anything at all.
+/// fail-closed declaration for a host that can't contain anything at all. A
+/// vfkit host with a VM and no process containment is handled by
+/// [`to_wire_capabilities`], not here (macOS, #483).
 fn detected_isolation_classes(status: &ContainmentStatus, vm_available: bool) -> Vec<IsolationClass> {
     if !status.is_available() {
         return Vec::new();
@@ -154,8 +156,15 @@ fn to_wire_capabilities(
         Arch::X86_64 => sandy_executor_proto::Arch::X8664,
         Arch::Aarch64 => sandy_executor_proto::Arch::Aarch64,
     };
+    // A VM-only host (a Mac, see `capabilities_for_host`) has no process containment to read the classes from: a VM
+    // honours both.
+    let classes = if capabilities.kind == SandboxKind::Vm {
+        vec![IsolationClass::Trusted, IsolationClass::Untrusted]
+    } else {
+        detected_isolation_classes(status, vm_available)
+    };
     let mut kinds = vec![i32::from(process_kind)];
-    if vm_available {
+    if vm_available && process_kind != sandy_executor_proto::SandboxKind::Vm {
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
@@ -165,10 +174,7 @@ fn to_wire_capabilities(
         supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),
-        supported_isolation_classes: detected_isolation_classes(status, vm_available)
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        supported_isolation_classes: classes.into_iter().map(Into::into).collect(),
         shares_submitter_filesystem,
         transfer,
         // Declared only with VM capability: a process job has no egress boundary to apply a policy with.
@@ -234,11 +240,17 @@ fn declared(value: Option<&str>) -> bool {
 pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabilities, DetectError> {
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
-    let capabilities = capabilities_from(arch, &status)?;
+    let vm_available = detect_vm_capability();
+    let capabilities = capabilities_for_host(
+        arch,
+        &status,
+        vm_available,
+        crate::dispatch::hypervisor_for_os(std::env::consts::OS),
+    )?;
     Ok(to_wire_capabilities(
         capabilities,
         &status,
-        detect_vm_capability(),
+        vm_available,
         shares_submitter_filesystem_from_env(),
         egress_proxy_from(std::env::var("SANDY_HOST_EGRESS_PROXY").ok().as_deref()),
         transfer_from(std::env::var("SANDY_HOST_TRANSFER").ok().as_deref())?,
@@ -286,6 +298,48 @@ fn vm_capability_from(facts: VmProbeFacts) -> bool {
         && facts.kvm_usable
         && facts.vhost_vsock_usable
         && facts.guest_wrapper_present
+}
+
+/// The facts [`vfkit_capability_from`] derives a VM-capability verdict from on macOS, where the hypervisor is vfkit
+/// and there is no `/dev/kvm` or `/dev/vhost-vsock` to probe (the agent link rides vfkit's own vsock socket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VfkitProbeFacts {
+    /// The vfkit binary (`SANDY_VFKIT_BIN`, else `vfkit`) runs.
+    vfkit_runnable: bool,
+    /// `nix` runs: the `flake/v1` branch resolves and builds the guest with it.
+    nix_runnable: bool,
+    /// The packaged guest wrapper flake is present (see [`VmProbeFacts::guest_wrapper_present`]).
+    guest_wrapper_present: bool,
+}
+
+/// Whether `facts` satisfy declaring `SandboxKind::Vm` on a vfkit host.
+fn vfkit_capability_from(facts: VfkitProbeFacts) -> bool {
+    facts.vfkit_runnable && facts.nix_runnable && facts.guest_wrapper_present
+}
+
+/// The capability a host declares from its containment `status` and whether it can run a VM: `Process` when the
+/// containment is available. Without it, a vfkit host (a Mac, which has no process containment at all) declares `Vm`
+/// alone when a VM can run; any other host declares nothing, since reaping gates a Linux host (decision 6).
+fn capabilities_for_host(
+    arch: Arch,
+    status: &ContainmentStatus,
+    vm_available: bool,
+    hypervisor: crate::dispatch::Hypervisor,
+) -> Result<Capabilities, DetectError> {
+    match capabilities_from(arch, status) {
+        Err(_) if vm_available && hypervisor == crate::dispatch::Hypervisor::Vfkit => Ok(Capabilities {
+            kind: SandboxKind::Vm,
+            arch,
+            attestation: None,
+        }),
+        other => other,
+    }
+}
+
+/// The vfkit binary: `SANDY_VFKIT_BIN`, else `vfkit` on `PATH`, the same lookup `sandy run` does. The probe and the
+/// real boot share it, so they cannot drift onto different binaries.
+pub(crate) fn vfkit_bin() -> String {
+    std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string())
 }
 
 /// Whether `binary --version` runs successfully — a real-usability probe
@@ -342,7 +396,14 @@ fn probe_vm_facts() -> VmProbeFacts {
 /// — never trust an earlier registration alone).
 #[must_use]
 pub fn detect_vm_capability() -> bool {
-    vm_capability_from(probe_vm_facts())
+    match crate::dispatch::hypervisor_for_os(std::env::consts::OS) {
+        crate::dispatch::Hypervisor::Qemu => vm_capability_from(probe_vm_facts()),
+        crate::dispatch::Hypervisor::Vfkit => vfkit_capability_from(VfkitProbeFacts {
+            vfkit_runnable: runs_successfully(&vfkit_bin()),
+            nix_runnable: runs_successfully(&sandy_guest_template::nix_bin()),
+            guest_wrapper_present: sandy_guest_template::guest_wrapper_present(),
+        }),
+    }
 }
 
 /// The diagnostic string carried by a non-`Available` [`ContainmentStatus`].
@@ -356,6 +417,7 @@ fn unavailable_reason(status: &ContainmentStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::Hypervisor;
 
     #[test]
     fn detect_arch_matches_the_running_processs_own_target() -> anyhow::Result<()> {
@@ -718,6 +780,86 @@ mod tests {
             !device_openable(&path_str),
             "a nonexistent path must not be reported as openable"
         );
+        Ok(())
+    }
+
+    fn unsupported() -> ContainmentStatus {
+        ContainmentStatus::Unsupported("process containment needs Linux cgroup v2".to_owned())
+    }
+
+    /// A macOS host runs VMs through vfkit: with vfkit, nix and the guest wrapper present it can declare `Vm`, and it
+    /// needs neither `/dev/kvm` nor `/dev/vhost-vsock`. Each missing fact refuses.
+    #[test]
+    fn a_vfkit_host_needs_vfkit_nix_and_the_wrapper_and_no_kvm() {
+        let all = VfkitProbeFacts {
+            vfkit_runnable: true,
+            nix_runnable: true,
+            guest_wrapper_present: true,
+        };
+        assert!(vfkit_capability_from(all), "every fact holds");
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            vfkit_runnable: false,
+            ..all
+        }));
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            nix_runnable: false,
+            ..all
+        }));
+        assert!(!vfkit_capability_from(VfkitProbeFacts {
+            guest_wrapper_present: false,
+            ..all
+        }));
+    }
+
+    /// A host with no process containment but a working VM (a Mac) declares the VM kind alone: no `Process`, which it
+    /// could only run uncontained. With no VM either it still declares nothing, and names the containment reason.
+    #[test]
+    fn a_host_with_no_process_containment_declares_vm_only_when_a_vm_can_run() -> anyhow::Result<()> {
+        let capabilities = capabilities_for_host(Arch::Aarch64, &unsupported(), true, Hypervisor::Vfkit)?;
+        assert_eq!(capabilities.kind, SandboxKind::Vm);
+        let wire = to_wire_capabilities(capabilities, &unsupported(), true, false, false, false);
+        assert_eq!(
+            wire.supported_sandbox_kinds,
+            vec![i32::from(sandy_executor_proto::SandboxKind::Vm)],
+            "no process kind without containment"
+        );
+        assert_eq!(
+            wire.supported_isolation_classes,
+            vec![i32::from(IsolationClass::Trusted), i32::from(IsolationClass::Untrusted)],
+            "a VM honours both classes"
+        );
+        let err = capabilities_for_host(Arch::Aarch64, &unsupported(), false, Hypervisor::Vfkit)
+            .expect_err("neither backend can run");
+        assert!(matches!(err, DetectError::ContainmentUnavailable(_)), "{err:?}");
+        Ok(())
+    }
+
+    /// A Linux host (qemu) with no process containment still refuses to start, even with a working VM: reaping gates a
+    /// Linux host, and only a vfkit host (a Mac, which has no process containment at all) declares VM alone.
+    #[test]
+    fn a_qemu_host_without_process_containment_still_refuses_to_start() {
+        let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
+        let err = capabilities_for_host(Arch::X86_64, &status, true, Hypervisor::Qemu)
+            .expect_err("a Linux host needs its containment");
+        assert_eq!(
+            err,
+            DetectError::ContainmentUnavailable("no user systemd instance".to_owned())
+        );
+    }
+
+    /// A host with process containment keeps its declaration whatever its VM state: `Process`, plus `Vm` when a VM can
+    /// run, exactly as before.
+    #[test]
+    fn a_host_with_process_containment_still_declares_process() -> anyhow::Result<()> {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        for vm in [false, true] {
+            assert_eq!(
+                capabilities_for_host(Arch::X86_64, &status, vm, Hypervisor::Qemu)?.kind,
+                SandboxKind::Process
+            );
+        }
         Ok(())
     }
 }

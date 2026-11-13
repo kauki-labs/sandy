@@ -44,7 +44,7 @@ use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, Sand
 use sandy_fabric_local::mesh_link::relay_agent_link;
 use sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1;
 use sandy_impls_local::ProcessBackend;
-use sandy_impls_vm::QemuBackend;
+use sandy_impls_vm::{QemuBackend, VfkitBackend};
 use serde::Deserialize;
 
 use crate::{
@@ -64,9 +64,54 @@ use crate::{
 /// be guessing a shape no real sender produces).
 pub const MANIFEST_ENCODING_ARGV_V1: &str = "argv/v1";
 
+/// The hypervisor behind a `SandboxKind::Vm` dispatch on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hypervisor {
+    /// qemu/KVM, on every host that is not macOS.
+    Qemu,
+    /// vfkit over Virtualization.framework, on macOS.
+    Vfkit,
+}
+
+/// The hypervisor for `os` (a `std::env::consts::OS` value).
+pub(crate) fn hypervisor_for_os(os: &str) -> Hypervisor {
+    if os == "macos" {
+        Hypervisor::Vfkit
+    } else {
+        Hypervisor::Qemu
+    }
+}
+
+/// The backend behind a VM dispatch, chosen by [`Hypervisor`]. Both backends build on every platform, so the choice
+/// is one pure function and the Linux gate covers it.
+enum VmRunner {
+    Qemu(QemuBackend),
+    Vfkit(VfkitBackend),
+}
+
+impl VmRunner {
+    fn new(hypervisor: Hypervisor, agent: AgentLaunch) -> Self {
+        match hypervisor {
+            Hypervisor::Qemu => Self::Qemu(QemuBackend::new().with_agent(agent)),
+            Hypervisor::Vfkit => Self::Vfkit(VfkitBackend::new(crate::capability::vfkit_bin()).with_agent(agent)),
+        }
+    }
+
+    fn run(&self, spec: &RunSpec<'_>) -> Result<Outcome, BackendError> {
+        match self {
+            Self::Qemu(backend) => backend.run(spec),
+            Self::Vfkit(backend) => backend.run(spec),
+        }
+    }
+}
+
 /// A dispatch that cannot be honored, refused before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchError {
+    /// A process dispatch reached a host whose process containment is not available (a macOS host, which runs VMs
+    /// only). The process backend would run the job uncontained, so it is refused.
+    #[error("this host has no process containment, so it runs VM jobs only")]
+    ProcessContainmentUnavailable,
     /// This host's declared backend cannot provide the job's required
     /// isolation class. Fail-closed, never a silent downgrade onto
     /// trusted-process (#269's isolation-class gate, D5).
@@ -737,6 +782,11 @@ pub fn handle_dispatch(
         _ => ApiSandboxKind::Process,
     };
     check_isolation_class(required, kind, &status)?;
+    // `check_isolation_class` admits a trusted job on any host. A host with no process containment (a Mac) declares
+    // VM only, so a process dispatch there would run uncontained: refuse it (#483).
+    if kind == ApiSandboxKind::Process && !status.is_available() {
+        return Err(DispatchError::ProcessContainmentUnavailable.into());
+    }
 
     let forward_back: SocketAddr = dispatch
         .forward_back
@@ -870,10 +920,9 @@ pub fn handle_dispatch(
                 // `--from-devshell` rides the manifest (A3, #483); an executor that predates the field refuses the
                 // manifest.
                 decoded.from_devshell,
-                // The macOS vfkit-prereq check: dead code on this host's
-                // Linux build target (`cfg!(target_os = "macos")` is false
-                // there), so a callback that never fires is correct, not a
-                // stub standing in for missing behavior.
+                // The macOS vfkit-prereq check (nix and a linux-builder) is `sandy doctor`'s, in `sandy-cli`. Here a
+                // missing builder surfaces as `FlakeResolve` with nix's own message, and `detect_vm_capability` has
+                // already confirmed vfkit, nix and the guest wrapper before the host declared `Vm`.
                 || None,
                 // #332, CodeRabbit finding on PR #333: bound this REMOTE
                 // call — unlike `sandy run --flake`'s local, interactive,
@@ -914,10 +963,13 @@ pub fn handle_dispatch(
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
             let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
-            let backend = QemuBackend::new().with_agent(AgentLaunch {
-                program: agent_program,
-                on_link,
-            });
+            let backend = VmRunner::new(
+                hypervisor_for_os(std::env::consts::OS),
+                AgentLaunch {
+                    program: agent_program,
+                    on_link,
+                },
+            );
             let spec = RunSpec {
                 digests: dispatch.digests,
                 egress: allow.as_ref(),
@@ -1768,6 +1820,55 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.
+    #[test]
+    fn the_hypervisor_is_vfkit_on_macos_and_qemu_elsewhere() {
+        assert_eq!(hypervisor_for_os("macos"), Hypervisor::Vfkit);
+        assert_eq!(hypervisor_for_os("linux"), Hypervisor::Qemu);
+    }
+
+    /// The VM runner builds the backend its hypervisor names. Construct-only, so the Linux gate covers the vfkit arm's
+    /// wiring (`vfkit_bin`, `with_agent`) that a run on a Mac would otherwise be the only check of.
+    #[test]
+    fn the_vm_runner_builds_the_backend_its_hypervisor_names() {
+        let agent = || AgentLaunch {
+            program: PathBuf::from("/nonexistent/sandy-agent"),
+            on_link: Arc::new(|_, _, _| {}),
+        };
+        assert!(matches!(VmRunner::new(Hypervisor::Vfkit, agent()), VmRunner::Vfkit(_)));
+        assert!(matches!(VmRunner::new(Hypervisor::Qemu, agent()), VmRunner::Qemu(_)));
+    }
+
+    /// A host with no process containment (a Mac, which declares VM only) refuses a process dispatch instead of
+    /// running the job uncontained, even for a trusted one.
+    #[tokio::test]
+    async fn a_process_dispatch_is_refused_on_a_host_without_process_containment() -> anyhow::Result<()> {
+        let dispatch = process_dispatch_with_data_token(Vec::new(), "127.0.0.1:9000")?;
+        let rt = tokio::runtime::Handle::current();
+        let err = tokio::task::spawn_blocking(move || {
+            handle_dispatch(
+                &dispatch,
+                Box::new(sandy::NoContainment),
+                PathBuf::from("/nonexistent/sandy-agent"),
+                rt,
+                true,
+                sandy_api::backend::RunControl::with_timeout_secs(60),
+                test_mesh_tls_config(),
+            )
+        })
+        .await
+        .context("the blocking dispatch task")?
+        .expect_err("no containment, no process run");
+        assert!(
+            matches!(
+                err,
+                HandleDispatchError::Dispatch(DispatchError::ProcessContainmentUnavailable)
+            ),
+            "expected ProcessContainmentUnavailable, got {err:?}"
+        );
+        Ok(())
     }
 
     /// A1 (#483): a process job shares the host network, so a policy on one is refused before anything runs
