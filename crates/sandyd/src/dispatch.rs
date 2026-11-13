@@ -97,6 +97,9 @@ pub struct JobChannel {
     /// set at mint beside `data_link`. Empty exactly when `data_link` is `None` or the job has inputs only. sandyd
     /// decides from this, never from the host's `outputs_follow` flag, whether a succeeded job owes outputs.
     pub data_outputs: Vec<sandy_executor_proto::Output>,
+    /// The outputs the Submit declared, as `(name, destination)`, for every placement (A2c of #483): the envelope
+    /// lists what the run left at these destinations once its outputs have settled, as the direct path lists its own.
+    pub declared_outputs: Vec<(Option<String>, std::path::PathBuf)>,
     /// The egress allow-list the job was dispatched with (A2b of #483), or `None` for a job with no policy. The
     /// executor reports the boundary's state; this is what that boundary enforced, for the envelope's receipt.
     pub egress_allow: Option<sandy::AllowList>,
@@ -271,6 +274,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         data_link: None,
         data_inputs: Vec::new(),
         data_outputs: Vec::new(),
+        declared_outputs: Vec::new(),
         egress_allow: None,
         outputs: crate::output_slot::OutputsSlot::new(),
         granted_caps: Vec::new(),
