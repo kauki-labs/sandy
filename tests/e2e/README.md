@@ -16,13 +16,15 @@ tests/e2e/
   helpers/      common.bash: binary resolution, state isolation, the require_live gate
 ```
 
-- `basic/*.bats` — no hypervisor, no network, no `nix`. Runs anywhere the binary
-  builds, including the Nix sandbox. One file per subcommand.
-- `live/*.bats` — a real job booted through `sandy run`. Needs a hypervisor and a
-  buildable guest, so every test is gated by `require_live` and **skipped**
-  off-matrix (INV-S9: never counted green from a skip).
-- `helpers/common.bash` — binary resolution, per-test `$SANDY_HOME` and
-  `$XDG_CONFIG_HOME` isolation, and the `require_live` gate.
+- `basic/*.bats` — no hypervisor, no network, no `nix`, no `sandyd`. Runs anywhere
+  the binary builds, including the Nix sandbox. One file per subcommand; a verb
+  that needs the daemon is checked for its refusal when none runs.
+- `live/*.bats` — a real job booted through `sandy run`. Needs a running `sandyd`
+  with a VM-capable `sandy-host-executor` and a buildable guest, so every test is
+  gated by `require_live` and **skipped** off-matrix (INV-S9: never counted green
+  from a skip).
+- `helpers/common.bash` — binary resolution, per-test `$SANDY_HOME`,
+  `$XDG_CONFIG_HOME` and `$SANDY_SOCK` isolation, and the `require_live` gate.
 
 ## Run it
 
