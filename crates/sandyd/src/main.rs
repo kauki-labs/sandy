@@ -286,12 +286,31 @@ async fn main() {
     // #481: a Submit naming `credential` mints from this host's trust roots,
     // the ones `sandy cred github register` wrote, through the resolver chosen at start-up.
     let registry = match JobRegistry::new() {
-        Ok(registry) => Arc::new(registry.with_credentials(JobCredentials::new(Arc::clone(&resolver)))),
+        Ok(registry) => Arc::new(
+            registry.with_credentials(JobCredentials::new(Arc::clone(&resolver)).with_store(Arc::clone(&store))),
+        ),
         Err(e) => {
             tracing::error!(error = %e, "could not create the job registry's capability authority");
             std::process::exit(1);
         }
     };
+
+    // #830: revoke the credentials a previous sandyd left behind. After the socket is bound and the rows are
+    // recovered, so no job is reported live while this runs; in the background, since each revoke is a provider call.
+    if let Some(credentials) = registry.credentials() {
+        let credentials = Arc::clone(credentials);
+        tokio::task::spawn_blocking(move || {
+            let report = credentials.recover();
+            if !(report.revoked.is_empty() && report.expired.is_empty() && report.failed.is_empty()) {
+                tracing::warn!(
+                    revoked = report.revoked.len(),
+                    expired = report.expired.len(),
+                    failed = report.failed.len(),
+                    "recovered the credentials a previous sandyd left behind"
+                );
+            }
+        });
+    }
 
     // One HostRegistry (#298), shared between the mesh management-channel
     // loop below (which registers connected host-executors), the
@@ -921,24 +940,38 @@ fn run_operator_command() -> Option<i32> {
             return Some(1);
         }
     };
-    Some(match sandyd::operator::cancel_offline(&db, &job_id) {
-        Ok(CancelOutcome::Cancelled) => {
-            println!("cancelled {job_id}");
-            0
-        }
-        Ok(CancelOutcome::NotFound) => {
-            eprintln!("sandyd cancel: no job {job_id}");
-            1
-        }
-        Ok(CancelOutcome::AlreadyTerminal(status)) => {
-            eprintln!("sandyd cancel: job {job_id} is already {status:?}");
-            1
-        }
-        Err(e) => {
-            eprintln!("sandyd cancel: {e}");
-            1
-        }
-    })
+    Some(
+        match sandyd::operator::cancel_offline_and_revoke(&db, &job_id, &sandyd::credential::TrustRootResolver) {
+            Ok((outcome, revoked)) => {
+                match &revoked {
+                    Some(Ok(())) => println!("revoked the credential of {job_id}"),
+                    Some(Err(e)) => eprintln!(
+                        "sandyd cancel: could not revoke the credential of {job_id}: {e}; the next sandyd start tries \
+                         again"
+                    ),
+                    None => {}
+                }
+                match outcome {
+                    CancelOutcome::Cancelled => {
+                        println!("cancelled {job_id}");
+                        0
+                    }
+                    CancelOutcome::NotFound => {
+                        eprintln!("sandyd cancel: no job {job_id}");
+                        1
+                    }
+                    CancelOutcome::AlreadyTerminal(status) => {
+                        eprintln!("sandyd cancel: job {job_id} is already {status:?}");
+                        1
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("sandyd cancel: {e}");
+                1
+            }
+        },
+    )
 }
 
 /// The control socket path: `$SANDY_SOCK` if set (a deployer's explicit

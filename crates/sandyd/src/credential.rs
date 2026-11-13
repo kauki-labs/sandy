@@ -22,7 +22,7 @@ use std::{
 
 use sandy::{CredentialBracket, DirFingerprint, Scope, SharedProvider, StagingTarget};
 
-use crate::store::JobStore;
+use crate::store::{CredentialRecord, JobStore};
 
 /// The secret name the job sees the token under: the same name `sandy run
 /// --credential` injects.
@@ -87,6 +87,74 @@ pub enum Redaction {
     NotHeld(Vec<u8>),
     /// The job holds a credential but its staged file could not be read.
     Unavailable,
+}
+
+fn unix_secs(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// The handle id of the record `job_id` has in `batch`, for the log line.
+fn record_handle(batch: &[(String, CredentialRecord)], job_id: &str) -> String {
+    batch
+        .iter()
+        .find(|(id, _)| id == job_id)
+        .map(|(_, record)| record.handle_id.clone())
+        .unwrap_or_default()
+}
+
+fn forget(store: &JobStore, job_id: &str) {
+    if let Err(e) = store.clear_credential(job_id) {
+        tracing::warn!(job_id, error = %e, "could not clear a credential record");
+    }
+}
+
+/// Revoke the credential `record` names through trust root `record.trust_root`'s provider, then remove its staged
+/// token file and dir whatever the revoke said. Blocking; run it on a thread of its own (the provider may own a
+/// runtime). Also the offline `sandyd cancel`'s revoke.
+///
+/// # Errors
+/// A human-readable reason: the trust root cannot be resolved, or the provider's revoke failed.
+pub fn revoke_recorded(resolver: &dyn CredentialResolver, record: &CredentialRecord) -> Result<(), String> {
+    let result = resolver.provider(&record.trust_root).and_then(|provider| {
+        let lease = sandy::Lease {
+            secret_ref: sandy::SecretRef {
+                name: CREDENTIAL_SECRET_NAME.to_owned(),
+                source: sandy::SecretSource::File(record.token_path.clone()),
+            },
+            expires_at: std::time::UNIX_EPOCH + Duration::from_secs(record.expires_at_unix),
+            handle: sandy::CredentialHandle {
+                id: record.handle_id.clone(),
+            },
+        };
+        provider.revoke(&lease).map_err(|e| e.to_string())
+    });
+    remove_staged(&record.token_path);
+    result
+}
+
+/// Remove a recorded staged token file and its `cred-*` dir. Refuses a path that is not shaped like one the daemon
+/// stages, so a damaged record cannot point this at another file. Best effort.
+fn remove_staged(token_path: &std::path::Path) {
+    let Some(dir) = token_path.parent() else { return };
+    let shaped = token_path.file_name().is_some_and(|n| n == CREDENTIAL_SECRET_NAME)
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("cred-"));
+    if !shaped {
+        tracing::warn!(path = %token_path.display(), "a credential record names a path that is not a staged token; leaving it");
+        return;
+    }
+    match std::fs::remove_file(token_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %token_path.display(), error = %e, "could not remove a staged token file"),
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "could not remove a staging dir"),
+    }
 }
 
 /// What [`JobCredentials::recover`] did.
@@ -235,7 +303,7 @@ impl JobCredentials {
     /// [`JobCredentials::release`]. Blocking when a store is set (it records the revocation state): call it from a
     /// blocking task.
     pub fn adopt(&self, job_id: &str, trust_root: &str, bracket: CredentialBracket) {
-        let _ = trust_root;
+        self.record(job_id, trust_root, &bracket);
         let previous = self.lock_live().insert(job_id.to_owned(), bracket);
         if previous.is_some() {
             // Job ids are fresh UUIDs; a second adopt is a caller bug. The
@@ -257,14 +325,21 @@ impl JobCredentials {
         };
         let job = job_id.to_owned();
         let job_id = job_id.to_owned();
+        let store = self.store.clone();
         let teardown = move || {
             let handle = bracket.handle().map(|h| h.id).unwrap_or_default();
             match bracket.revoke() {
-                Ok(()) => tracing::info!(
-                    job_id,
-                    handle,
-                    "revoked the job's credential and removed its staged file"
-                ),
+                Ok(()) => {
+                    tracing::info!(
+                        job_id,
+                        handle,
+                        "revoked the job's credential and removed its staged file"
+                    );
+                    // Only a revoke that worked forgets the record: a failed one stays for the next start (#830).
+                    if let Some(Err(e)) = store.as_ref().map(|store| store.clear_credential(&job_id)) {
+                        tracing::warn!(job_id, error = %e, "could not clear the job's credential record");
+                    }
+                }
                 Err(e) => tracing::warn!(
                     job_id,
                     handle,
@@ -295,10 +370,85 @@ impl JobCredentials {
     }
 
     /// Revoke the credentials a previous daemon left behind and forget their records (#830). Blocking: run it on a
-    /// blocking task, after the control socket is bound.
+    /// blocking task, after the control socket is bound. A record past its expiry needs no revoke (the token is dead).
+    /// A revoke that fails leaves its record for the next start; the staged token file is removed either way. At most
+    /// [`MAX_CONCURRENT_RELEASES`] revokes run at once, each bounded by the provider's own call deadline.
     #[must_use]
     pub fn recover(&self) -> RecoveryReport {
-        RecoveryReport::default()
+        let mut report = RecoveryReport::default();
+        let Some(store) = &self.store else { return report };
+        let records = match store.credential_records() {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the credential records; nothing to recover");
+                return report;
+            }
+        };
+        let now = unix_secs(std::time::SystemTime::now());
+        let mut due = Vec::new();
+        for (job_id, record) in records {
+            if record.expires_at_unix > now {
+                due.push((job_id, record));
+                continue;
+            }
+            remove_staged(&record.token_path);
+            forget(store, &job_id);
+            report.expired.push(job_id);
+        }
+        for batch in due.chunks(MAX_CONCURRENT_RELEASES) {
+            // A thread of its own, not the blocking pool: a live adapter owns a tokio runtime, which must not
+            // drop inside another one.
+            let running: Vec<_> = batch
+                .iter()
+                .map(|(job_id, record)| {
+                    let (resolver, record) = (Arc::clone(&self.resolver), record.clone());
+                    let spawned = std::thread::Builder::new()
+                        .name("sandy-cred-recover".to_owned())
+                        .spawn(move || revoke_recorded(resolver.as_ref(), &record));
+                    (job_id, record_handle(batch, job_id), spawned)
+                })
+                .collect();
+            for (job_id, handle, spawned) in running {
+                let outcome = match spawned {
+                    Ok(thread) => thread
+                        .join()
+                        .unwrap_or_else(|_| Err("the revoke thread panicked".to_owned())),
+                    Err(e) => Err(format!("could not start the revoke thread: {e}")),
+                };
+                match outcome {
+                    Ok(()) => {
+                        tracing::info!(job_id = %job_id, handle, "revoked a credential a previous sandyd left behind");
+                        forget(store, job_id);
+                        report.revoked.push(job_id.clone());
+                    }
+                    Err(e) => {
+                        tracing::warn!(job_id = %job_id, handle, error = %e, "could not revoke a credential a previous sandyd left behind; keeping its record for the next start");
+                        report.failed.push(job_id.clone());
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    /// Write `job_id`'s revocation record, from the live `bracket`. A failed write is logged: the job still runs,
+    /// and a crash before its release leaves the token valid until its native expiry.
+    fn record(&self, job_id: &str, trust_root: &str, bracket: &CredentialBracket) {
+        let Some(store) = &self.store else { return };
+        let (Some(handle), Some(expires_at), sandy::SecretSource::File(token_path)) =
+            (bracket.handle(), bracket.expires_at(), bracket.secret_ref().source)
+        else {
+            return;
+        };
+        let record = CredentialRecord {
+            trust_root: trust_root.to_owned(),
+            handle_id: handle.id,
+            expires_at_unix: unix_secs(expires_at),
+            token_path,
+        };
+        if let Err(e) = store.set_credential(job_id, &record) {
+            tracing::warn!(job_id, error = %e, "could not record the credential's revocation state; a crash before its release leaves the token valid until its native expiry");
+        }
     }
 
     fn create_dir(&self) -> Result<sandy_fsutil::OwnedDir, sandy_fsutil::FsError> {
@@ -1402,7 +1552,7 @@ mod tests {
         let sandy::SecretSource::File(path) = bracket.secret_ref().source else {
             anyhow::bail!("the staged secret is a file");
         };
-        credentials.adopt("job-hung", bracket);
+        credentials.adopt("job-hung", "gh-test", bracket);
         let started = Instant::now();
         credentials.release("job-hung");
         while path.exists() && started.elapsed() < WAIT {
@@ -1436,7 +1586,7 @@ mod tests {
             let bracket = tokio::task::spawn_blocking(move || c.mint("gh-test", &[]))
                 .await?
                 .map_err(|e| anyhow::anyhow!(e))?;
-            credentials.adopt(job, bracket);
+            credentials.adopt(job, "gh-test", bracket);
         }
         for job in ["job-a", "job-b", "job-c"] {
             credentials.release(job);
