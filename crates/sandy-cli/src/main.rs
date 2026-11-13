@@ -340,7 +340,7 @@ enum DaemonOp {
         wait_timeout: u64,
     },
     /// Block until a job ends, then print it with its result envelope; exit `0` succeeded, `1` failed or cancelled, `3`
-    /// an infrastructure fault or a timeout.
+    /// an infrastructure fault or a timeout. Ctrl-C stops the wait only: the job keeps running and the exit is `1`.
     Wait {
         /// The job id to wait on.
         job_id: String,
@@ -883,10 +883,6 @@ fn dispatch_daemon(op: DaemonOp, output: OutputFormat) -> i32 {
     runtime.block_on(dispatch_daemon_async(op, output))
 }
 
-/// Connect to `sandyd`, make the one matching control-RPC call, print the
-/// result, and map it to a process exit band (INV-11). A fresh connection per
-/// invocation: the control RPC is strictly one-request-one-response with no
-/// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
 /// How long `daemon wait` and `daemon submit --wait` wait by default: an hour, longer than the host ceiling on a job's
 /// own timeout. The daemon has no wait call, so the client polls `Status` within this bound.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 3600;
@@ -934,6 +930,36 @@ fn report_and_band(status: &sandy_control_proto::StatusResponse, output: OutputF
     }
 }
 
+/// The bound a waiting op (`daemon wait`, `daemon submit --wait`) gives its poll; `None` for every other op.
+fn wait_bound_of(op: &DaemonOp) -> Option<std::time::Duration> {
+    match op {
+        DaemonOp::Wait { wait_timeout, .. }
+        | DaemonOp::Submit {
+            wait: true,
+            wait_timeout,
+            ..
+        } => Some(std::time::Duration::from_secs(*wait_timeout)),
+        _ => None,
+    }
+}
+
+/// The interrupt (SIGINT, SIGTERM) streams of a waiting client. Installed before the Submit is sent, so an interrupt
+/// that lands before the job id is known is held, not fatal, and cancels the job as soon as the reply arrives.
+struct Interrupts {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl Interrupts {
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
+}
+
 /// Wait on `stream` for `job_id` to end, within `bound`, and report it. With `cancel_token` set (a job this client
 /// submitted) an interrupt (SIGINT or SIGTERM) cancels the job on the daemon through a fresh connection, because the
 /// interrupted poll leaves `stream` mid-conversation, and then waits a short while for it to end.
@@ -944,12 +970,12 @@ async fn wait_and_report(
     cancel_token: Option<Vec<u8>>,
     bound: std::time::Duration,
     output: OutputFormat,
+    interrupts: Interrupts,
 ) -> i32 {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut sigint), Ok(mut sigterm)) = (signal(SignalKind::interrupt()), signal(SignalKind::terminate())) else {
-        eprintln!("sandy: could not install the interrupt handlers");
-        return ProcessExit::InfraFault.code();
-    };
+    let Interrupts {
+        mut sigint,
+        mut sigterm,
+    } = interrupts;
     let ids = std::sync::atomic::AtomicU64::new(2);
     let cell = tokio::sync::Mutex::new(&mut stream);
     let mut waiting = Box::pin(sandy_cli::wait::wait_until_terminal(
@@ -1013,6 +1039,10 @@ async fn wait_and_report(
     }
 }
 
+/// Connect to `sandyd`, make the one matching control-RPC call, print the
+/// result, and map it to a process exit band (INV-11). A fresh connection per
+/// invocation: the control RPC is strictly one-request-one-response with no
+/// pipelining (#211 §1), so there is nothing to pool across a single CLI run.
 async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     // #232 (CodeRabbit on this PR): validate `--cap-file` before opening any
     // connection — a malformed or unreadable path is a pure client-side
@@ -1263,15 +1293,19 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     };
 
     // `daemon wait`, and `daemon submit --wait` after its Submit: poll Status to a terminal state within this bound.
-    let wait_bound = match &op {
-        DaemonOp::Wait { wait_timeout, .. }
-        | DaemonOp::Submit {
-            wait: true,
-            wait_timeout,
-            ..
-        } => Some(std::time::Duration::from_secs(*wait_timeout)),
-        _ => None,
+    // The interrupt handlers go in first, so a Ctrl-C during the Submit still cancels the job it creates.
+    let interrupts = if wait_bound_of(&op).is_some() {
+        match Interrupts::install() {
+            Ok(i) => Some(i),
+            Err(e) => {
+                eprintln!("sandy: could not install the interrupt handlers: {e}");
+                return ProcessExit::InfraFault.code();
+            }
+        }
+    } else {
+        None
     };
+    let wait_bound = wait_bound_of(&op);
 
     let request_op = match op {
         DaemonOp::Submit {
@@ -1372,9 +1406,21 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             sandy_cli::attach::persist_attach_token(&r.job_id, &r.attach_token);
             match wait_bound {
                 // `--wait`: the job is the client's own, so an interrupt cancels it; only the final report prints.
-                Some(bound) => {
-                    wait_and_report(stream, &socket, &r.job_id, Some(r.attach_token.clone()), bound, output).await
-                }
+                Some(bound) => match interrupts {
+                    Some(interrupts) => {
+                        wait_and_report(
+                            stream,
+                            &socket,
+                            &r.job_id,
+                            Some(r.attach_token.clone()),
+                            bound,
+                            output,
+                            interrupts,
+                        )
+                        .await
+                    }
+                    None => ProcessExit::InfraFault.code(),
+                },
                 None => succeed_or(emit(&SubmittedJob::from(&r), output)),
             }
         }
@@ -1466,9 +1512,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             }
         }
         // `daemon wait`: the first answer decides whether to keep polling; an unknown job is the `Error` arm below.
-        Some(control_response::Result::Status(r)) if wait_bound.is_some() => match wait_bound {
-            Some(bound) if !sandy_cli::wait::is_terminal(&r) => {
-                wait_and_report(stream, &socket, &r.job_id, None, bound, output).await
+        Some(control_response::Result::Status(r)) if wait_bound.is_some() => match (wait_bound, interrupts) {
+            (Some(bound), Some(interrupts)) if !sandy_cli::wait::is_terminal(&r) => {
+                wait_and_report(stream, &socket, &r.job_id, None, bound, output, interrupts).await
             }
             _ => report_and_band(&r, output),
         },

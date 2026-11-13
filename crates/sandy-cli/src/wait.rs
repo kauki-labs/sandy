@@ -54,11 +54,13 @@ pub fn is_terminal(status: &StatusResponse) -> bool {
     )
 }
 
-/// Poll `fetch` every `poll` until the job is terminal or `bound` has passed.
+/// Poll `fetch` every `poll` until the job is terminal or `bound` has passed. Each call gets only the time the bound
+/// has left, so a daemon that accepts a call and never answers ends the wait at the bound too.
 ///
 /// # Errors
 ///
-/// [`WaitError::TimedOut`] naming the last state seen; [`WaitError::Call`] when `fetch` fails.
+/// [`WaitError::TimedOut`] naming the last state seen (`no answer` when there was none); [`WaitError::Call`] when
+/// `fetch` fails.
 pub async fn wait_until_terminal<F, Fut>(
     mut fetch: F,
     poll: Duration,
@@ -69,13 +71,19 @@ where
     Fut: std::future::Future<Output = Result<StatusResponse, String>>,
 {
     let started = tokio::time::Instant::now();
+    let mut last = "no answer".to_owned();
     loop {
-        let status = fetch().await.map_err(WaitError::Call)?;
+        let left = bound.saturating_sub(started.elapsed());
+        let Ok(answer) = tokio::time::timeout(left, fetch()).await else {
+            return Err(WaitError::TimedOut(last, bound));
+        };
+        let status = answer.map_err(WaitError::Call)?;
         if is_terminal(&status) {
             return Ok(status);
         }
+        last = status.status().as_str_name().to_owned();
         if started.elapsed() >= bound {
-            return Err(WaitError::TimedOut(status.status().as_str_name().to_owned(), bound));
+            return Err(WaitError::TimedOut(last, bound));
         }
         tokio::time::sleep(poll).await;
     }
@@ -216,7 +224,7 @@ mod tests {
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
             wait_until_terminal(
-                || std::future::pending::<Result<StatusResponse, String>>(),
+                std::future::pending::<Result<StatusResponse, String>>,
                 Duration::from_millis(5),
                 Duration::from_millis(60),
             ),
