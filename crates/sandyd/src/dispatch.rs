@@ -100,6 +100,9 @@ pub struct JobChannel {
     /// The outputs the Submit declared, as `(name, destination)`, for every placement (A2c of #483): the envelope
     /// lists what the run left at these destinations once its outputs have settled, as the direct path lists its own.
     pub declared_outputs: Vec<(Option<String>, std::path::PathBuf)>,
+    /// The names of the inputs the Submit declared, for every placement (#841): an input digest the executor reports
+    /// must start with one of these.
+    pub declared_inputs: Vec<String>,
     /// Whether the Submit asked for digests (`--digests`, A2c of #483): the envelope records what the executor reports
     /// only for a job that asked, and warns when it asked and nothing came back.
     pub digests_requested: bool,
@@ -278,6 +281,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         data_inputs: Vec::new(),
         data_outputs: Vec::new(),
         declared_outputs: Vec::new(),
+        declared_inputs: Vec::new(),
         digests_requested: false,
         egress_allow: None,
         outputs: crate::output_slot::OutputsSlot::new(),

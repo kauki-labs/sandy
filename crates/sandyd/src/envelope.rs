@@ -139,6 +139,8 @@ pub(crate) struct Placement<'a> {
     pub allow: Option<&'a AllowList>,
     /// The outputs its Submit declared, as `(name, destination)`.
     pub declared: &'a [(Option<String>, std::path::PathBuf)],
+    /// The names of the inputs its Submit declared.
+    pub declared_inputs: &'a [String],
     /// Whether the Submit asked for digests.
     pub digests_requested: bool,
 }
@@ -158,6 +160,7 @@ pub(crate) fn from_run(
         host_id,
         allow,
         declared,
+        declared_inputs,
         digests_requested,
     } = *placed;
     let outcome = Outcome {
@@ -193,7 +196,7 @@ pub(crate) fn from_run(
     if digests_requested {
         match facts.digests.as_ref() {
             None => digest_warnings.push("digests were requested but the executor reported none".to_owned()),
-            Some(report) => match ingest_digests(report) {
+            Some(report) => match ingest_digests(report, declared_inputs) {
                 Ok((accepted, warning)) => {
                     digests = Some(accepted);
                     digest_warnings.extend(warning);
@@ -339,6 +342,7 @@ fn bound_list<T>(list: &mut Vec<T>, path: impl Fn(&T) -> &str) -> usize {
 /// when something was cut. `Err` names why the report is malformed.
 fn ingest_digests(
     report: &sandy_executor_proto::RunDigests,
+    _declared_inputs: &[String],
 ) -> Result<((sandy::ContentDigests, sandy::ContentDigests), Option<String>), String> {
     let mut inputs = validate_side(report.inputs.as_ref()).map_err(|why| format!("inputs: {why}"))?;
     let mut outputs = validate_side(report.outputs.as_ref()).map_err(|why| format!("outputs: {why}"))?;

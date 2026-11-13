@@ -671,15 +671,18 @@ async fn finish_job(
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
     let facts = facts.clone();
-    let (host_id, declared, allow, digests_requested) =
-        job_registry.get(job_id).map_or((None, Vec::new(), None, false), |job| {
-            (
-                job.host_id.clone(),
-                job.declared_outputs.clone(),
-                job.egress_allow.clone(),
-                job.digests_requested,
-            )
-        });
+    let (host_id, declared, declared_inputs, allow, digests_requested) =
+        job_registry
+            .get(job_id)
+            .map_or((None, Vec::new(), Vec::new(), None, false), |job| {
+                (
+                    job.host_id.clone(),
+                    job.declared_outputs.clone(),
+                    job.declared_inputs.clone(),
+                    job.egress_allow.clone(),
+                    job.digests_requested,
+                )
+            });
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
@@ -696,6 +699,7 @@ async fn finish_job(
                 host_id: host_id.as_deref(),
                 allow: allow.as_ref(),
                 declared: &declared,
+                declared_inputs: &declared_inputs,
                 digests_requested,
             },
         );
@@ -2556,6 +2560,7 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.declared_outputs = vec![(Some("out".to_owned()), dest.path().to_owned())];
+        job.declared_inputs = vec!["data".to_owned()];
         job.digests_requested = requested;
         job_registry.insert("job-1".to_owned(), job);
         record_job_result(
@@ -2654,6 +2659,57 @@ mod tests {
         Ok(())
     }
 
+    /// A2c (#483, #841): an input digest must belong to an input the Submit declared and each path is reported once.
+    /// A name the job never had, or two digests for one path, drops the report whole with a warning, as a malformed
+    /// one does, so a hostile executor cannot put an invented input into `host_observed.input_digests`.
+    #[tokio::test]
+    async fn an_undeclared_or_repeated_input_digest_drops_the_report_with_a_warning() -> anyhow::Result<()> {
+        let sha = "5".repeat(64);
+        let cases: Vec<(&str, sandy_executor_proto::RunDigests, &str)> = vec![
+            (
+                "undeclared name",
+                wire_digests(&[("other/x.txt", &sha)], &[], &[]),
+                "other",
+            ),
+            (
+                "undeclared whole-file name",
+                wire_digests(&[("data/x.txt", &sha), ("secret", &sha)], &[], &[]),
+                "secret",
+            ),
+            (
+                "repeated input path",
+                wire_digests(&[("data/x.txt", &sha), ("data/x.txt", &sha)], &[], &[]),
+                "data/x.txt",
+            ),
+            (
+                "repeated output path",
+                wire_digests(
+                    &[("data/x.txt", &sha)],
+                    &[("out/a.txt", &sha), ("out/a.txt", &sha)],
+                    &[],
+                ),
+                "out/a.txt",
+            ),
+        ];
+        for (name, reported, named) in cases {
+            let envelope = envelope_with_digests(true, Some(reported)).await?;
+            let receipt = envelope.receipt.context("the audit receipt")?;
+            assert!(
+                receipt.host_observed.input_digests.is_none(),
+                "{name}: nothing is believed"
+            );
+            assert!(
+                envelope
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("digests") && w.contains("dropped") && w.contains(named)),
+                "{name}: the warning names {named:?}: {:?}",
+                envelope.warnings
+            );
+        }
+        Ok(())
+    }
+
     /// A2c (#483): a job that asked and got nothing back says so; a job that did not ask ignores what an executor
     /// sends anyway.
     #[tokio::test]
@@ -2714,6 +2770,7 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.declared_outputs = vec![(None, dest.path().to_owned())];
+        job.declared_inputs = small_paths.clone();
         job.digests_requested = true;
         job.egress_allow = Some(allow());
         job_registry.insert("job-1".to_owned(), job);
