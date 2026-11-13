@@ -5,7 +5,7 @@ use std::{collections::HashSet, path::Path, time::Duration};
 
 use sandy::{CoreError, JobState, Journal, MAX_TTL_SECS, StagedImage, plan_eviction};
 
-use super::GcReport;
+use crate::output::GcReport;
 
 /// [`super::gc`]'s implementation against an already-resolved `staging_base`: evict
 /// terminal records, then sweep stale staging dirs under it. [`super::gc`] calls this

@@ -34,7 +34,7 @@ use sandy::{
 };
 use zeroize::Zeroizing;
 
-use crate::plan::JobPlan;
+use crate::{output::GcReport, plan::JobPlan};
 
 mod cred_refresh;
 mod envelope;
@@ -997,18 +997,6 @@ fn stop_live_owner<B: VmBackend, S: OwnerSignal + ?Sized>(
     }
     // The owner went without writing its result: the reconcile path settles it (`crashed`).
     reconcile_job(journal, backend, job_id)
-}
-
-/// [`gc`]'s result: evicted job ids and swept staging-dir names, kept apart
-/// (#195). `evicted` holds job ids only, so a consumer passing its entries to
-/// `status`/`wait` never receives a staging-dir name, and the plain-text
-/// "evicted N record(s)" count never counts a directory as a record.
-#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GcReport {
-    /// Job ids evicted under the keep-last-N + referenced policy.
-    pub evicted: Vec<String>,
-    /// Names of any `cred-*`/`verify-*` staging dirs swept past `MAX_TTL_SECS`.
-    pub swept_staging_dirs: Vec<String>,
 }
 
 /// Garbage-collect terminal job records under the keep-last-N + referenced
