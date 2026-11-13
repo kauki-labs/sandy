@@ -246,6 +246,7 @@ mod tests {
     fn dispatch_debug_redacts_the_link_token() {
         let marker = b"sandy-link-token-leak-marker-7e2b";
         let dispatch = Dispatch {
+            digests: false,
             job_id: "job-1".to_owned(),
             manifest: b"m".to_vec(),
             manifest_encoding: "test/v1".to_owned(),
@@ -288,6 +289,7 @@ mod tests {
             op: Some(host_executor_message::Op::Register(Register {
                 host_id: "remote-host".to_owned(),
                 capabilities: Some(Capabilities {
+                    digests: false,
                     supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                     arch: Arch::X8664.into(),
                     attestation: false,
@@ -312,6 +314,7 @@ mod tests {
         let (mut write_side, mut read_side) = tokio::io::duplex(4096);
         let message = HostExecutorMessage {
             op: Some(host_executor_message::Op::Result(JobResult {
+                digests: None,
                 job_id: "job-1".to_owned(),
                 booted: true,
                 exit_code: Some(0),
@@ -358,6 +361,7 @@ mod tests {
             &mut write_side,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-1".to_owned(),
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
