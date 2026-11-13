@@ -6,7 +6,8 @@
 
 use std::{path::Path, time::Duration};
 
-use sandy_control_proto::HostSummary;
+use sandy::ProcessExit;
+use sandy_control_proto::{HostSummary, IsolationClass, ListHostsRequest, control_request, control_response};
 
 use crate::doctor::DoctorResult;
 
@@ -17,25 +18,85 @@ use crate::doctor::DoctorResult;
 /// A message naming what failed: the socket could not be connected, the daemon did not answer within `bound`, it
 /// answered with an error, or it answered something other than a host list.
 pub async fn list_hosts(socket: &Path, bound: Duration) -> Result<Vec<HostSummary>, String> {
-    let _ = (socket, bound);
-    Ok(Vec::new())
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| format!("could not connect to {}: {e}", socket.display()))?;
+        let op = control_request::Op::ListHosts(ListHostsRequest {});
+        let response = sandy_control_proto::client::call(&mut stream, 1, op)
+            .await
+            .map_err(|e| format!("the daemon call failed: {e}"))?;
+        match response.result {
+            Some(control_response::Result::Hosts(r)) => Ok(r.hosts),
+            Some(control_response::Result::Error(e)) => Err(e.message),
+            other => Err(format!("the daemon answered a host list request with {other:?}")),
+        }
+    };
+    tokio::time::timeout(bound, exchange)
+        .await
+        .map_err(|_| format!("sandyd at {} did not answer within {bound:?}", socket.display()))?
 }
 
 /// The doctor verdict for the daemon check: ok with the executors listed, or a refusal (exit `2`, invalid environment)
 /// that names the fix. `socket` is only named in the messages.
 #[must_use]
 pub fn daemon_check_result(socket: &Path, hosts: Result<Vec<HostSummary>, String>) -> DoctorResult {
-    let _ = (socket, hosts);
-    DoctorResult {
-        exit_code: 0,
-        message: String::new(),
+    let refuse = |message: String| DoctorResult {
+        exit_code: ProcessExit::InvalidPlan.code(),
+        message: format!("sandy doctor: {message}"),
+    };
+    let hosts = match hosts {
+        Ok(hosts) => hosts,
+        Err(why) => {
+            return refuse(format!(
+                "sandyd is not reachable at {}: {why}; start `sandyd` (it listens on $SANDY_SOCK, else in the default \
+                 runtime directory) and retry",
+                socket.display()
+            ));
+        }
+    };
+    if hosts.is_empty() {
+        return refuse(format!(
+            "sandyd at {} has no executor registered, so no job can be placed; start `sandy-host-executor` against it \
+             (see docs/design/host-executor/spec.md)",
+            socket.display()
+        ));
     }
+    let listed: Vec<String> = hosts.iter().map(describe).collect();
+    DoctorResult {
+        exit_code: ProcessExit::Succeeded.code(),
+        message: format!(
+            "sandy doctor: sandyd at {} has {} executor{}: {} — OK",
+            socket.display(),
+            hosts.len(),
+            if hosts.len() == 1 { "" } else { "s" },
+            listed.join(", ")
+        ),
+    }
+}
+
+/// `id (kinds; classes; arch)`, as a host declared them.
+fn describe(host: &HostSummary) -> String {
+    let classes: Vec<&str> = host
+        .isolation_classes
+        .iter()
+        .filter_map(|c| match IsolationClass::try_from(*c) {
+            Ok(IsolationClass::Trusted) => Some("trusted"),
+            Ok(IsolationClass::Untrusted) => Some("untrusted"),
+            _ => None,
+        })
+        .collect();
+    format!(
+        "{} ({}; {}; {})",
+        host.host_id,
+        host.sandbox_kinds.join(", "),
+        classes.join(", "),
+        host.arch
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use sandy_control_proto::IsolationClass;
-
     use super::*;
 
     fn host(id: &str, kinds: &[&str], classes: &[IsolationClass], arch: &str) -> HostSummary {
