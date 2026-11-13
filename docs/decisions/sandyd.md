@@ -2149,6 +2149,39 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   can write is outside the threat model (the executor is a trusted writer). A cancel mid-receive ends the slot and
   drops the receive, but the host may still be sending until its own send cap.
 
+### Slice 7: the host declares `transfer`
+
+The data link is on. A job with inputs or outputs and no `secrets` or `credential` may be placed on a host that
+declares `transfer`; it moves its data over the link as slices 5 to 6c describe.
+
+- **The operator declares it.** `SANDY_HOST_TRANSFER=1` (or `true`, `yes`) on the executor sets
+  `Capabilities.transfer`. It is the operator's statement that the host has disk headroom and a temp-staging path,
+  never auto-detected, like `SANDY_HOST_SHARES_SUBMITTER_FS`. `0`, `false`, `no`, empty and unset leave it off. Any
+  other value stops the executor at start, naming the variable: a typo is not read as off. (The two older flags still
+  read an unknown value as off.)
+- **Submit checks the declaration, the stream checks the bytes.** `sandyd` refuses at Submit what it can know from the
+  request alone, before a credential is minted or a host is chosen: at most 256 `inputs` and 256 `outputs`; every
+  name a plain relative path by the receiver's own rule (`DataLinkMessage::validate`); and no two names in one field
+  that are equal or nested (`a` and `a/b`), the clash the sender and the staging root refuse too. The number of
+  files, directories and bytes below a path is not known until it is walked, so the send and the receive bound those:
+  `MAX_TRANSFER_ENTRIES` (100 000) and `MAX_TRANSFER_BYTES` (4 GiB). The 256 limits bound the number of walks per
+  Submit; they are not the entry cap, which counts everything below those paths.
+- **Completed files stay on a failure.** A transfer that fails part way leaves the files already written in place
+  under the destination (the owner's ruling on #794). The job is recorded failed, and the destination is not
+  cleaned.
+- **Send bounds.** The send of the inputs has no total time limit of its own: it ends with the job (the job's end
+  publishes to the slot, which stops the send). A stalled reader ends it at the read timeout (120 s). A read that
+  stalls inside the blocking call keeps its thread until the call returns. A dead link, a write timeout and a read
+  timeout end the send without a `TransferError`; a reader failure sends one.
+- **Names.** A backslash in a name is accepted: it is an ordinary byte on unix, and the staging root keeps the
+  component below it.
+- **Stale staging roots.** At start the executor removes the `sandy-<kind>-<pid>-*` directories under its temp dir
+  whose process is gone and which it owns, so a killed executor does not leave a transfer behind. It sweeps one temp
+  dir: roots under a `TMPDIR` the executor no longer uses stay, and a pid reused in another pid namespace reads as
+  alive.
+- **Live proof.** One two-host run by hand (KXFER1 in `kpi.md`): the Mac as orchestrator, ws01 as executor, inputs
+  and outputs equal byte for byte.
+
 ## 23. `Cancel` is gated per job by the job's attach token (#540, audit #391)
 
 **Status:** accepted. **Upholds:** INV-1.
