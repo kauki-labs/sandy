@@ -322,8 +322,10 @@ fn validate_side(side: Option<&sandy_executor_proto::ContentDigests>) -> Result<
     Ok(sandy::ContentDigests { files, skipped })
 }
 
-/// Every path of `side` starts with the name of an input the Submit declared: the executor stages and hashes only
-/// those, so any other name is invented.
+/// Every path of `side` equals the name of an input the Submit declared, or starts with it plus `/` (a name may hold
+/// a `/` itself, so a bare prefix does not count): the executor stages and hashes only those, so any other name is
+/// invented. Only the input side is checked: output paths are the executor's own listing of what the job wrote, and
+/// the daemon joins them to the destinations it walks, so an invented one matches no file and is ignored.
 fn check_declared(side: &sandy::ContentDigests, declared: &[String]) -> Result<(), String> {
     let paths = side
         .files
@@ -331,8 +333,11 @@ fn check_declared(side: &sandy::ContentDigests, declared: &[String]) -> Result<(
         .map(|file| &file.path)
         .chain(side.skipped.iter().map(|entry| &entry.path));
     for path in paths {
-        let name = path.split('/').next().unwrap_or_default();
-        if !declared.iter().any(|declared| declared == name) {
+        let belongs = declared.iter().any(|name| {
+            path.strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        });
+        if !belongs {
             return Err(format!("the path {path:?} is not under a declared input"));
         }
     }
