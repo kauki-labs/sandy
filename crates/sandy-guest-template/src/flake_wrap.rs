@@ -144,6 +144,12 @@ pub fn resolve_bundled_flake(flake_ref: &str, root: impl FnOnce() -> Result<Path
     Ok(format!("{}?dir=nix/guest", flake_ref_root_prefix(&root)))
 }
 
+/// What `--from-devshell` prints on every use, by the submitter and by the executor that resolves the flake (#326).
+pub const FROM_DEVSHELL_WARNING: &str = "sandy: best-effort: synthesizing a nixos-module from --from-devshell — a \
+                                         devShell's shellHook assumes an interactive shell, the host checkout's cwd, \
+                                         and inherited host env, none of which carry over identically into the \
+                                         guest's login shell";
+
 /// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
 /// or `--from-devshell` for kind `devshell`, #326) into a [`ResolvedTemplate`],
 /// printing the kind it picked (or was told) to stderr before doing anything
@@ -192,11 +198,7 @@ pub fn resolve_flake_template(
         // never silently skipped by an early failure (#326's own acceptance
         // bar: the warning fires on every invocation, not only a successful
         // one).
-        eprintln!(
-            "sandy: best-effort: synthesizing a nixos-module from --from-devshell — a devShell's shellHook assumes an \
-             interactive shell, the host checkout's cwd, and inherited host env, none of which carry over identically \
-             into the guest's login shell"
-        );
+        eprintln!("{FROM_DEVSHELL_WARNING}");
         let resolved_attr = attr.unwrap_or(DEFAULT_ATTR).to_string();
         detect_devshell(flake_ref, &resolved_attr, &host, deadline)?;
         (TemplateKind::DevShell, resolved_attr)

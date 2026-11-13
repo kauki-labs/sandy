@@ -22,6 +22,7 @@ fn run_from_devshell(flake_ref: &str) -> anyhow::Result<std::process::Output> {
     let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
     Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
+        .env("SANDY_SOCK", home.path().join("no-daemon.sock"))
         .env("PATH", "/nonexistent-sandy-test-path")
         .args(["run", "--flake", flake_ref, "--from-devshell", "--", "true"])
         .output()
@@ -68,6 +69,7 @@ fn the_best_effort_warning_is_absent_without_from_devshell() -> anyhow::Result<(
     let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
+        .env("SANDY_SOCK", home.path().join("no-daemon.sock"))
         .env("PATH", "/nonexistent-sandy-test-path")
         .args(["run", "--flake", "/nonexistent-flake", "--", "true"])
         .output()
@@ -88,6 +90,7 @@ fn from_devshell_without_flake_or_template_is_a_clap_error() -> anyhow::Result<(
     let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
+        .env("SANDY_SOCK", home.path().join("no-daemon.sock"))
         .args(["run", "--from-devshell", "--", "true"])
         .output()
         .context("running `sandy run --from-devshell` with no --flake or template")?;
@@ -112,6 +115,7 @@ fn from_devshell_conflicts_with_a_bare_template() -> anyhow::Result<()> {
     let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
+        .env("SANDY_SOCK", home.path().join("no-daemon.sock"))
         .args(["run", "some-template", "--from-devshell", "--", "true"])
         .output()
         .context("running `sandy run <template> --from-devshell`")?;
@@ -132,6 +136,7 @@ fn from_devshell_conflicts_with_kind() -> anyhow::Result<()> {
     let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
     let output = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_HOME", home.path())
+        .env("SANDY_SOCK", home.path().join("no-daemon.sock"))
         .args([
             "run",
             "--flake",

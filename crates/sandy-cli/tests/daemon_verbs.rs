@@ -189,3 +189,13 @@ fn gc_prunes_the_daemons_store() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `-o json` is global: it may precede the verb, and `ls` then prints the daemon's jobs as JSON.
+#[test]
+fn the_output_flag_may_precede_the_verb() -> anyhow::Result<()> {
+    let (out, _) = against_fake_daemon(&["--output", "json", "ls"])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout).context("stdout utf8")?;
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).context("stdout must be valid JSON")?;
+    Ok(())
+}

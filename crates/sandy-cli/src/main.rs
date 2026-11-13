@@ -1,9 +1,9 @@
 //! The `sandy` command-line interface.
 //!
 //! A thin argv shell over the `sandy-cli` library: `doctor` (Block 0) and the
-//! Block 6 job ops `run`/`ls`/`status`/`wait`/`kill`/`gc`. All orchestration lives
-//! in the library modules; `main` only parses argv, selects the host backend, and
-//! maps results to process exit bands (INV-11).
+//! job verbs `run`/`ls`/`status`/`wait`/`kill`/`gc`, each a control-RPC call to `sandyd`.
+//! All orchestration lives in the library modules and the daemon; `main` only parses argv
+//! and maps results to process exit bands (INV-11).
 //!
 //! A separate crate root from `lib.rs`, so it repeats that file's
 //! `clippy::print_stdout` deny (#512): [`sandy_cli::output::emit`] is
@@ -12,16 +12,14 @@
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use sandy::{CoreError, GithubAdapter, Journal, ProcessExit, Scope};
+use sandy::ProcessExit;
 use sandy_cli::{
     app_register::{self, Owner},
     doctor,
     output::{
-        AttachEvent, AttachedChannel, CancelledJob, JobRecords, JobStatusReport, JobSummaries, MeshFingerprint,
-        OutputFormat, Render, SubmittedJob, emit,
+        AttachEvent, AttachedChannel, CancelledJob, JobStatusReport, JobSummaries, MeshFingerprint, OutputFormat,
+        Render, SubmittedJob, emit,
     },
-    plan::{JobPlan, RunArgs, parse_run},
-    supervisor,
 };
 use sandy_control_proto::{
     AttachRequest, CancelRequest, ListRequest, PruneRequest, StatusRequest, SubmitRequest, control_request,
@@ -45,7 +43,8 @@ struct Cli {
 enum Command {
     /// Verify environment preconditions before any job runs (Block 0, REQ-12).
     Doctor,
-    /// Boot a template and run a job to completion in the foreground.
+    /// Submit a job to `sandyd` (an untrusted VM job), wait for it and print its result envelope. Ctrl-C cancels the
+    /// job.
     Run {
         /// The template (flake attr / image) to boot. Mutually exclusive with `--flake`.
         #[arg(required_unless_present = "flake", conflicts_with = "flake")]
@@ -126,25 +125,29 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// List every job record.
+    /// List every job `sandyd` knows about.
     Ls,
-    /// Reconcile and print one job's current state.
+    /// Print one job's current state.
     Status {
         /// The job id to inspect.
         job_id: String,
     },
-    /// Wait for one job to reach a terminal state, then print it.
+    /// Wait for one job to reach a terminal state, then print it; exit `0` succeeded, `1` failed or cancelled, `3` an
+    /// infrastructure fault or a timeout.
     Wait {
         /// The job id to wait on.
         job_id: String,
+        /// Give up after this many seconds, naming the state the job was in (exit `3`).
+        #[arg(long, default_value_t = DEFAULT_WAIT_TIMEOUT_SECS)]
+        wait_timeout: u64,
     },
-    /// Cancel a running job and tear its box down.
+    /// Cancel a job and tear its box down.
     Kill {
         /// The job id to cancel.
         job_id: String,
     },
-    /// Garbage-collect terminal job records (keeping the newest N) and sweep
-    /// stale credential staging dirs past their mint TTL.
+    /// Delete terminal jobs from `sandyd`'s store (keeping the newest N) and sweep stale credential staging dirs past
+    /// their mint TTL. A running or pending job is never deleted.
     Gc {
         /// How many terminal records to keep (newest first).
         #[arg(long, default_value_t = 20)]
@@ -164,11 +167,9 @@ enum Command {
         #[command(subcommand)]
         op: MeshOp,
     },
-    /// Drive `sandyd`, the control-plane daemon, over its control RPC (#205,
-    /// B4). A separate job model from `run`/`status`/…, which execute
-    /// directly with no daemon involved — see #221 for the planned
-    /// convergence once `sandy submit`'s manifest reaches parity with `run`'s
-    /// flag set.
+    /// Drive `sandyd`, the control-plane daemon, over its control RPC (#205, B4). The job verbs (`run`, `ls`, `status`,
+    /// `wait`, `kill`, `gc`) make the same calls; this subcommand adds `submit` without `--wait`, `attach` and the
+    /// manifest and isolation-class flags.
     Daemon {
         /// The daemon operation to perform.
         #[command(subcommand)]
@@ -505,85 +506,6 @@ enum GithubOp {
         #[arg(long)]
         keep_remote: bool,
     },
-}
-
-/// The macOS host backend: vfkit. The live boot is the #26 seam — the sandbox
-/// gate exercises the generic `run_job` with a `FakeBackend`, never this path.
-#[cfg(target_os = "macos")]
-fn host_backend() -> sandy_backend::VfkitBackend {
-    // Resolve the vfkit binary from $SANDY_VFKIT_BIN, else let PATH resolve it at
-    // spawn time. Construction is lazy enough to stay off the sandbox path (#26).
-    let vfkit_bin = std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string());
-    sandy_backend::VfkitBackend::new(vfkit_bin)
-}
-
-/// The Linux host backend: qemu/KVM. See [`host_backend`] above for the #26 seam.
-#[cfg(not(target_os = "macos"))]
-fn host_backend() -> sandy_backend::QemuBackend {
-    sandy_backend::QemuBackend::new()
-}
-
-/// The Linux egress applier: `nft`-backed default-deny enforcement. The live load
-/// whose boundary an in-guest root flush cannot bypass is tier-3 (#29).
-#[cfg(target_os = "linux")]
-fn egress_applier() -> sandy::NftablesApplier {
-    sandy::NftablesApplier::default()
-}
-
-/// The non-Linux egress applier: the local no-op ([`sandy_backend::NoEgress`]),
-/// because `plan_egress` yields `NoBoundary` off Linux and nothing is applied.
-#[cfg(not(target_os = "linux"))]
-fn egress_applier() -> sandy_backend::NoEgress {
-    sandy_backend::NoEgress
-}
-
-/// Load the named trust root from `dir` and build the live [`GithubAdapter`] plus
-/// the [`Scope`] to mint for. Delegates to [`sandy::resolve_provider`], the one
-/// resolution `sandy run` and sandyd's job credential (#481) share.
-fn credential_setup(
-    dir: &std::path::Path,
-    name: &str,
-    capabilities: &[String],
-) -> Result<(GithubAdapter, Scope), String> {
-    sandy::resolve_provider(dir, name, capabilities)
-}
-
-/// The host credential source: load the named trust root and build the live GitHub
-/// adapter ([`credential_setup`]), boxed behind the [`sandy::CredentialSource`] seam
-/// so the credentialed run path composes through the profile like the backend and
-/// egress seams. The provider is built per run (it needs `--credential` + the trust
-/// root), so the profile carries the construction, not a prebuilt provider.
-struct HostCredentialSource;
-
-impl sandy::CredentialSource for HostCredentialSource {
-    fn provider(
-        &self,
-        dir: &std::path::Path,
-        name: &str,
-        capabilities: &[String],
-    ) -> Result<(Box<dyn sandy::CredentialProvider + Sync>, sandy::Scope), String> {
-        let (adapter, scope) = credential_setup(dir, name, capabilities)?;
-        Ok((Box::new(adapter), scope))
-    }
-}
-
-/// The host run profile: today's sandbox backend, egress applier, and GitHub
-/// credential source, bundled as the composition root `dispatch_run` threads. The
-/// egress OS model is the platform's (Linux enforces the nftables boundary, macOS
-/// is honestly unenforced). This is the one concrete profile today; a different
-/// profile (all-local) swaps the impls without touching dispatch.
-fn host_profile() -> sandy::Profile {
-    let egress_os = if cfg!(target_os = "macos") {
-        sandy::EgressOs::MacOs
-    } else {
-        sandy::EgressOs::Linux
-    };
-    sandy::Profile::new(
-        Box::new(host_backend()),
-        Box::new(egress_applier()),
-        egress_os,
-        Box::new(HostCredentialSource),
-    )
 }
 
 fn main() {
@@ -1103,6 +1025,10 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             timeout: *timeout,
             command: command.clone(),
         };
+        if flake.is_some() && *from_devshell {
+            // The executor prints it too, to a log the submitter never reads.
+            eprintln!("{}", sandy_guest_template::FROM_DEVSHELL_WARNING);
+        }
         let built = match (flake, template) {
             (Some(flake), _) => Some(sandy_cli::submit::flake_manifest(
                 flake.clone(),
@@ -1572,7 +1498,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
 }
 
 /// Dispatch `sandy doctor`: print the host-prerequisite verdict and return its
-/// exit band. Needs no journal, so it runs before `$SANDY_HOME` is touched.
+/// exit band.
 fn dispatch_doctor(output: OutputFormat) -> i32 {
     let result = doctor::run_doctor();
     if output == OutputFormat::Plain && result.exit_code != 0 {
@@ -1588,207 +1514,14 @@ fn dispatch_doctor(output: OutputFormat) -> i32 {
     result.exit_code
 }
 
-/// Removes a directory when dropped: the credential staging dir must not
-/// outlive the run, including on a panic.
-struct RemoveDirOnDrop(std::path::PathBuf);
-
-impl Drop for RemoveDirOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Mint a scoped forge token from the named trust root, stage it under a
-/// per-process dir, and run the job bracketed by it (mint → inject → revoke at
-/// teardown). Setup faults (bad trust-roots dir, unknown capability) map to an
-/// exit band before any boot; the staging dir is always removed. The error arm
-/// carries the process band so the caller returns it directly.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "forwards the run and credential inputs to run_job_with_credential"
-)]
-fn run_credentialed(
-    profile: &sandy::Profile,
-    journal: &Journal,
-    plan: JobPlan,
-    tap: Option<&str>,
-    name: &str,
-    cred_capability: &[String],
-) -> Result<supervisor::RunReport, i32> {
-    let dir = app_register::trust_roots_dir().map_err(|e| {
-        eprintln!("sandy: trust-roots dir: {e}");
-        ProcessExit::InfraFault.code()
-    })?;
-    let (provider, scope) = profile.cred().provider(&dir, name, cred_capability).map_err(|e| {
-        eprintln!("sandy: {e}");
-        ProcessExit::InvalidPlan.code()
-    })?;
-    // A fresh 0700 dir under the validated staging base, randomly named: a
-    // predictable /tmp path could be pre-created by another user (#192).
-    let cred_handle = sandy_fsutil::private_staging_dir("cred").map_err(|e| {
-        eprintln!("sandy: create credential staging dir: {e}");
-        ProcessExit::InfraFault.code()
-    })?;
-    // Captured here, not re-derived later: the fingerprint is this validation's
-    // own binding to the directory it just created (#323), carried alongside the
-    // bare path every downstream re-open (mint, refresh, the backend's guest-share
-    // staging) is checked against, instead of trusting a same-uid, same-mode
-    // directory swapped in at the path afterward.
-    let (dev, ino) = cred_handle.dev_ino().map_err(|e| {
-        eprintln!("sandy: fingerprint credential staging dir: {e}");
-        ProcessExit::InfraFault.code()
-    })?;
-    let cred_fingerprint = sandy::DirFingerprint { dev, ino };
-    let cred_dir = cred_handle.path().to_path_buf();
-    drop(cred_handle);
-    // Removed on every exit from here, a panic included, not only a normal return.
-    let _cleanup = RemoveDirOnDrop(cred_dir.clone());
-    let result = supervisor::run_job_with_credential(
-        profile.backend(),
-        journal,
-        plan,
-        profile.egress(),
-        profile.egress_os(),
-        tap,
-        provider.as_ref(),
-        &scope,
-        "GITHUB_TOKEN",
-        &cred_dir,
-        cred_fingerprint,
-        sandy::MAX_TTL_SECS,
-    );
-    result.map_err(|e| {
-        eprintln!("sandy: run failed: {e}");
-        ProcessExit::InfraFault.code()
-    })
-}
-
-/// What `sandy run` says about the sweep it made, or nothing when it found nothing to do. A box left alone because
-/// its owner is alive is not news.
-fn sweep_notice(report: &sandy_backend::SweepReport) -> Option<String> {
-    let left = report.undecided + report.unreadable;
-    if report.killed + report.wiped + left == 0 {
-        return None;
-    }
-    let mut notice = format!(
-        "swept the VMs a killed host left behind: {} process(es) signalled, {} box(es) removed",
-        report.killed, report.wiped
-    );
-    if left > 0 {
-        notice.push_str(&format!(", {left} left for the next run"));
-    }
-    Some(notice)
-}
-
-/// Dispatch `sandy run`: parse the plan, bracket the boot with egress and an
-/// optional credential, print the result envelope, and return the process exit
-/// band (INV-11).
-fn dispatch_run(
-    profile: &sandy::Profile,
-    args: RunArgs,
-    credential: Option<String>,
-    cred_capability: &[String],
-    journal: &Journal,
-    output: OutputFormat,
-) -> i32 {
-    let mut plan = match parse_run(args) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("sandy: {e}");
-            return ProcessExit::InvalidPlan.code();
-        }
-    };
-    // `SANDY_EGRESS=proxy` runs the guest behind the backend's egress proxy instead of the nftables boundary (#360).
-    // An unknown value is refused rather than ignored, so a typo never boots under the other model.
-    match std::env::var("SANDY_EGRESS").ok().as_deref() {
-        None | Some("") => {}
-        Some("proxy") => plan.egress_proxy = true,
-        Some(other) => {
-            eprintln!("sandy: SANDY_EGRESS must be `proxy` or unset, got `{other}`");
-            return ProcessExit::InvalidPlan.code();
-        }
-    }
-    // `SANDY_NETWORK=nic` boots the guest with a NIC (#602). An unknown value is refused, never defaulted.
-    match sandy::NetworkMode::from_env() {
-        Ok(mode) => plan.network = mode,
-        Err(e) => {
-            eprintln!("sandy: {e}");
-            return ProcessExit::InvalidPlan.code();
-        }
-    }
-    // From here on the run owns a guest, a credential and an egress boundary: a termination signal must cancel the
-    // run so the teardown runs, not end the process with the default action (#687). Fail closed when the handlers
-    // cannot be installed.
-    if let Err(e) = sandy_cli::signals::cancel_on_termination(plan.control.clone()) {
-        eprintln!("sandy: cannot install the termination-signal handlers: {e}");
-        return ProcessExit::InfraFault.code();
-    }
-    // The run seams come from the injected `profile` — the sandbox backend, the
-    // egress applier (Linux enforces the nftables boundary, macOS has none), and the
-    // credential source. The composition root selects the profile at the top
-    // (`dispatch`) and threads it here, so this code never names a concrete impl and
-    // a different profile swaps them without touching dispatch.
-    // The guest's tap (if any) comes from $SANDY_TAP — the same interface the
-    // backend attaches the NIC to. On Linux a bound tap selects the guest-scoped
-    // forward ruleset (safe), never the host-OUTPUT drop-all (#29).
-    let tap = std::env::var("SANDY_TAP").ok().filter(|t| !t.is_empty());
-
-    // With `--credential`, mint a scoped forge token and bracket the run with it;
-    // otherwise run with no credential. Both paths compose through the profile.
-    let report = match credential {
-        Some(name) => match run_credentialed(profile, journal, plan, tap.as_deref(), &name, cred_capability) {
-            Ok(report) => report,
-            Err(code) => return code,
-        },
-        None => match supervisor::run_with_profile(profile, journal, &plan, tap.as_deref()) {
-            Ok(report) => report,
-            Err(e) => {
-                eprintln!("sandy: run failed: {e}");
-                return ProcessExit::InfraFault.code();
-            }
-        },
-    };
-    // The envelope is the result, not a diagnostic — print it (the band, not
-    // stdout, signals failure) and exit on the process band.
-    if let Err(code) = emit(&report.envelope, output) {
-        return code;
-    }
-    report.process_exit.code()
-}
-
 /// Dispatch one parsed command and return the process exit band (INV-11).
 fn dispatch(command: Command, output: OutputFormat) -> i32 {
-    // Doctor needs no journal; handle it before touching `$SANDY_HOME`.
-    if let Command::Doctor = command {
-        return dispatch_doctor(output);
-    }
-
-    // `cred` ops need only the user config dir, not $SANDY_HOME.
-    if let Command::Cred { provider } = command {
-        return dispatch_cred(provider, output);
-    }
-
-    // `mesh` ops touch only the caller-named identity dir, not $SANDY_HOME.
-    if let Command::Mesh { op } = command {
-        return dispatch_mesh(op, output);
-    }
-
-    // `daemon` ops talk to sandyd over its own socket, not $SANDY_HOME.
-    if let Command::Daemon { op } = command {
-        return dispatch_daemon(op, output);
-    }
-
-    let journal = Journal::new(doctor::sandy_home());
-    if let Err(e) = journal.ensure_dirs() {
-        eprintln!("sandy: cannot initialize $SANDY_HOME: {e}");
-        return ProcessExit::InfraFault.code();
-    }
-
     match command {
-        Command::Doctor => unreachable!("doctor handled above"),
-        Command::Cred { .. } => unreachable!("cred handled above"),
-        Command::Mesh { .. } => unreachable!("mesh handled above"),
-        Command::Daemon { .. } => unreachable!("daemon handled above"),
+        Command::Doctor => dispatch_doctor(output),
+        Command::Cred { provider } => dispatch_cred(provider, output),
+        Command::Mesh { op } => dispatch_mesh(op, output),
+        Command::Daemon { op } => dispatch_daemon(op, output),
+        // The job verbs are the daemon's: each is the `sandy daemon` call of the same meaning.
         Command::Run {
             template,
             flake,
@@ -1807,95 +1540,40 @@ fn dispatch(command: Command, output: OutputFormat) -> i32 {
             credential,
             cred_capability,
             command,
-        } => {
-            // `--flake` resolves to either the user's own `topologies` attr
-            // (kind `topology`, unchanged) or a prebuilt topology JSON file
-            // (kinds `nixos-module`/`nixos-configuration`, #325) that
-            // `JobPlan::template` becomes — `_kept_template_file` holds that
-            // file open for exactly this call, dropped (and deleted) only
-            // after `dispatch_run` returns.
-            let (resolved_template, _kept_template_file) = match flake {
-                Some(flake_ref) => {
-                    match sandy_cli::flake_wrap::resolve_flake_template(
-                        &flake_ref,
-                        kind.as_deref(),
-                        attr.as_deref(),
-                        from_devshell,
-                    ) {
-                        Ok(sandy_cli::flake_wrap::ResolvedTemplate::Direct(t)) => (t, None),
-                        Ok(sandy_cli::flake_wrap::ResolvedTemplate::Prebuilt { path, _kept }) => (path, Some(_kept)),
-                        Err(e) => {
-                            eprintln!("sandy: --flake {flake_ref}: {e}");
-                            return ProcessExit::InvalidPlan.code();
-                        }
-                    }
-                }
-                // clap's `required_unless_present = "flake"` guarantees
-                // `template` is set whenever `flake` is not; the `None` arm
-                // is unreachable in practice but reported, not panicked, if
-                // clap's own guarantee ever changes.
-                None => match template {
-                    Some(t) => (t, None),
-                    None => {
-                        eprintln!("sandy: neither a template nor --flake was given");
-                        return ProcessExit::InvalidPlan.code();
-                    }
-                },
-            };
-            let args = RunArgs {
-                template: resolved_template,
-                inputs,
-                outputs,
-                secrets,
+        } => dispatch_daemon(
+            DaemonOp::Submit {
+                manifest: template,
+                // A template boots a VM, so the job needs the hypervisor boundary.
+                isolation_class: IsolationClassArg::Untrusted,
+                manifest_encoding: None,
+                flake,
+                attr,
+                kind,
+                from_devshell,
+                history_lines: None,
                 env,
-                allow,
                 cpu,
                 mem,
                 timeout,
-                digests,
                 command,
-            };
-            // Stop the VMs a killed `sandy` or `sandyd` left behind before this run boots another (#666). It touches
-            // only a box whose owner is verifiably gone, so a daemon or a CLI run that is alive is never hit. Here and
-            // not in `host_backend()`, which read-only commands (`ls`, `status`) share. It sweeps by the records a run
-            // writes, so it covers qemu on Linux and vfkit on macOS.
-            if let Some(notice) = sweep_notice(&sandy_backend::sweep_orphaned_vms()) {
-                eprintln!("sandy: {notice}");
-            }
-            // The composition root: select the run profile here and inject it. Today
-            // only the host profile exists; a different profile (all-local) is a swap
-            // at this one call site, not a change to dispatch_run.
-            dispatch_run(&host_profile(), args, credential, &cred_capability, &journal, output)
-        }
-        Command::Ls => match supervisor::ls(&journal) {
-            Ok(records) => succeed_or(emit(&JobRecords(records), output)),
-            Err(e) => report_error(&e),
-        },
-        Command::Status { job_id } => {
-            let backend = host_backend();
-            match supervisor::status(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(&record, output)),
-                Err(e) => report_error(&e),
-            }
-        }
-        Command::Wait { job_id } => {
-            let backend = host_backend();
-            match supervisor::wait(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(&record, output)),
-                Err(e) => report_error(&e),
-            }
-        }
-        Command::Kill { job_id } => {
-            let backend = host_backend();
-            match supervisor::kill(&journal, &backend, &job_id) {
-                Ok(record) => succeed_or(emit(&record, output)),
-                Err(e) => report_error(&e),
-            }
-        }
-        Command::Gc { keep_last } => match supervisor::gc(&journal, keep_last) {
-            Ok(report) => succeed_or(emit(&report, output)),
-            Err(e) => report_error(&e),
-        },
+                cap_files: Vec::new(),
+                inputs,
+                outputs,
+                secrets,
+                credential,
+                cred_capability,
+                allow,
+                digests,
+                wait: true,
+                wait_timeout: DEFAULT_WAIT_TIMEOUT_SECS,
+            },
+            output,
+        ),
+        Command::Ls => dispatch_daemon(DaemonOp::List, output),
+        Command::Status { job_id } => dispatch_daemon(DaemonOp::Status { job_id }, output),
+        Command::Wait { job_id, wait_timeout } => dispatch_daemon(DaemonOp::Wait { job_id, wait_timeout }, output),
+        Command::Kill { job_id } => dispatch_daemon(DaemonOp::Cancel { job_id }, output),
+        Command::Gc { keep_last } => dispatch_daemon(DaemonOp::Prune { keep_last }, output),
     }
 }
 
@@ -1914,166 +1592,13 @@ fn succeed_or(emitted: Result<(), i32>) -> i32 {
     }
 }
 
-/// Print a management-op error and map it to an exit band: an unknown job id is a
-/// usage error (band 2); every other journal fault is an infra fault (band 3).
-fn report_error(error: &CoreError) -> i32 {
-    eprintln!("sandy: {error}");
-    match error {
-        CoreError::NotFound(_) => ProcessExit::InvalidPlan.code(),
-        _ => ProcessExit::InfraFault.code(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use anyhow::Context;
-    use sandy::{
-        Capability, CredentialProvider, CredentialSource, EgressOs, Outcome, Profile, Target, TrustRoot, TrustRootIo,
-    };
-    use sandy_test_support::{FakeApplier, FakeBackend};
 
     use super::*;
-
-    /// The non-credentialed dispatch path builds no provider, so a test profile
-    /// carries this to satisfy the credential seam without a live backend.
-    struct NoCred;
-    impl CredentialSource for NoCred {
-        fn provider(
-            &self,
-            _dir: &std::path::Path,
-            _name: &str,
-            _capabilities: &[String],
-        ) -> Result<(Box<dyn CredentialProvider + Sync>, Scope), String> {
-            unreachable!("the non-credentialed dispatch path never builds a credential provider")
-        }
-    }
-
-    /// A minimal `run demo` request with no inputs, secrets, or command.
-    fn demo_run_args() -> RunArgs {
-        RunArgs {
-            template: "demo".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            secrets: vec![],
-            env: vec![],
-            allow: vec![],
-            cpu: None,
-            mem: None,
-            timeout: None,
-            digests: false,
-            command: vec![],
-        }
-    }
-
-    /// The composition root threads the INJECTED profile (#131 T1): `dispatch_run`,
-    /// given a `Profile` whose `FakeBackend` is scripted to a clean success, exits on
-    /// the band-0 success code — proving the dispatch SITE runs the injected backend,
-    /// not `host_backend()`. A regression where `dispatch_run` bypassed the profile
-    /// and reached a real host backend could not produce a band-0 success here.
-    #[test]
-    fn dispatch_run_threads_the_injected_profile() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir().context("temp SANDY_HOME")?;
-        let journal = Journal::new(tmp.path());
-        journal.ensure_dirs().context("ensure_dirs")?;
-        let backend = FakeBackend::new().with_outcome(Outcome {
-            digests: None,
-            booted: true,
-            guest_exit: Some(0),
-            transport_error: None,
-            timed_out: false,
-            console: String::new(),
-        });
-        let profile = Profile::new(
-            Box::new(backend),
-            Box::new(FakeApplier::new()),
-            EgressOs::Linux,
-            Box::new(NoCred),
-        );
-        let code = dispatch_run(&profile, demo_run_args(), None, &[], &journal, OutputFormat::Plain);
-        assert_eq!(
-            code,
-            ProcessExit::Succeeded.code(),
-            "dispatch_run must run the injected FakeBackend's clean-success outcome (band 0)"
-        );
-        Ok(())
-    }
-
-    /// Write a GitHub trust root (and a `0600` dummy key) under `dir`, so
-    /// `credential_setup` has something to load without a live forge.
-    fn write_trust_root(dir: &std::path::Path, name: &str, targets: &[&str]) -> anyhow::Result<()> {
-        std::fs::create_dir_all(dir).context("mkdir")?;
-        let pem = dir.join(format!("{name}.pem"));
-        std::fs::write(&pem, b"-----dummy-----").context("write pem")?;
-        std::fs::set_permissions(&pem, std::fs::Permissions::from_mode(0o600)).context("chmod pem")?;
-        let root = TrustRoot::Github {
-            base_url: None,
-            app_id: "123".to_string(),
-            private_key_path: pem,
-            installation_id: 7,
-            targets: targets.iter().map(|t| Target((*t).to_string())).collect(),
-        };
-        root.write(&dir.join(format!("{name}.json")))
-            .context("write trust root")?;
-        Ok(())
-    }
-
-    #[test]
-    fn credential_setup_scopes_to_the_trust_root_targets_and_capabilities() -> anyhow::Result<()> {
-        let tmp = tempfile::Builder::new()
-            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
-                0o700,
-            ))
-            .tempdir()?;
-        write_trust_root(tmp.path(), "runner", &["kauki-labs/sandy-pilot-test"])?;
-
-        let (_adapter, scope) = credential_setup(
-            tmp.path(),
-            "runner",
-            &["write-code".to_string(), "write-pr".to_string()],
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-        assert_eq!(scope.targets, vec![Target("kauki-labs/sandy-pilot-test".to_string())]);
-        assert_eq!(scope.capabilities, vec![Capability::WriteCode, Capability::WritePr]);
-        Ok(())
-    }
-
-    #[test]
-    fn credential_setup_defaults_to_read_code_when_no_capability_is_given() -> anyhow::Result<()> {
-        let tmp = tempfile::Builder::new()
-            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
-                0o700,
-            ))
-            .tempdir()?;
-        write_trust_root(tmp.path(), "runner", &["o/r"])?;
-
-        let (_adapter, scope) = credential_setup(tmp.path(), "runner", &[]).map_err(|e| anyhow::anyhow!(e))?;
-
-        assert_eq!(
-            scope.capabilities,
-            vec![Capability::ReadCode],
-            "no capability flag defaults to read-code"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn credential_setup_rejects_an_unknown_capability() -> anyhow::Result<()> {
-        let tmp = tempfile::Builder::new()
-            .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(
-                0o700,
-            ))
-            .tempdir()?;
-        write_trust_root(tmp.path(), "runner", &["o/r"])?;
-
-        let err = credential_setup(tmp.path(), "runner", &["admin".to_string()])
-            .map(|_| ())
-            .expect_err("an unknown capability must be rejected");
-        assert!(err.contains("unknown --cred-capability"), "got: {err}");
-        Ok(())
-    }
 
     fn write_cap_file(dir: &std::path::Path, name: &str, contents: &str) -> anyhow::Result<String> {
         let path = dir.join(name);
@@ -2178,47 +1703,5 @@ mod tests {
             .expect_err("a missing --cap-file must be refused");
         assert!(err.contains("/nonexistent/cap/path"), "got: {err}");
         assert!(err.contains("could not be read"), "got: {err}");
-    }
-
-    /// #666: a run that stopped a killed host's VMs says so, or the user never learns that it killed anything.
-    #[test]
-    fn a_sweep_that_did_something_is_reported() {
-        let swept = sandy_backend::SweepReport {
-            killed: 3,
-            wiped: 1,
-            ..sandy_backend::SweepReport::default()
-        };
-        assert_eq!(
-            sweep_notice(&swept).as_deref(),
-            Some("swept the VMs a killed host left behind: 3 process(es) signalled, 1 box(es) removed")
-        );
-    }
-
-    #[test]
-    fn a_box_that_could_not_be_swept_is_reported_as_left_for_the_next_run() {
-        let swept = sandy_backend::SweepReport {
-            killed: 1,
-            undecided: 2,
-            unreadable: 1,
-            ..sandy_backend::SweepReport::default()
-        };
-        assert_eq!(
-            sweep_notice(&swept).as_deref(),
-            Some(
-                "swept the VMs a killed host left behind: 1 process(es) signalled, 0 box(es) removed, 3 left for the \
-                 next run"
-            )
-        );
-    }
-
-    #[test]
-    fn a_sweep_that_found_nothing_to_do_says_nothing() {
-        assert_eq!(sweep_notice(&sandy_backend::SweepReport::default()), None);
-        // A live owner's box is left alone, and that is not news.
-        let alive = sandy_backend::SweepReport {
-            live_owner: 2,
-            ..sandy_backend::SweepReport::default()
-        };
-        assert_eq!(sweep_notice(&alive), None);
     }
 }

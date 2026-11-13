@@ -26,7 +26,7 @@ needs a matching-arch Linux guest built remotely (nix-darwin's
 `nix.linux-builder`) — `doctor` is what catches a missing or misconfigured
 builder before you waste time on a `run` that fails mid-boot.
 
-## Running one job directly: `sandy run`
+## Running one job: `sandy run`
 
 ```
 sandy run [TEMPLATE] [OPTIONS] [-- CMD ARGS...]
@@ -41,6 +41,12 @@ sandy run [TEMPLATE] [OPTIONS] [-- CMD ARGS...]
   throwaway module from a flake's `devShells.<system>.default` — always
   opt-in, never auto-detected, and it prints a warning about what doesn't
   carry over (interactive shell assumptions, host env, cwd).
+- `sandy run` submits to `sandyd` and waits (an untrusted VM job), so `sandyd` and
+  a VM-capable `sandy-host-executor` must be running; `sandy doctor` reports
+  whether they are. `TEMPLATE` is `topologies.<system>.<hypervisor>` of sandy's
+  bundled guest flake or `REF#topologies.<system>.<hypervisor>`. The executor
+  evaluates it but does not build it: on a cold executor, build the guest runner
+  first (`nix build ./nix/guest#packages.<system>.guest-runner`).
 - No trailing `-- CMD` means "boot the template's default command."
 - **Resource/time bounds**: `--cpu N`, `--mem MiB`, `--timeout SECS`
   (defaults to 5 minutes if omitted). These are requests the host may clamp,
@@ -76,24 +82,24 @@ should branch on which one you got, not just "exit != 0."
 
 ## Checking in on and managing jobs
 
-`sandy run` blocks in the foreground until the job finishes. For anything
-you want to manage asynchronously, or dispatch to a different machine, go
-through the daemon instead (below). Either way:
+`sandy run` blocks in the foreground until the job finishes. For a job that
+keeps running without this CLI, use `sandy daemon submit` (below). Either way:
 
-- `sandy ls -o json` — every job record.
-- `sandy status <job-id> -o json` — reconcile and print one job's current state.
+- `sandy ls -o json` — every job `sandyd` knows.
+- `sandy status <job-id> -o json` — one job's current state.
 - `sandy wait <job-id> -o json` — block until that job reaches a terminal
-  state, then print it. Prefer this over polling `status` in a loop.
-- `sandy kill <job-id>` — cancel a running job and tear its sandbox down.
-- `sandy gc --keep-last N` — prune old terminal job records and sweep stale
+  state, then print it; exit `0` succeeded, `1` failed or cancelled, `3` an
+  infrastructure fault or timeout. Prefer this over polling `status` in a loop.
+- `sandy kill <job-id>` — cancel a job and tear its sandbox down.
+- `sandy gc --keep-last N` — delete old terminal jobs and sweep stale
   credential staging dirs (defaults to keeping the newest 20).
 
 ## Dispatching through `sandyd` (the daemon path)
 
-`sandy daemon submit` talks to `sandyd`, the control-plane daemon, instead of
-running the job directly in this process — use it when you want the job to
-keep running independent of this CLI invocation, or to be placed on a
-different registered host.
+`sandy daemon submit` makes the same call `sandy run` does, without waiting by
+default and with the manifest and isolation-class flags — use it when you want
+the job to keep running independent of this CLI invocation, or to run a
+trusted argv job.
 
 ```
 sandy daemon submit --isolation-class <trusted|untrusted> --flake <ref> [OPTIONS] [-- CMD ARGS...]
@@ -118,7 +124,7 @@ sandy daemon submit --isolation-class <trusted|untrusted> --flake <ref> [OPTIONS
   finished) job, interactively or for its printed data-plane channel/cap.
   Detaching never ends the job.
 - `sandy daemon cancel <job-id>` / `status <job-id>` / `list` round out the
-  set, same shape as the direct-run commands above.
+  set, the same calls as `sandy kill`, `status` and `ls` above.
 
 ## Managing forge credentials: `sandy cred`
 

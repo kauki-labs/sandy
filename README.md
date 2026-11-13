@@ -74,9 +74,18 @@ sandy doctor                       # verify host prerequisites
 sandy run <template> [flags] -- <cmd...>
 ```
 
-`<template>` is a guest flake attr (e.g. `topologies.aarch64-linux.vfkit`). The
-job command runs inside the guest; its exit code and the guest console come back in
-the result envelope. Flags (repeatable where it makes sense):
+`sandy run` submits the job to `sandyd` and waits for it, so it needs a running `sandyd`
+(socket `$SANDY_SOCK`) and a `sandy-host-executor` that can boot a VM: two processes, see
+[Running `sandyd` across multiple hosts](#running-sandyd-across-multiple-hosts) (one
+machine works too). A VM job is untrusted: only a hypervisor boundary may run it.
+
+`<template>` is `topologies.<system>.<hypervisor>` of sandy's bundled guest flake, or
+`REF#topologies.<system>.<hypervisor>` for your own flake `REF`. The executor picks
+its own system and hypervisor. It evaluates the topology but does not build it: on a
+cold executor run `nix build ./nix/guest#packages.<system>.guest-runner` first (qemu;
+`guest-runner-vfkit` on macOS). The job command runs inside the guest; its exit code
+and the guest console come back in the result envelope. Flags (repeatable where it
+makes sense):
 
 | Flag                                       | Effect                                                                                                           |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
@@ -97,11 +106,11 @@ sandy run topologies.aarch64-linux.vfkit \
 ```
 
 ```sh
-sandy ls                       # list every job record
-sandy status <job-id>          # reconcile + print one job's current state
-sandy wait <job-id>            # block until terminal, then print it
-sandy kill <job-id>            # cancel a running job and tear its box down
-sandy gc [--keep-last N]       # evict terminal records, keep the newest N (default 20)
+sandy ls                       # list every job sandyd knows
+sandy status <job-id>          # print one job's current state
+sandy wait <job-id>            # block until terminal, then print it; exit by band
+sandy kill <job-id>            # cancel a job and tear its box down
+sandy gc [--keep-last N]       # delete terminal jobs, keep the newest N (default 20)
 ```
 
 Credential trust roots are managed with
@@ -114,8 +123,9 @@ sandy daemon status|attach|cancel <job-id>
 sandy daemon list
 ```
 
-`sandy daemon` drives `sandyd`, an evolving control-plane daemon with its own
-job model (see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
+`sandy daemon` makes the same control-RPC calls as the verbs above and adds
+`submit` without `--wait`, `attach`, and the manifest and isolation-class flags
+(see [`docs/decisions/sandyd.md`](docs/decisions/sandyd.md)).
 
 ### Running `sandyd` across multiple hosts
 
