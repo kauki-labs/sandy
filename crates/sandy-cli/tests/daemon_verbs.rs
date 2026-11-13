@@ -320,7 +320,11 @@ fn kill_without_a_saved_token_is_refused_and_says_why() -> anyhow::Result<()> {
     let out = fake.sandy(&["kill", "job-9"])?;
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("no attach token saved for job job-9"), "{stderr}");
+    assert!(stderr.contains("no attach token is saved on this host"), "{stderr}");
+    assert!(
+        !stderr.contains("job-9"),
+        "the refusal must not echo the job id (#540): {stderr}"
+    );
     assert!(stderr.contains("not authorized to cancel"), "{stderr}");
     Ok(())
 }

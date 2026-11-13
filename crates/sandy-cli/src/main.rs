@@ -1310,8 +1310,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             // the same way `attach` does.
             let attach_token = sandy_cli::attach::read_attach_token(&job_id);
             if attach_token.is_none() {
+                // Not the job id: the daemon's refusal says nothing about the job either (#540).
                 eprintln!(
-                    "sandy: no attach token saved for job {job_id} on this host; sandyd cancels a job only for the \
+                    "sandy: no attach token is saved on this host for that job; sandyd cancels a job only for the \
                      client that submitted it"
                 );
             }
