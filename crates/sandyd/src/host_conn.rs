@@ -2273,13 +2273,21 @@ mod tests {
     async fn egress_receipt_for(
         report: Option<sandy_executor_proto::EgressReport>,
     ) -> anyhow::Result<sandy::EgressReceipt> {
+        egress_receipt_dispatched_with(report, Some(allow())).await
+    }
+
+    /// [`egress_receipt_for`] for a job dispatched with `allow` (`None` for a job with no policy).
+    async fn egress_receipt_dispatched_with(
+        report: Option<sandy_executor_proto::EgressReport>,
+        allow: Option<sandy::AllowList>,
+    ) -> anyhow::Result<sandy::EgressReceipt> {
         let (store, job_registry) = (test_store(), test_job_registry());
         store.insert_pending("job-1", b"m", "test/v1")?;
         store.mark_running("job-1")?;
         let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
             .await
             .context("mint job channel")?;
-        job.egress_allow = Some(allow());
+        job.egress_allow = allow;
         job_registry.insert("job-1".to_owned(), job);
         record_job_result(
             &store,
@@ -2350,6 +2358,56 @@ mod tests {
             }
             assert_eq!(receipt.allow_list, applied.then(allow), "{name}: allow-list");
         }
+        Ok(())
+    }
+
+    /// A2b (#483, sandy-5e F2 on #835): a report for a job dispatched with no policy is ignored. `PROXIED` would
+    /// otherwise read as `Enforced` with an empty allow-list for a job that never asked for a boundary.
+    #[tokio::test]
+    async fn an_egress_report_for_a_job_without_a_policy_is_ignored() -> anyhow::Result<()> {
+        let report = sandy_executor_proto::EgressReport {
+            state: sandy_executor_proto::EgressState::Proxied.into(),
+            reason: None,
+        };
+        let receipt = egress_receipt_dispatched_with(Some(report), None).await?;
+        assert_eq!(receipt.status, sandy::EgressEnforcement::Unenforced);
+        assert_eq!(receipt.allow_list, None);
+        Ok(())
+    }
+
+    /// A2b (#483, sandy-5e F1 on #835): the executor's egress reason can be as large as its frame, so it is cut like
+    /// the message is: a huge one leaves a `Status` reply that fits one frame.
+    #[tokio::test]
+    async fn a_huge_egress_reason_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.egress_allow = Some(allow());
+        job_registry.insert("job-1".to_owned(), job);
+        let report = sandy_executor_proto::EgressReport {
+            state: sandy_executor_proto::EgressState::Failed.into(),
+            reason: Some("\u{1}".repeat(900 * 1024)),
+        };
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                egress: Some(report),
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        assert!(
+            envelope.len() < sandy_control_proto::MAX_FRAME_LEN as usize / 2,
+            "the stored envelope is {} bytes",
+            envelope.len()
+        );
         Ok(())
     }
 

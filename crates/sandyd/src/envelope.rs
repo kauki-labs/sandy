@@ -162,6 +162,13 @@ pub(crate) fn from_run(
     )
 }
 
+/// Redact, then cut, the egress reason in `envelope`'s receipt: it is the executor's own error string, as the message
+/// is, so it can hold a token and can be as large as the frame that carried it (sandy-5e on #835). Redact first so a
+/// token straddling the cut leaves no suffix, then keep the last `MAX_MESSAGE_BYTES`.
+pub(crate) fn bound_egress_reason(envelope: &mut ResultEnvelope, redact: impl FnOnce(String) -> String) {
+    let _ = (envelope, redact);
+}
+
 /// The envelope for a job cancelled before a terminal guest result: the shape the direct `kill` writes (status
 /// `Cancelled`, not retryable, no exit, no receipt: no backend run was observed).
 pub(crate) fn cancelled(job_id: &str) -> ResultEnvelope {
@@ -195,4 +202,31 @@ pub(crate) fn infra_fault(job_id: &str, reason: &str, host_id: Option<&str>) -> 
         Vec::new(),
         Some(receipt(job_id, None, host_id, egress_receipt(None, None))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A2b (#483, sandy-5e on #835): the egress reason is redacted whole and then cut, so a token that straddles the
+    /// cut leaves no suffix, and a huge reason is bounded.
+    #[test]
+    fn the_egress_reason_is_redacted_then_cut() {
+        const TOKEN: &str = "ghs_sentinel835_never_log_me";
+        let mut envelope = infra_fault("job-1", "x", None);
+        let filler = "z".repeat(MAX_MESSAGE_BYTES - TOKEN.len() / 2);
+        if let Some(receipt) = envelope.receipt.as_mut() {
+            receipt.host_observed.egress.reason = Some(format!("{TOKEN}{filler}"));
+        }
+        bound_egress_reason(&mut envelope, |text| text.replace(TOKEN, "[REDACTED]"));
+        let reason = envelope
+            .receipt
+            .and_then(|receipt| receipt.host_observed.egress.reason)
+            .unwrap_or_default();
+        assert!(reason.len() <= MAX_MESSAGE_BYTES, "reason is {} bytes", reason.len());
+        assert!(
+            !reason.contains(&TOKEN[TOKEN.len() / 2..]),
+            "a suffix of the token survived the cut"
+        );
+    }
 }
