@@ -553,7 +553,7 @@ mod tests {
 
     fn format_status(response: &StatusResponse, format: OutputFormat) -> Result<String, EmitError> {
         emitted(
-            &JobStatusReport::from_response(response).map_err(io::Error::other)?,
+            &JobStatusReport::from_response(response).map_err(std::io::Error::other)?,
             format,
         )
     }
