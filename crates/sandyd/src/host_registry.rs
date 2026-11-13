@@ -653,6 +653,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -665,6 +666,7 @@ mod tests {
 
     fn vm_capabilities() -> Capabilities {
         Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
             attestation: false,
@@ -686,6 +688,7 @@ mod tests {
 
     fn dispatch() -> Dispatch {
         Dispatch {
+            digests: false,
             job_id: "job-1".to_owned(),
             manifest: b"m".to_vec(),
             manifest_encoding: "test/v1".to_owned(),

@@ -603,6 +603,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: Arch::X8664.into(),
             attestation: false,
@@ -738,6 +739,7 @@ mod tests {
                     &mut server,
                     &OrchestratorMessage {
                         op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                            digests: false,
                             job_id: job_id.to_owned(),
                             manifest: Vec::new(),
                             manifest_encoding: String::new(),
@@ -883,6 +885,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),
@@ -960,6 +963,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),
@@ -1103,6 +1107,7 @@ mod tests {
             &mut server,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-1".to_owned(),
                     manifest: Vec::new(),
                     manifest_encoding: String::new(),
@@ -1163,6 +1168,7 @@ mod tests {
             &mut server,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-1".to_owned(),
                     manifest: Vec::new(),
                     manifest_encoding: String::new(),
@@ -1232,6 +1238,7 @@ mod tests {
             &mut server,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-2".to_owned(),
                     manifest: Vec::new(),
                     manifest_encoding: String::new(),
@@ -1299,6 +1306,7 @@ mod tests {
             &mut server,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-1".to_owned(),
                     manifest: Vec::new(),
                     manifest_encoding: String::new(),
@@ -1396,6 +1404,7 @@ mod tests {
             &mut server,
             &OrchestratorMessage {
                 op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                    digests: false,
                     job_id: "job-1".to_owned(),
                     manifest: Vec::new(),
                     manifest_encoding: String::new(),
@@ -1489,6 +1498,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),
@@ -1604,6 +1614,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),
@@ -1678,6 +1689,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),
@@ -1802,6 +1814,7 @@ mod tests {
                 &mut server,
                 &OrchestratorMessage {
                     op: Some(orchestrator_message::Op::Dispatch(Dispatch {
+                        digests: false,
                         job_id: "job-1".to_owned(),
                         manifest: Vec::new(),
                         manifest_encoding: String::new(),

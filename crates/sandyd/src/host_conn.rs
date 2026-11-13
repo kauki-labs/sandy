@@ -1055,6 +1055,7 @@ mod tests {
 
         let mut in_flight = HashSet::from(["job-1".to_owned()]);
         let result = JobResult {
+            digests: None,
             job_id: "job-1".to_owned(),
             booted: true,
             exit_code: Some(0),
@@ -1082,6 +1083,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: Arch::X8664.into(),
             attestation: false,
@@ -1133,6 +1135,7 @@ mod tests {
         assert!(matches!(response.op, Some(orchestrator_message::Op::Registered(_))));
 
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_owned(),
             manifest: b"m".to_vec(),
             manifest_encoding: "test/v1".to_owned(),
@@ -1631,6 +1634,7 @@ mod tests {
 
     fn test_dispatch(job_id: &str) -> sandy_executor_proto::Dispatch {
         sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: job_id.to_owned(),
             manifest: b"m".to_vec(),
             manifest_encoding: "test/v1".to_owned(),
@@ -1961,6 +1965,7 @@ mod tests {
 
     fn result_for(job_id: &str, exit_code: i32, outputs_follow: bool) -> JobResult {
         JobResult {
+            digests: None,
             job_id: job_id.to_owned(),
             booted: true,
             exit_code: Some(exit_code),
@@ -2129,6 +2134,7 @@ mod tests {
             let (store, job_registry) = (test_store(), test_job_registry());
             running_job(&store, &job_registry, "job-1").await?;
             let result = JobResult {
+                digests: None,
                 job_id: "job-1".to_owned(),
                 booted,
                 exit_code,

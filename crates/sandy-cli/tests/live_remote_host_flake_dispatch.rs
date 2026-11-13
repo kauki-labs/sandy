@@ -175,6 +175,7 @@ async fn submit_flake(
         conn,
         request_id,
         control_request::Op::Submit(SubmitRequest {
+            digests: false,
             manifest,
             manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_owned(),
             submitter_caps: Vec::new(),

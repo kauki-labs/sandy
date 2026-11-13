@@ -1475,6 +1475,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_refuses_an_untrusted_job_before_touching_the_backend() {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: b"not valid json".to_vec(),
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
@@ -1525,6 +1526,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_refuses_a_vm_backend_this_host_cannot_run() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
@@ -1563,6 +1565,7 @@ mod tests {
     /// at spawn at once and touches nothing. `data_token` is the dispatch's data link token.
     fn process_dispatch_with_data_token(data_token: Vec<u8>, forward_back: &str) -> anyhow::Result<Dispatch> {
         Ok(Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["/nonexistent/sandy-test-command"]).context("encoding the test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
@@ -1884,6 +1887,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_refuses_an_unspecified_backend_even_when_vm_capable() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
@@ -1929,6 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_reaches_the_vm_branch_and_decodes_flake_v1() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: b"irrelevant".to_vec(),
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(), // not flake/v1
@@ -1986,6 +1991,7 @@ mod tests {
                 service: None,
             })?;
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest,
             manifest_encoding: MANIFEST_ENCODING_FLAKE_V1.to_string(),
@@ -2027,6 +2033,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_admits_an_untrusted_vm_dispatch_past_the_isolation_gate() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: b"irrelevant".to_vec(),
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(), // not flake/v1
@@ -2089,6 +2096,7 @@ mod tests {
     #[tokio::test]
     async fn handle_dispatch_refuses_an_untrusted_job_with_an_unspecified_backend() -> anyhow::Result<()> {
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),
@@ -2144,6 +2152,7 @@ mod tests {
             "test fixture must stay one byte short"
         );
         let dispatch = sandy_executor_proto::Dispatch {
+            digests: false,
             job_id: "job-1".to_string(),
             manifest: serde_json::to_vec(&["echo"]).context("encoding the static test manifest")?,
             manifest_encoding: MANIFEST_ENCODING_ARGV_V1.to_string(),

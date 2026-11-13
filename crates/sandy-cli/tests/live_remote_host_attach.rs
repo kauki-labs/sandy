@@ -164,6 +164,7 @@ async fn submit(
         conn,
         request_id,
         control_request::Op::Submit(SubmitRequest {
+            digests: false,
             manifest,
             manifest_encoding: "argv/v1".to_owned(),
             submitter_caps: Vec::new(),

@@ -275,6 +275,7 @@ fn register_over_tcp(
 
 fn trusted_process_capabilities() -> Capabilities {
     Capabilities {
+        digests: false,
         supported_sandbox_kinds: vec![SandboxKind::Process.into()],
         arch: Arch::X8664.into(),
         attestation: false,
