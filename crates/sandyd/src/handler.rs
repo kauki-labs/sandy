@@ -3516,7 +3516,11 @@ mod tests {
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.digests = true;
         }
-        let (_dispatch, job, _registry) = place_and_read(request, digests_host(true), peer_ip).await?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            ..digests_host(true)
+        };
+        let (_dispatch, job, _registry) = place_and_read(request, capabilities, peer_ip).await?;
         assert_eq!(job.declared_inputs, vec!["src".to_owned()]);
         Ok(())
     }
