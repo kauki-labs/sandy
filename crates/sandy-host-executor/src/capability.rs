@@ -159,8 +159,9 @@ fn to_wire_capabilities(
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
-        // Wire only for now: nothing hashes yet.
-        digests: false,
+        // Both backends hash a run's inputs and outputs when `RunSpec.digests` is set (#373), so this is an
+        // implementation fact, not an operator declaration.
+        digests: true,
         supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),
@@ -598,6 +599,24 @@ mod tests {
         for asked in [false, true] {
             let wire = to_wire_capabilities(capabilities(), &status, false, false, false, asked);
             assert_eq!(wire.transfer, asked, "asked={asked}");
+        }
+    }
+
+    /// A2c (#483): this executor's backends hash a run's inputs and outputs when asked, so every registration declares
+    /// `digests`, whatever else the host has.
+    #[test]
+    fn to_wire_capabilities_always_declares_digests() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = || Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        for vm in [false, true] {
+            let wire = to_wire_capabilities(capabilities(), &status, vm, false, false, false);
+            assert!(wire.digests, "vm={vm}: digests not declared");
         }
     }
 
