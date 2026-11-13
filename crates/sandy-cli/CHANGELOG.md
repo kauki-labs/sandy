@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.3...sandy-cli-v0.2.4) - 2026-11-13
+
+### Added
+
+- *(cli)* doctor refuses without a sandyd or an executor, docs for the daemon-backed verbs (refs #483) ([#861](https://github.com/kauki-labs/sandy/pull/861))
+- *(cli)* run, ls, status, wait, kill and gc are daemon-backed (refs #483) ([#860](https://github.com/kauki-labs/sandy/pull/860))
+- *(cli)* the doctor's check of sandyd and its executors (refs #483) ([#857](https://github.com/kauki-labs/sandy/pull/857))
+- *(sandyd)* ListHosts lists the connected executors (refs #483) ([#854](https://github.com/kauki-labs/sandy/pull/854))
+- *(cli)* a template names a bundled or referenced topology (refs #483) ([#852](https://github.com/kauki-labs/sandy/pull/852))
+- *(cli)* daemon wait, and daemon submit --wait with Ctrl-C cancelling the job (refs #483) ([#846](https://github.com/kauki-labs/sandy/pull/846))
+- *(cli)* daemon status -o json prints the result envelope under result, as the direct record does (refs #483) ([#842](https://github.com/kauki-labs/sandy/pull/842))
+- *(host-executor,sandyd,cli)* digests over the daemon, hashed by the executor and recorded in the receipt (refs #483) ([#840](https://github.com/kauki-labs/sandy/pull/840))
+- *(proto)* digest fields on SubmitRequest, Dispatch, Capabilities and JobResult, wire only (refs #483) ([#839](https://github.com/kauki-labs/sandy/pull/839))
+- *(sandyd)* the daemon's envelope lists the outputs left at the declared destinations (refs #483) ([#837](https://github.com/kauki-labs/sandy/pull/837))
+- *(host-executor,sandyd)* the executor reports its egress outcome and the envelope receipt reads it (refs #483) ([#835](https://github.com/kauki-labs/sandy/pull/835))
+- *(sandyd,cli)* daemon prune, the gc equivalent over the control RPC (refs #483) ([#832](https://github.com/kauki-labs/sandy/pull/832))
+- *(sandyd)* a terminal job records and serves the result envelope (refs #483) ([#828](https://github.com/kauki-labs/sandy/pull/828))
+- *(sandyd,host-executor,cli)* daemon submit --allow, placed on an egress_proxy host and applied by the executor (refs #483) ([#818](https://github.com/kauki-labs/sandy/pull/818))
+- *(cli)* daemon submit takes a TEMPLATE, --from-devshell and the plain flags without --flake (refs #483) ([#813](https://github.com/kauki-labs/sandy/pull/813))
+- *(proto)* EgressPolicy on SubmitRequest and Dispatch, an egress_proxy capability, wire only (refs #360) ([#816](https://github.com/kauki-labs/sandy/pull/816))
+- *(host-executor)* stage a remote job's outputs, send them after the run, and set outputs_follow (refs #482) ([#803](https://github.com/kauki-labs/sandy/pull/803))
+
+### Other
+
+- *(cli)* ListHostsError uses thiserror; doctor warns without an untrusted executor (closes #862) ([#866](https://github.com/kauki-labs/sandy/pull/866))
+- *(vm)* remove the guest NIC profile (refs #483) ([#864](https://github.com/kauki-labs/sandy/pull/864))
+- *(cli)* delete the direct execution path and the Journal (refs #483, #221) ([#863](https://github.com/kauki-labs/sandy/pull/863))
+- *(cli)* GcReport lives in output, not the direct supervisor (refs #483) ([#856](https://github.com/kauki-labs/sandy/pull/856))
+- *(t3)* replace the T3 guest with a generic service guest (part 2 of 3) ([#777](https://github.com/kauki-labs/sandy/pull/777))
+- *(t3)* strip T3 names from crates/impls code (part 1 of 3) ([#766](https://github.com/kauki-labs/sandy/pull/766))
+
 ## [0.2.3](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.2...sandy-cli-v0.2.3) - 2026-11-10
 
 ### Added
