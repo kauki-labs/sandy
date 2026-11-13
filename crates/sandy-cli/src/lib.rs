@@ -13,6 +13,7 @@
 
 pub mod app_register;
 pub mod attach;
+pub mod daemon_check;
 pub mod doctor;
 pub mod flake_wrap;
 // `host_target` moved to `sandy-guest-template` (#332, a pure extraction
