@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
-use sandy_cli::daemon_check::list_hosts;
+use sandy_cli::daemon_check::{ListHostsError, list_hosts};
 use sandy_control_proto::{
     ControlError, ControlRequest, ControlResponse, HostSummary, ListHostsResponse, ListResponse, control_request,
     control_response, read_frame, write_frame,
@@ -84,7 +84,8 @@ async fn a_missing_socket_is_an_error_naming_it() -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("temp dir")?;
     let sock = dir.path().join("nobody-home.sock");
     let err = list_hosts(&sock, Duration::from_secs(5)).await.expect_err("no daemon");
-    assert!(err.contains("nobody-home.sock"), "{err}");
+    assert!(matches!(err, ListHostsError::Unreachable(_)), "{err:?}");
+    assert!(err.to_string().contains("nobody-home.sock"), "{err}");
     Ok(())
 }
 
@@ -96,7 +97,8 @@ async fn a_daemon_error_reply_is_the_error() -> anyhow::Result<()> {
     let err = list_hosts(&sock, Duration::from_secs(5))
         .await
         .expect_err("an error reply");
-    assert!(err.contains("not today"), "{err}");
+    assert!(matches!(err, ListHostsError::Refused(_)), "{err:?}");
+    assert!(err.to_string().contains("not today"), "{err}");
     Ok(())
 }
 
@@ -109,7 +111,8 @@ async fn a_reply_of_another_kind_is_an_error() -> anyhow::Result<()> {
     let err = list_hosts(&sock, Duration::from_secs(5))
         .await
         .expect_err("wrong reply");
-    assert!(err.contains("host list"), "{err}");
+    assert!(matches!(err, ListHostsError::Refused(_)), "{err:?}");
+    assert!(err.to_string().contains("host list"), "{err}");
     Ok(())
 }
 
@@ -123,7 +126,8 @@ async fn a_stalled_daemon_ends_at_the_bound() -> anyhow::Result<()> {
         .await
         .context("the call hung past its bound")?;
     let err = outcome.expect_err("nothing answers");
-    assert!(err.contains("did not answer"), "{err}");
+    assert!(matches!(err, ListHostsError::Unreachable(_)), "{err:?}");
+    assert!(err.to_string().contains("did not answer"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(3), "ended at the bound");
     Ok(())
 }

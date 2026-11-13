@@ -1515,10 +1515,43 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
     }
 }
 
+/// How long `sandy doctor` waits for `sandyd` to list its executors.
+const DOCTOR_DAEMON_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Add the daemon check to the host verdict: the verbs are `sandyd`'s, so a missing daemon or executor refuses (exit
+/// `2`) like a missing prerequisite. A host refusal stands as it is; the daemon is not asked about a host that cannot
+/// run a job anyway.
+fn doctor_with_daemon(host: doctor::DoctorResult) -> doctor::DoctorResult {
+    if host.exit_code != ProcessExit::Succeeded.code() {
+        return host;
+    }
+    let refuse = |message: String| doctor::DoctorResult {
+        exit_code: ProcessExit::InvalidPlan.code(),
+        message: format!("sandy doctor: {message}"),
+    };
+    let socket = match daemon_socket_path() {
+        Ok(socket) => socket,
+        Err(e) => return refuse(format!("the sandyd control socket path could not be resolved: {e}")),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(e) => return refuse(format!("could not start the async runtime: {e}")),
+    };
+    let hosts = runtime.block_on(sandy_cli::daemon_check::list_hosts(&socket, DOCTOR_DAEMON_BOUND));
+    let daemon = sandy_cli::daemon_check::daemon_check_result(&socket, hosts);
+    if daemon.exit_code != ProcessExit::Succeeded.code() {
+        return daemon;
+    }
+    doctor::DoctorResult {
+        exit_code: ProcessExit::Succeeded.code(),
+        message: format!("{}\n{}", host.message, daemon.message),
+    }
+}
+
 /// Dispatch `sandy doctor`: print the host-prerequisite verdict and return its
 /// exit band.
 fn dispatch_doctor(output: OutputFormat) -> i32 {
-    let result = doctor::run_doctor();
+    let result = doctor_with_daemon(doctor::run_doctor());
     if output == OutputFormat::Plain && result.exit_code != 0 {
         // Plain keeps the stream convention (ok→stdout, refusal→stderr): a
         // refusal explains itself, so it's a diagnostic like every other

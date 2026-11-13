@@ -20,8 +20,10 @@ result shape is stable — don't scrape the plain-text output.
 
 Run `sandy doctor -o json` once before using sandy in a new environment. It
 checks the real preconditions (nix with flakes enabled, and on macOS, a
-working `aarch64-linux` remote builder for vfkit) and names exactly what's
-missing rather than failing deep inside a boot. On macOS specifically, vfkit
+working `aarch64-linux` remote builder for vfkit), then that `sandyd` answers
+on its control socket (`$SANDY_SOCK`) and at least one executor is registered. It
+names exactly what's missing (exit `2`) rather than failing deep inside a boot or
+a submit. On macOS specifically, vfkit
 needs a matching-arch Linux guest built remotely (nix-darwin's
 `nix.linux-builder`) — `doctor` is what catches a missing or misconfigured
 builder before you waste time on a `run` that fails mid-boot.

@@ -70,7 +70,7 @@ are in [`docs/architecture/`](docs/architecture/overview.md).
 ## Usage
 
 ```sh
-sandy doctor                       # verify host prerequisites
+sandy doctor                       # verify host prerequisites, sandyd and an executor
 sandy run <template> [flags] -- <cmd...>
 ```
 

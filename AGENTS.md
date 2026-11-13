@@ -14,16 +14,19 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 (`[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`):
 
 - **`sandy`** — the deep library. Private implementation modules behind a curated
-  `pub use` facade: the `VmBackend` seam, the journal, reconcile, the result
-  envelope (INV-11), nix topology, egress, seed, secret staging, and gc. Seam
+  `pub use` facade: the `VmBackend` seam, the result envelope (INV-11), nix
+  topology, egress, seed, secret staging, and gc. Seam
   test doubles (`FakeBackend`, `FakeApplier`, `FakeProvider`,
   `FakeProvisioner`, `FakeContainment`) live in `sandy-test-support`. The
   VM-only console driver lives in `sandy-impls-vm`.
 - **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
   (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
   console on `hvc0`).
-- **`sandy-cli`** — the `sandy` binary: `doctor`, `run`/`ls`/`status`/`wait`/
-  `kill`/`gc`, and `cred github register`/`verify`/`import`/`deregister` (manage
+- **`sandy-cli`** — the `sandy` binary: `doctor` (host prerequisites, then `sandyd`
+  reachable and an executor registered; exit 2 when not), `run`/`ls`/`status`/`wait`/
+  `kill`/`gc` (each the control call its `sandy daemon` twin makes, over `$SANDY_SOCK`:
+  there is no direct execution path, so they need `sandyd` and a `sandy-host-executor`),
+  and `cred github register`/`verify`/`import`/`deregister` (manage
   the forge trust root the credential seam mints from; `run --credential <name>`
   mints a scoped token from it). Text or `-o json`. The trust-root installer is
   provider-nested (`sandy cred <provider> <op>`); GitHub today, GitLab later. See
@@ -198,7 +201,7 @@ Commit with a Conventional Commits title.
 
 ```text
 crates/
-  ├─ sandy/               - deep library behind a curated facade (seam, journal, result, topology, …)
+  ├─ sandy/               - deep library behind a curated facade (seam, result, topology, …)
   ├─ sandy-api/           - the pinned seam contract (traits + data/error types, no behavior)
   ├─ sandy-test-support/  - in-memory test doubles for the seam traits (FakeBackend, FakeApplier, …), api-only
   ├─ sandy-backend/       - the backend hub: feature-gated re-export of impls/local and impls/vm
@@ -240,7 +243,7 @@ A two-level spec of the existing system lives under
   `EgressApplier`), and the subsystem map, with mermaid diagrams.
 - **Deep work in one subsystem** → read that subsystem's section in
   [`docs/architecture/spec.md`](docs/architecture/spec.md): run plane, guest shares,
-  secret channel, credential seam, egress, result + classification, journal. Each
+  secret channel, credential seam, egress, result + classification. Each
   section states the **decisions** (with rationale + the invariant it turns on) and
   the **KPI** — the tests that verify it.
 - **Why is it this way / can I change decision X** → the full record for that
