@@ -157,6 +157,10 @@ blur the two models together. Issue #221 tracks the eventual convergence:
 once `JobManifest` reaches parity with `run`'s flag set, retire direct
 execution and promote the daemon commands to the top-level names.
 
+**Update (#483).** The direct execution path and the Journal were deleted. `run`/`ls`/`status`/`wait`/`kill`/`gc`
+are now control-RPC calls to `sandyd`, each the same call as its `sandy daemon` twin (`run` is an untrusted VM
+Submit plus wait). The coexistence below ended there.
+
 **Consequences.** Two job models coexist under one binary for as long as
 `JobManifest` lacks parity — an operator must know which namespace a given
 job lives in. The coexistence is explicitly temporary (#221 names the exit

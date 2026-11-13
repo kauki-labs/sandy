@@ -1,6 +1,6 @@
 //! Resolving and building the live host's guest target — shared by the `live`
-//! test suites (`tests/common/mod.rs` re-exports these) and the `acceptance-vm`
-//! binary (#131 R4b), so both consumers of "boot a real guest on this host" use
+//! test suites (`tests/common/mod.rs` re-exports these) and the `live-vfkit-guest`
+//! binary, so both consumers of "boot a real guest on this host" use
 //! one implementation. Behind the `live` feature: a non-live build never needs a
 //! hypervisor or a guest flake.
 

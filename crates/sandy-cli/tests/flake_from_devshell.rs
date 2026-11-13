@@ -4,8 +4,8 @@
 //! the warning's presence is asserted independently of whether the eventual
 //! `nix` probe can even run, and so this suite stays in the default (non-live)
 //! gate. Boot acceptance (the devShell actually working, the ordering, and the
-//! negative host-conditional fixture) is `tests/live_flake_devshell.rs`,
-//! tier-3.
+//! negative host-conditional fixture) was `tests/live_flake_devshell.rs`,
+//! removed in #483 (a daemon-path live test is #858).
 
 use std::process::Command;
 

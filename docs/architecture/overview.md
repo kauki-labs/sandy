@@ -17,19 +17,20 @@ disagree (INV-11).
 
 ## The run pipeline
 
-One `sandy run` is a straight-line pipeline. The CLI parses flags into a `JobPlan`;
-the supervisor brackets the backend boot with the egress boundary (and, for a
+One `sandy run` is a straight-line pipeline. The CLI submits the job to `sandyd`
+(the direct execution path was removed in #483); sandyd records it and dispatches it to
+an executor, which brackets the backend boot with the egress boundary (and, for a
 credentialed run, a mint→revoke bracket); the backend stages the shares, launches
 the guest, drives it over the console protocol, collects outputs, and returns the
-physical `Outcome`; the supervisor classifies it into the envelope and persists it.
+physical `Outcome`; the executor classifies it into the envelope and sandyd persists it.
 
 ```mermaid
 flowchart TD
   cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
-  cli --> plan["parse_run → JobPlan<br/>(inputs, outputs, secrets, allow, grants)"]
+  cli --> plan["Submit to sandyd<br/>(manifest: inputs, outputs, secrets, allow, grants)"]
   plan --> validate{"validate plan<br/>(no secret leak, egress hosts)"}
-  validate -- invalid --> band2["band 2: invalid plan<br/>no Running record, no backend run"]
-  validate -- valid --> sup["supervisor::run_job<br/>Running record BEFORE boot (INV-6)"]
+  validate -- invalid --> band2["band 2: invalid plan<br/>no stored record, no backend run"]
+  validate -- valid --> sup["sandyd dispatch to an executor<br/>Pending JobStore row BEFORE boot (INV-6)"]
   sup --> cred{"--credential?"}
   cred -- yes --> mint["mint_lease → stage token 0600<br/>(revoke at teardown)"]
   cred -- no --> egress
@@ -43,7 +44,7 @@ flowchart TD
   collect --> outcome["Outcome (booted, guest_exit, timed_out, console)"]
   outcome --> classify["classify_outcome → status + retryable + exit band (INV-11)"]
   classify --> env["ResultEnvelope<br/>status / exit_code / outputs / logs"]
-  env --> journal[("Journal: terminal record (INV-6)")]
+  env --> store[("sandyd JobStore: terminal record (INV-6)")]
   env --> render["-o plain (default) | -o json"]
 ```
 
@@ -76,19 +77,19 @@ flowchart LR
 Each row links to its detailed spec section, and names the one invariant it turns
 on and the crate it lives in.
 
-| Subsystem                                                            | What it owns                                | Key invariant                            | Crate                            |
-| -------------------------------------------------------------------- | ------------------------------------------- | ---------------------------------------- | -------------------------------- |
-| [Run plane](spec.md#1-run-plane-vmbackend)                           | native hypervisor launch + console protocol | never green from a fake (INV-S9)         | `sandy-backend`                  |
-| [Guest shares](spec.md#2-guest-shares-guestsharetransport)           | inputs/outputs/secrets as virtio-fs         | RO enforced at the host boundary (INV-1) | `sandy-backend` + `sandy::stage` |
-| [Secret channel](spec.md#3-secret-channel)                           | `$NAME` delivery, never argv/env/store      | secrets off the data plane (INV-1)       | `sandy::stage`                   |
-| [Credential seam](spec.md#4-credential-seam-credentialprovider)      | mint → stage → refresh → revoke             | fail-closed mint (INV-7)                 | `sandy::cred`                    |
-| [Egress](spec.md#5-egress)                                           | allow-list around the boot                  | fail-closed, guest-scoped (#29)          | `sandy::egress`                  |
-| [Result + classification](spec.md#6-result-envelope--classification) | locked envelope, exit bands                 | status ⇔ band ⇔ retryable (INV-11)       | `sandy::result`                  |
-| [Journal](spec.md#7-journal)                                         | durable job records, reconcile              | Running before boot (INV-6)              | `sandy::journal`                 |
+| Subsystem                                                            | What it owns                                          | Key invariant                            | Crate                            |
+| -------------------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------- | -------------------------------- |
+| [Run plane](spec.md#1-run-plane-vmbackend)                           | native hypervisor launch + console protocol           | never green from a fake (INV-S9)         | `sandy-backend`                  |
+| [Guest shares](spec.md#2-guest-shares-guestsharetransport)           | inputs/outputs/secrets as virtio-fs                   | RO enforced at the host boundary (INV-1) | `sandy-backend` + `sandy::stage` |
+| [Secret channel](spec.md#3-secret-channel)                           | `$NAME` delivery, never argv/env/store                | secrets off the data plane (INV-1)       | `sandy::stage`                   |
+| [Credential seam](spec.md#4-credential-seam-credentialprovider)      | mint → stage → revoke                                 | fail-closed mint (INV-7)                 | `sandy::cred`                    |
+| [Egress](spec.md#5-egress)                                           | allow-list around the boot                            | fail-closed, guest-scoped (#29)          | `sandy::egress`                  |
+| [Result + classification](spec.md#6-result-envelope--classification) | locked envelope, exit bands                           | status ⇔ band ⇔ retryable (INV-11)       | `sandy::result`                  |
+| [Job record](spec.md#7-journal-removed-in-483)                       | sandyd's `JobStore` (the Journal was removed in #483) | Pending before boot (INV-6)              | `sandyd::store`                  |
 
 ## The control plane: sandyd, the host executor, interactive attach
 
-A second, separate dispatch model alongside direct `sandy run`:
+The dispatch model `sandy run` itself now uses (the direct path was removed in #483):
 `sandy daemon submit`/`attach`/`status`/`cancel` goes through `sandyd` (the
 per-machine control-plane daemon) and, for M2 cross-machine dispatch, a
 remote `sandy-host-executor`. Full decision record:
@@ -148,7 +149,7 @@ The spec defines each subsystem's KPI as the tests that prove it, in two distinc
 tiers (see [spec.md § Testing](spec.md#testing-integration-vs-end-to-end)):
 
 - **Integration tests**, tier-2, run in CI, **no hypervisor**: the pure argv
-  assemblers, the staging/collection functions, and the supervisor over
+  assemblers, the staging/collection functions, and sandyd and the executor over
   `FakeBackend`. They prove wiring and classification without a boot.
 - **End-to-end tests**, tier-3, **host-gated behind the `live` feature**, a real
   guest boots: the full workflows (a job reads an input + secret + credential and

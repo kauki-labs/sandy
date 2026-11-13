@@ -27,10 +27,10 @@ the step it owns.
 ```mermaid
 flowchart TD
   cli["sandy run TEMPLATE<br/>--input / --out / --secret / --credential / --allow"]
-  cli --> plan["parse_run → JobPlan"]
+  cli --> plan["Submit to sandyd<br/>(manifest: inputs, outputs, secrets, allow, grants)"]
   plan --> validate{"validate plan<br/>(no secret leak, egress hosts)"}
-  validate -- invalid --> band2["band 2: invalid plan<br/>no Running record, no backend run"]
-  validate -- valid --> sup["supervisor::run_job<br/>Running record before boot (INV-6)"]
+  validate -- invalid --> band2["band 2: invalid plan<br/>no stored record, no backend run"]
+  validate -- valid --> sup["sandyd dispatch to an executor<br/>Pending JobStore row before boot (INV-6)"]
   sup --> credq{"--credential?"}
 
   subgraph cred_seam["CredentialProvider seam"]
@@ -58,7 +58,7 @@ flowchart TD
   guest --> collect["collect_outputs → host dests"]
   collect --> classify["classify_outcome → status + exit band (INV-11)"]
   classify --> env["ResultEnvelope"]
-  env --> journal[("Journal: terminal record")]
+  env --> store[("sandyd JobStore: terminal record")]
   env --> render["-o plain (default) | -o json"]
 ```
 

@@ -49,7 +49,7 @@ guest-cooperative on vfkit. This is accepted rather than closed, because each sh
 is a single per-run, sandy-owned dir wiped at teardown — a guest that remounts rw
 can corrupt only its own run's staging, never escape the share (virtio-fs confines
 to `sharedDir`) or reach another run, and the VM is the trust boundary. K5
-(`live_inputs.rs`) proves host-boundary RO on qemu and guest-mount RO on vfkit.
+(`live_inputs.rs`, removed in #483; not yet re-proven through the daemon, #858) proved host-boundary RO on qemu and guest-mount RO on vfkit.
 
 **Set aside (do not re-propose without new information).** Host-side RO on vfkit:
 unavailable in the vfkit CLI as of v0.6.3 (its virtio-fs device has no read-only

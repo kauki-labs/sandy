@@ -1,5 +1,8 @@
 # Refresh re-delivery (#49) — design note
 
+**Status (#483).** Not built for jobs. The direct path and its refresh thread were removed; jobs get no mid-run
+refresh and K11 is retired. The pointers to `supervisor.rs` below name removed code.
+
 Increment to the credential-seam package. Closes the last gap in execution-bound
 credential lifetime: a job that runs past the provider's token cap keeps a valid,
 scoped token for its whole run, and the old token is revoked as soon as it rotates.
@@ -25,7 +28,7 @@ re-mints.
   (`crates/sandy/src/cred_github.rs:235`; GitHub has no rotate, so refresh = re-mint
   - revoke-old).
 - `should_refresh(now, expires_at, margin)` decides when to fire
-  (`crates/sandy-cli/src/supervisor.rs:319`).
+  (`supervisor.rs`, removed in #483; the function now lives in `crates/sandy/src/cred.rs`).
 
 ## What's missing — three seams
 

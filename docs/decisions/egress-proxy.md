@@ -349,7 +349,7 @@ guest topology, so they should move together.
    pass on a real boot (INV-S9), never as a skip.
 6. Cutover: the proxy becomes the only path. The guest topology drops
    `networkingModule` and the guest `nftables` package. `$SANDY_TAP`, the tap
-   argv, `NftablesApplier`, `to_nftables_forward`, and `live_egress.rs` (K13)
+   argv, `NftablesApplier`, `to_nftables_forward`, and `live_egress.rs` (K13, removed in #483)
    are deleted. `egress.md` decisions 1 and 2 are marked superseded, and K13
    leaves `kpi.md`.
 7. With every VM run enforced, #358's warning becomes a refusal: a VM run whose
