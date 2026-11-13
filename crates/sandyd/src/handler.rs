@@ -13,8 +13,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobStatus,
-    JobSummary as WireJobSummary, ListResponse, PruneResponse, StatusResponse, SubmitRequest, SubmitResponse,
-    control_request, control_response,
+    JobSummary as WireJobSummary, ListHostsResponse, ListResponse, PruneResponse, StatusResponse, SubmitRequest,
+    SubmitResponse, control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
@@ -319,6 +319,43 @@ fn to_dispatch_path_fields(
         })
         .collect();
     (inputs, outputs, secrets)
+}
+
+/// A connected host as `ListHosts` reports it: what it declared at Register. An unset or unknown enum value is left
+/// out rather than guessed.
+fn host_summary(
+    host_id: String,
+    capabilities: &sandy_executor_proto::Capabilities,
+) -> sandy_control_proto::HostSummary {
+    let sandbox_kinds = capabilities
+        .supported_sandbox_kinds
+        .iter()
+        .filter_map(|k| match SandboxKind::try_from(*k) {
+            Ok(SandboxKind::Process) => Some("process".to_owned()),
+            Ok(SandboxKind::Vm) => Some("vm".to_owned()),
+            _ => None,
+        })
+        .collect();
+    let isolation_classes = capabilities
+        .supported_isolation_classes
+        .iter()
+        .filter_map(|c| match IsolationClass::try_from(*c) {
+            Ok(IsolationClass::Trusted) => Some(sandy_control_proto::IsolationClass::Trusted.into()),
+            Ok(IsolationClass::Untrusted) => Some(sandy_control_proto::IsolationClass::Untrusted.into()),
+            _ => None,
+        })
+        .collect();
+    let arch = match sandy_executor_proto::Arch::try_from(capabilities.arch) {
+        Ok(sandy_executor_proto::Arch::X8664) => "x86_64",
+        Ok(sandy_executor_proto::Arch::Aarch64) => "aarch64",
+        _ => "unknown",
+    };
+    sandy_control_proto::HostSummary {
+        host_id,
+        sandbox_kinds,
+        isolation_classes,
+        arch: arch.to_owned(),
+    }
 }
 
 /// Parse `SubmitRequest.required_isolation_class`'s wire value (the
@@ -1327,6 +1364,13 @@ pub async fn handle(
                     .collect(),
             })
         }
+        Some(control_request::Op::ListHosts(_)) => control_response::Result::Hosts(ListHostsResponse {
+            hosts: host_registry
+                .connected()
+                .into_iter()
+                .map(|(id, c)| host_summary(id, &c))
+                .collect(),
+        }),
         Some(control_request::Op::Prune(prune)) => {
             let store = Arc::clone(store);
             let keep_last = usize::try_from(prune.keep_last).unwrap_or(usize::MAX);
@@ -5095,6 +5139,72 @@ mod tests {
             sandy_control_proto::JobStatus::Failed,
             "a job whose host disconnected mid-run must be FAILED, never stuck Pending/Running"
         );
+        Ok(())
+    }
+
+    fn list_hosts_request(request_id: u64) -> ControlRequest {
+        ControlRequest {
+            request_id,
+            op: Some(control_request::Op::ListHosts(sandy_control_proto::ListHostsRequest {})),
+        }
+    }
+
+    async fn listed_hosts(
+        store: &Arc<JobStore>,
+        registry: &Arc<JobRegistry>,
+        host_registry: &Arc<HostRegistry>,
+    ) -> anyhow::Result<Vec<sandy_control_proto::HostSummary>> {
+        let response = handle(
+            store,
+            registry,
+            host_registry,
+            None,
+            test_session(),
+            list_hosts_request(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Hosts(r)) => Ok(r.hosts),
+            other => anyhow::bail!("expected a hosts reply, got {other:?}"),
+        }
+    }
+
+    /// `ListHosts` answers from the live registry: none connected is an empty list, a connected host appears with what
+    /// it declared, hosts come ordered by id, and a host whose connection ended is gone.
+    #[tokio::test]
+    async fn list_hosts_reports_the_connected_executors_and_what_they_declared() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        assert!(
+            listed_hosts(&store, &registry, &host_registry).await?.is_empty(),
+            "no host registered"
+        );
+
+        let vm_host = sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Vm.into()],
+            arch: sandy_executor_proto::Arch::Aarch64.into(),
+            supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
+            ..trusted_host_capabilities()
+        };
+        let ip_b: std::net::IpAddr = "100.64.0.8".parse().context("peer ip literal")?;
+        let ip_a: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _rx_b = register_test_host(&host_registry, "b-mac", ip_b, vm_host);
+        let _rx_a = register_test_host(&host_registry, "a-linux", ip_a, trusted_host_capabilities());
+
+        let hosts = listed_hosts(&store, &registry, &host_registry).await?;
+        let ids: Vec<&str> = hosts.iter().map(|h| h.host_id.as_str()).collect();
+        assert_eq!(ids, ["a-linux", "b-mac"], "ordered by host id");
+        let mac = &hosts[1];
+        assert_eq!(mac.sandbox_kinds, ["vm"]);
+        assert_eq!(mac.arch, "aarch64");
+        assert_eq!(
+            mac.isolation_classes,
+            [
+                i32::from(sandy_control_proto::IsolationClass::Trusted),
+                i32::from(sandy_control_proto::IsolationClass::Untrusted)
+            ]
+        );
+        assert_eq!(hosts[0].sandbox_kinds, ["process"]);
+        assert_eq!(hosts[0].arch, "x86_64");
         Ok(())
     }
 }
