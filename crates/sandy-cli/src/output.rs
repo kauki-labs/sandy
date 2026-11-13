@@ -454,12 +454,18 @@ impl JobStatusReport {
     /// A message when the envelope bytes do not decode: a corrupt reply is refused, never printed as a job with no
     /// result.
     pub fn from_response(response: &StatusResponse) -> Result<Self, String> {
+        let result = response
+            .result_envelope
+            .as_deref()
+            .map(serde_json::from_slice::<ResultEnvelope>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             job_id: response.job_id.clone(),
             status: job_status_name(response.status).to_owned(),
             exit_code: response.exit_code,
             console_tail: response.console_tail.clone(),
-            result: None,
+            result,
         })
     }
 }
