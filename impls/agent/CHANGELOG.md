@@ -11,15 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(cli)* doctor refuses without a sandyd or an executor, docs for the daemon-backed verbs (refs #483) ([#861](https://github.com/kauki-labs/sandy/pull/861))
-- *(cli)* run, ls, status, wait, kill and gc are daemon-backed (refs #483) ([#860](https://github.com/kauki-labs/sandy/pull/860))
+- _(cli)_ doctor refuses without a sandyd or an executor, docs for the daemon-backed verbs (refs #483) ([#861](https://github.com/kauki-labs/sandy/pull/861))
+- _(cli)_ run, ls, status, wait, kill and gc are daemon-backed (refs #483) ([#860](https://github.com/kauki-labs/sandy/pull/860))
 
 ### Other
 
-- *(vm)* remove the guest NIC profile (refs #483) ([#864](https://github.com/kauki-labs/sandy/pull/864))
-- *(cli)* delete the direct execution path and the Journal (refs #483, #221) ([#863](https://github.com/kauki-labs/sandy/pull/863))
-- *(t3)* replace the T3 guest with a generic service guest (part 2 of 3) ([#777](https://github.com/kauki-labs/sandy/pull/777))
-- *(t3)* strip T3 names from crates/impls code (part 1 of 3) ([#766](https://github.com/kauki-labs/sandy/pull/766))
+- _(vm)_ remove the guest NIC profile (refs #483) ([#864](https://github.com/kauki-labs/sandy/pull/864))
+- _(cli)_ delete the direct execution path and the Journal (refs #483, #221) ([#863](https://github.com/kauki-labs/sandy/pull/863))
+- _(t3)_ replace the T3 guest with a generic service guest (part 2 of 3) ([#777](https://github.com/kauki-labs/sandy/pull/777))
+- _(t3)_ strip T3 names from crates/impls code (part 1 of 3) ([#766](https://github.com/kauki-labs/sandy/pull/766))
 
 ## [0.2.2](https://github.com/kauki-labs/sandy/compare/sandy-agent-v0.2.1...sandy-agent-v0.2.2) - 2026-11-10
 
