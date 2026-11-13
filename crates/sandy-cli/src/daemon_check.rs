@@ -14,12 +14,11 @@ use crate::doctor::DoctorResult;
 /// one that is running.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ListHostsError {
-    /// Nothing usable answered: the socket could not be connected, the call failed, or the daemon did not answer in
-    /// time.
+    /// Nothing usable answered: the socket could not be connected, or the daemon did not answer in time.
     #[error("{0}")]
     Unreachable(String),
-    /// A daemon answered, but with an error or with a reply of another kind (an older `sandyd` does not know
-    /// `ListHosts`).
+    /// A daemon is there, but it errored, answered with a reply of another kind or dropped the connection (an older
+    /// `sandyd` does not know `ListHosts`).
     #[error("{0}")]
     Refused(String),
 }
@@ -28,8 +27,9 @@ pub enum ListHostsError {
 ///
 /// # Errors
 ///
-/// [`ListHostsError::Unreachable`] when the socket could not be connected, the call failed or the daemon did not answer
-/// within `bound`; [`ListHostsError::Refused`] when it answered with an error or with something other than a host list.
+/// [`ListHostsError::Unreachable`] when the socket could not be connected or the daemon did not answer within `bound`;
+/// [`ListHostsError::Refused`] when it answered with an error or with something other than a host list, or dropped the
+/// connection on the request.
 pub async fn list_hosts(socket: &Path, bound: Duration) -> Result<Vec<HostSummary>, ListHostsError> {
     use ListHostsError::{Refused, Unreachable};
     let exchange = async {
@@ -37,9 +37,11 @@ pub async fn list_hosts(socket: &Path, bound: Duration) -> Result<Vec<HostSummar
             .await
             .map_err(|e| Unreachable(format!("could not connect to {}: {e}", socket.display())))?;
         let op = control_request::Op::ListHosts(ListHostsRequest {});
+        // Connected, so something listens: a failed call is a daemon that does not answer this request (an older one
+        // closes the connection on a request it does not know), not an absent one.
         let response = sandy_control_proto::client::call(&mut stream, 1, op)
             .await
-            .map_err(|e| Unreachable(format!("the daemon call failed: {e}")))?;
+            .map_err(|e| Refused(format!("the daemon call failed: {e}")))?;
         match response.result {
             Some(control_response::Result::Hosts(r)) => Ok(r.hosts),
             Some(control_response::Result::Error(e)) => Err(Refused(e.message)),
@@ -89,10 +91,19 @@ pub fn daemon_check_result(socket: &Path, hosts: Result<Vec<HostSummary>, ListHo
         ));
     }
     let listed: Vec<String> = hosts.iter().map(describe).collect();
+    // `sandy run` submits an untrusted VM job: a pool of trusted-only executors can place nothing it sends.
+    let untrusted = i32::from(IsolationClass::Untrusted);
+    let warning = if hosts.iter().any(|h| h.isolation_classes.contains(&untrusted)) {
+        String::new()
+    } else {
+        "\nsandy doctor: warning: no executor declares the untrusted isolation class, so `sandy run` (an untrusted VM \
+         job) cannot be placed; start a VM-capable `sandy-host-executor`"
+            .to_owned()
+    };
     DoctorResult {
         exit_code: ProcessExit::Succeeded.code(),
         message: format!(
-            "sandy doctor: sandyd at {} has {} executor{}: {} — OK",
+            "sandy doctor: sandyd at {} has {} executor{}: {} — OK{warning}",
             socket.display(),
             hosts.len(),
             if hosts.len() == 1 { "" } else { "s" },
