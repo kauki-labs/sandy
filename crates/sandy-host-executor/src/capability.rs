@@ -96,11 +96,19 @@ fn capabilities_from(arch: Arch, status: &ContainmentStatus) -> Result<Capabilit
 /// ANY containment, on any host, so declaring `Untrusted` off
 /// `ContainmentStatus::is_untrusted_boundary()` alone (as this function did
 /// before #381) would advertise a capability the re-check could never honor.
-/// A non-available status honors neither — the empty list is the correct,
-/// fail-closed declaration for a host that can't contain anything at all.
+/// A non-available status honors neither class through the process backend, so
+/// a host with no VM either declares the empty list, the fail-closed answer for
+/// a host that can't contain anything at all. A host with no process
+/// containment but a VM (macOS, #483) declares both classes through the VM
+/// kind alone; the executor refuses any process dispatch there.
 fn detected_isolation_classes(status: &ContainmentStatus, vm_available: bool) -> Vec<IsolationClass> {
     if !status.is_available() {
-        return Vec::new();
+        // No process containment: only a VM can run a job here, and a VM honours both classes (a Mac, #483).
+        return if vm_available {
+            vec![IsolationClass::Trusted, IsolationClass::Untrusted]
+        } else {
+            Vec::new()
+        };
     }
     let mut classes = vec![IsolationClass::Trusted];
     if vm_available {
@@ -155,7 +163,7 @@ fn to_wire_capabilities(
         Arch::Aarch64 => sandy_executor_proto::Arch::Aarch64,
     };
     let mut kinds = vec![i32::from(process_kind)];
-    if vm_available {
+    if vm_available && process_kind != sandy_executor_proto::SandboxKind::Vm {
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
@@ -234,11 +242,12 @@ fn declared(value: Option<&str>) -> bool {
 pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabilities, DetectError> {
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
-    let capabilities = capabilities_from(arch, &status)?;
+    let vm_available = detect_vm_capability();
+    let capabilities = capabilities_for_host(arch, &status, vm_available)?;
     Ok(to_wire_capabilities(
         capabilities,
         &status,
-        detect_vm_capability(),
+        vm_available,
         shares_submitter_filesystem_from_env(),
         egress_proxy_from(std::env::var("SANDY_HOST_EGRESS_PROXY").ok().as_deref()),
         transfer_from(std::env::var("SANDY_HOST_TRANSFER").ok().as_deref())?,
@@ -301,8 +310,8 @@ struct VfkitProbeFacts {
 }
 
 /// Whether `facts` satisfy declaring `SandboxKind::Vm` on a vfkit host.
-fn vfkit_capability_from(_facts: VfkitProbeFacts) -> bool {
-    false
+fn vfkit_capability_from(facts: VfkitProbeFacts) -> bool {
+    facts.vfkit_runnable && facts.nix_runnable && facts.guest_wrapper_present
 }
 
 /// The capability a host declares from its containment `status` and whether it can run a VM: `Process` when the
@@ -310,9 +319,22 @@ fn vfkit_capability_from(_facts: VfkitProbeFacts) -> bool {
 fn capabilities_for_host(
     arch: Arch,
     status: &ContainmentStatus,
-    _vm_available: bool,
+    vm_available: bool,
 ) -> Result<Capabilities, DetectError> {
-    capabilities_from(arch, status)
+    match capabilities_from(arch, status) {
+        Err(_) if vm_available => Ok(Capabilities {
+            kind: SandboxKind::Vm,
+            arch,
+            attestation: None,
+        }),
+        other => other,
+    }
+}
+
+/// The vfkit binary: `SANDY_VFKIT_BIN`, else `vfkit` on `PATH`, the same lookup `sandy run` does. The probe and the
+/// real boot share it, so they cannot drift onto different binaries.
+pub(crate) fn vfkit_bin() -> String {
+    std::env::var("SANDY_VFKIT_BIN").unwrap_or_else(|_| "vfkit".to_string())
 }
 
 /// Whether `binary --version` runs successfully — a real-usability probe
@@ -369,7 +391,14 @@ fn probe_vm_facts() -> VmProbeFacts {
 /// — never trust an earlier registration alone).
 #[must_use]
 pub fn detect_vm_capability() -> bool {
-    vm_capability_from(probe_vm_facts())
+    match crate::dispatch::hypervisor_for_os(std::env::consts::OS) {
+        crate::dispatch::Hypervisor::Qemu => vm_capability_from(probe_vm_facts()),
+        crate::dispatch::Hypervisor::Vfkit => vfkit_capability_from(VfkitProbeFacts {
+            vfkit_runnable: runs_successfully(&vfkit_bin()),
+            nix_runnable: runs_successfully(&sandy_guest_template::nix_bin()),
+            guest_wrapper_present: sandy_guest_template::guest_wrapper_present(),
+        }),
+    }
 }
 
 /// The diagnostic string carried by a non-`Available` [`ContainmentStatus`].
@@ -488,14 +517,18 @@ mod tests {
         );
     }
 
-    /// Adversarial: a host with no usable containment declares no isolation
-    /// class at all — never a hardcoded `[Trusted]` for a host that can't
-    /// actually honor it — even when `vm_available` is true (no reaping
-    /// means no backend can run anything at all).
+    /// Adversarial: a host with no usable containment and no VM declares no
+    /// isolation class at all — never a hardcoded `[Trusted]` for a host that
+    /// can't actually honor it. With a VM it declares both, through the VM kind
+    /// alone (#483): a Mac has no process containment but runs VMs.
     #[test]
-    fn an_unavailable_containment_declares_no_isolation_class() {
+    fn an_unavailable_containment_declares_no_isolation_class_unless_a_vm_can_run() {
         let status = ContainmentStatus::Unavailable("no user systemd instance".to_owned());
-        assert_eq!(detected_isolation_classes(&status, true), Vec::<IsolationClass>::new());
+        assert_eq!(detected_isolation_classes(&status, false), Vec::<IsolationClass>::new());
+        assert_eq!(
+            detected_isolation_classes(&status, true),
+            vec![IsolationClass::Trusted, IsolationClass::Untrusted]
+        );
     }
 
     /// The load-bearing property for #284: the wire `Capabilities` Register

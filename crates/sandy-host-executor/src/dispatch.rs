@@ -44,7 +44,7 @@ use sandy_executor_proto::{Dispatch, IsolationClass, REMOTE_LINK_TOKEN_LEN, Sand
 use sandy_fabric_local::mesh_link::relay_agent_link;
 use sandy_guest_template::manifest::MANIFEST_ENCODING_FLAKE_V1;
 use sandy_impls_local::ProcessBackend;
-use sandy_impls_vm::QemuBackend;
+use sandy_impls_vm::{QemuBackend, VfkitBackend};
 use serde::Deserialize;
 
 use crate::{
@@ -74,8 +74,35 @@ pub(crate) enum Hypervisor {
 }
 
 /// The hypervisor for `os` (a `std::env::consts::OS` value).
-pub(crate) fn hypervisor_for_os(_os: &str) -> Hypervisor {
-    Hypervisor::Qemu
+pub(crate) fn hypervisor_for_os(os: &str) -> Hypervisor {
+    if os == "macos" {
+        Hypervisor::Vfkit
+    } else {
+        Hypervisor::Qemu
+    }
+}
+
+/// The backend behind a VM dispatch, chosen by [`Hypervisor`]. Both backends build on every platform, so the choice
+/// is one pure function and the Linux gate covers it.
+enum VmRunner {
+    Qemu(QemuBackend),
+    Vfkit(VfkitBackend),
+}
+
+impl VmRunner {
+    fn new(hypervisor: Hypervisor, agent: AgentLaunch) -> Self {
+        match hypervisor {
+            Hypervisor::Qemu => Self::Qemu(QemuBackend::new().with_agent(agent)),
+            Hypervisor::Vfkit => Self::Vfkit(VfkitBackend::new(crate::capability::vfkit_bin()).with_agent(agent)),
+        }
+    }
+
+    fn run(&self, spec: &RunSpec<'_>) -> Result<Outcome, BackendError> {
+        match self {
+            Self::Qemu(backend) => backend.run(spec),
+            Self::Vfkit(backend) => backend.run(spec),
+        }
+    }
 }
 
 /// A dispatch that cannot be honored, refused before anything runs.
@@ -755,6 +782,11 @@ pub fn handle_dispatch(
         _ => ApiSandboxKind::Process,
     };
     check_isolation_class(required, kind, &status)?;
+    // `check_isolation_class` admits a trusted job on any host. A host with no process containment (a Mac) declares
+    // VM only, so a process dispatch there would run uncontained: refuse it (#483).
+    if kind == ApiSandboxKind::Process && !status.is_available() {
+        return Err(DispatchError::ProcessContainmentUnavailable.into());
+    }
 
     let forward_back: SocketAddr = dispatch
         .forward_back
@@ -888,10 +920,9 @@ pub fn handle_dispatch(
                 // `--from-devshell` rides the manifest (A3, #483); an executor that predates the field refuses the
                 // manifest.
                 decoded.from_devshell,
-                // The macOS vfkit-prereq check: dead code on this host's
-                // Linux build target (`cfg!(target_os = "macos")` is false
-                // there), so a callback that never fires is correct, not a
-                // stub standing in for missing behavior.
+                // The macOS vfkit-prereq check (nix and a linux-builder) is `sandy doctor`'s, in `sandy-cli`. Here a
+                // missing builder surfaces as `FlakeResolve` with nix's own message, and `detect_vm_capability` has
+                // already confirmed vfkit, nix and the guest wrapper before the host declared `Vm`.
                 || None,
                 // #332, CodeRabbit finding on PR #333: bound this REMOTE
                 // call — unlike `sandy run --flake`'s local, interactive,
@@ -932,10 +963,13 @@ pub fn handle_dispatch(
             let run_inputs: &[Input] = staged.as_ref().map_or(&path_inputs[..], |s| &s.inputs[..]);
             let staging = stage_outputs(&dispatch.outputs, staged.as_ref())?;
             let run_outputs: &[Output] = staging.as_ref().map_or(&path_outputs[..], OutputStaging::run_outputs);
-            let backend = QemuBackend::new().with_agent(AgentLaunch {
-                program: agent_program,
-                on_link,
-            });
+            let backend = VmRunner::new(
+                hypervisor_for_os(std::env::consts::OS),
+                AgentLaunch {
+                    program: agent_program,
+                    on_link,
+                },
+            );
             let spec = RunSpec {
                 digests: dispatch.digests,
                 egress: allow.as_ref(),
