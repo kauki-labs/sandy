@@ -32,6 +32,9 @@ message ControlRequest {
     ListRequest list = 14;
     // Delete terminal job rows past the newest `keep_last`: the daemon's `sandy gc` (A4 of #483).
     PruneRequest prune = 15;
+    // The executors registered with this daemon (#483): `sandy doctor` asks it, so a promoted `run` can say up front
+    // that no executor is there to place on.
+    ListHostsRequest list_hosts = 16;
     // Environment operations (#587, slice A2). Served by sandyd's environment
     // handler, separate from the job operations above.
     CreateEnvironmentRequest create_environment = 20;
@@ -60,6 +63,7 @@ message ControlResponse {
     ListResponse list = 14;
     ControlError error = 15;
     PruneResponse prune = 16;
+    ListHostsResponse hosts = 17;
     EnvironmentResponse environment = 20;
     ListEnvironmentsResponse environments = 21;
     // A typed refusal of an environment operation. Kept apart from
@@ -270,6 +274,25 @@ message StatusResponse {
 }
 
 message ListRequest {}
+
+// The currently connected host-executors. Read-only, and the same for every caller on the control socket.
+message ListHostsRequest {}
+
+// One connected host-executor and what it declared at Register. A host that disconnects is gone from the list at once.
+message HostSummary {
+  string host_id = 1;
+  // The sandbox kinds it declared, as `process` or `vm`.
+  repeated string sandbox_kinds = 2;
+  // The isolation classes it declared it can honour.
+  repeated IsolationClass isolation_classes = 3;
+  // `x86_64` or `aarch64`.
+  string arch = 4;
+}
+
+// The connected hosts, ordered by `host_id`.
+message ListHostsResponse {
+  repeated HostSummary hosts = 1;
+}
 
 message JobSummary {
   string job_id = 1;

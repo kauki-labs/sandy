@@ -13,8 +13,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobStatus,
-    JobSummary as WireJobSummary, ListResponse, PruneResponse, StatusResponse, SubmitRequest, SubmitResponse,
-    control_request, control_response,
+    JobSummary as WireJobSummary, ListHostsResponse, ListResponse, PruneResponse, StatusResponse, SubmitRequest,
+    SubmitResponse, control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
@@ -1323,6 +1323,10 @@ pub async fn handle(
                     })
                     .collect(),
             })
+        }
+        // Stub: the registry snapshot lands with the green step.
+        Some(control_request::Op::ListHosts(_)) => {
+            control_response::Result::Hosts(ListHostsResponse { hosts: Vec::new() })
         }
         Some(control_request::Op::Prune(prune)) => {
             let store = Arc::clone(store);
@@ -5092,6 +5096,72 @@ mod tests {
             sandy_control_proto::JobStatus::Failed,
             "a job whose host disconnected mid-run must be FAILED, never stuck Pending/Running"
         );
+        Ok(())
+    }
+
+    fn list_hosts_request(request_id: u64) -> ControlRequest {
+        ControlRequest {
+            request_id,
+            op: Some(control_request::Op::ListHosts(sandy_control_proto::ListHostsRequest {})),
+        }
+    }
+
+    async fn listed_hosts(
+        store: &Arc<JobStore>,
+        registry: &Arc<JobRegistry>,
+        host_registry: &Arc<HostRegistry>,
+    ) -> anyhow::Result<Vec<sandy_control_proto::HostSummary>> {
+        let response = handle(
+            store,
+            registry,
+            host_registry,
+            None,
+            test_session(),
+            list_hosts_request(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Hosts(r)) => Ok(r.hosts),
+            other => anyhow::bail!("expected a hosts reply, got {other:?}"),
+        }
+    }
+
+    /// `ListHosts` answers from the live registry: none connected is an empty list, a connected host appears with what
+    /// it declared, hosts come ordered by id, and a host whose connection ended is gone.
+    #[tokio::test]
+    async fn list_hosts_reports_the_connected_executors_and_what_they_declared() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        assert!(
+            listed_hosts(&store, &registry, &host_registry).await?.is_empty(),
+            "no host registered"
+        );
+
+        let vm_host = sandy_executor_proto::Capabilities {
+            supported_sandbox_kinds: vec![SandboxKind::Vm.into()],
+            arch: sandy_executor_proto::Arch::Aarch64.into(),
+            supported_isolation_classes: vec![IsolationClass::Trusted.into(), IsolationClass::Untrusted.into()],
+            ..trusted_host_capabilities()
+        };
+        let ip_b: std::net::IpAddr = "100.64.0.8".parse().context("peer ip literal")?;
+        let ip_a: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _rx_b = register_test_host(&host_registry, "b-mac", ip_b, vm_host);
+        let _rx_a = register_test_host(&host_registry, "a-linux", ip_a, trusted_host_capabilities());
+
+        let hosts = listed_hosts(&store, &registry, &host_registry).await?;
+        let ids: Vec<&str> = hosts.iter().map(|h| h.host_id.as_str()).collect();
+        assert_eq!(ids, ["a-linux", "b-mac"], "ordered by host id");
+        let mac = &hosts[1];
+        assert_eq!(mac.sandbox_kinds, ["vm"]);
+        assert_eq!(mac.arch, "aarch64");
+        assert_eq!(
+            mac.isolation_classes,
+            [
+                i32::from(sandy_control_proto::IsolationClass::Trusted),
+                i32::from(sandy_control_proto::IsolationClass::Untrusted)
+            ]
+        );
+        assert_eq!(hosts[0].sandbox_kinds, ["process"]);
+        assert_eq!(hosts[0].arch, "x86_64");
         Ok(())
     }
 }
