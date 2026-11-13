@@ -527,4 +527,33 @@ mod tests {
             "a suffix of the token survived the cut"
         );
     }
+
+    /// #841 (sandy-86 on #845): an input name may itself hold a `/` (the data link accepts `a/b/c.txt`), so a digest
+    /// path belongs to a declared name when it equals it or starts with it plus `/`, never on a bare prefix.
+    #[test]
+    fn an_input_digest_belongs_to_a_declared_name_by_whole_components() {
+        let declared = ["a/b".to_owned(), "c".to_owned()];
+        let side = |paths: &[&str]| sandy::ContentDigests {
+            files: paths
+                .iter()
+                .map(|path| sandy::FileDigest {
+                    path: (*path).to_owned(),
+                    sha256: "7".repeat(64),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        };
+        for ok in ["a/b", "a/b/x.txt", "c/y", "c"] {
+            assert!(
+                check_declared(&side(&[ok]), &declared).is_ok(),
+                "{ok} belongs to a declared input"
+            );
+        }
+        for bad in ["a/x", "a", "a/bc/x", "ab", "c2/y"] {
+            assert!(
+                check_declared(&side(&[bad]), &declared).is_err(),
+                "{bad} does not belong to a declared input"
+            );
+        }
+    }
 }
