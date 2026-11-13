@@ -239,8 +239,7 @@ every knob below from environment variables — there is no CLI flag form.
 
    ```
    nix build --no-link ./nix/guest#packages.aarch64-darwin.guest-runner-vfkit
-   sandy daemon submit --flake ./nix/guest --kind topology --attr topologies.aarch64-linux.vfkit \
-     --isolation-class untrusted -- echo hello
+   sandy daemon submit --flake ./nix/guest --kind topology --isolation-class untrusted -- echo hello
    ```
 
    `SANDY_AGENT_PATH` is still required by the executor's config but a VM job does not use it (the topology names the

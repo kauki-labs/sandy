@@ -229,8 +229,10 @@ vfkit VM (decision 6).
 **Decision.** The executor's declaration follows what the host can run, not the containment status alone.
 
 - Process containment available: `Process`, plus `Vm` when a VM can run. Unchanged.
-- No process containment but a VM can run: `Vm` alone, and both isolation classes (a VM honours `Trusted` and
-  `Untrusted`). A host with neither declares nothing and refuses to start.
+- No process containment but a VM can run, on a vfkit host (macOS, which has no process containment at all): `Vm`
+  alone, and both isolation classes (a VM honours `Trusted` and `Untrusted`). Any other host with no process
+  containment still declares nothing and refuses to start, qemu or not: reaping gates a Linux host (decision 6), and a
+  Linux host that lost its user systemd is a fault to fix, not a VM-only host. A host with neither refuses to start.
 - `check_isolation_class` admits a `Trusted` job on any host, so on its own it would let a process dispatch run
   uncontained on that Mac. `handle_dispatch` therefore refuses a `Process` dispatch when its own fresh containment
   probe is not available (`ProcessContainmentUnavailable`), mirroring the VM arm's `vm_available` re-check.

@@ -96,19 +96,13 @@ fn capabilities_from(arch: Arch, status: &ContainmentStatus) -> Result<Capabilit
 /// ANY containment, on any host, so declaring `Untrusted` off
 /// `ContainmentStatus::is_untrusted_boundary()` alone (as this function did
 /// before #381) would advertise a capability the re-check could never honor.
-/// A non-available status honors neither class through the process backend, so
-/// a host with no VM either declares the empty list, the fail-closed answer for
-/// a host that can't contain anything at all. A host with no process
-/// containment but a VM (macOS, #483) declares both classes through the VM
-/// kind alone; the executor refuses any process dispatch there.
+/// A non-available status honors neither — the empty list is the correct,
+/// fail-closed declaration for a host that can't contain anything at all. A
+/// vfkit host with a VM and no process containment is handled by
+/// [`to_wire_capabilities`], not here (macOS, #483).
 fn detected_isolation_classes(status: &ContainmentStatus, vm_available: bool) -> Vec<IsolationClass> {
     if !status.is_available() {
-        // No process containment: only a VM can run a job here, and a VM honours both classes (a Mac, #483).
-        return if vm_available {
-            vec![IsolationClass::Trusted, IsolationClass::Untrusted]
-        } else {
-            Vec::new()
-        };
+        return Vec::new();
     }
     let mut classes = vec![IsolationClass::Trusted];
     if vm_available {
@@ -162,6 +156,13 @@ fn to_wire_capabilities(
         Arch::X86_64 => sandy_executor_proto::Arch::X8664,
         Arch::Aarch64 => sandy_executor_proto::Arch::Aarch64,
     };
+    // A VM-only host (a Mac, see `capabilities_for_host`) has no process containment to read the classes from: a VM
+    // honours both.
+    let classes = if capabilities.kind == SandboxKind::Vm {
+        vec![IsolationClass::Trusted, IsolationClass::Untrusted]
+    } else {
+        detected_isolation_classes(status, vm_available)
+    };
     let mut kinds = vec![i32::from(process_kind)];
     if vm_available && process_kind != sandy_executor_proto::SandboxKind::Vm {
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
@@ -173,10 +174,7 @@ fn to_wire_capabilities(
         supported_sandbox_kinds: kinds,
         arch: arch.into(),
         attestation: capabilities.attestation.is_some(),
-        supported_isolation_classes: detected_isolation_classes(status, vm_available)
-            .into_iter()
-            .map(Into::into)
-            .collect(),
+        supported_isolation_classes: classes.into_iter().map(Into::into).collect(),
         shares_submitter_filesystem,
         transfer,
         // Declared only with VM capability: a process job has no egress boundary to apply a policy with.
@@ -320,15 +318,16 @@ fn vfkit_capability_from(facts: VfkitProbeFacts) -> bool {
 }
 
 /// The capability a host declares from its containment `status` and whether it can run a VM: `Process` when the
-/// containment is available, else `Vm` alone when a VM can run. A host with neither declares nothing.
+/// containment is available. Without it, a vfkit host (a Mac, which has no process containment at all) declares `Vm`
+/// alone when a VM can run; any other host declares nothing, since reaping gates a Linux host (decision 6).
 fn capabilities_for_host(
     arch: Arch,
     status: &ContainmentStatus,
     vm_available: bool,
-    _hypervisor: crate::dispatch::Hypervisor,
+    hypervisor: crate::dispatch::Hypervisor,
 ) -> Result<Capabilities, DetectError> {
     match capabilities_from(arch, status) {
-        Err(_) if vm_available => Ok(Capabilities {
+        Err(_) if vm_available && hypervisor == crate::dispatch::Hypervisor::Vfkit => Ok(Capabilities {
             kind: SandboxKind::Vm,
             arch,
             attestation: None,
