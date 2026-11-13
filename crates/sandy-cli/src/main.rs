@@ -44,7 +44,8 @@ enum Command {
     /// Verify environment preconditions before any job runs (Block 0, REQ-12).
     Doctor,
     /// Submit a job to `sandyd` (an untrusted VM job), wait for it and print its result envelope. Ctrl-C cancels the
-    /// job.
+    /// job. The wait ends (exit `3`) after an hour, or after the job's `--timeout` plus ten minutes when that is
+    /// longer.
     Run {
         /// The template (flake attr / image) to boot. Mutually exclusive with `--flake`.
         #[arg(required_unless_present = "flake", conflicts_with = "flake")]
