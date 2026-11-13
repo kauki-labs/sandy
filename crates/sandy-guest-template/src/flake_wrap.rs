@@ -122,7 +122,8 @@ pub enum ResolvedTemplate {
 pub const BUNDLED_GUEST_FLAKE: &str = "bundled:guest";
 
 /// `flake_ref` with [`BUNDLED_GUEST_FLAKE`] replaced by this host's bundled guest flake, found under `root` (the tree
-/// that holds `nix/guest-wrapper`, see [`guest_wrapper_root`]); any other reference is returned unchanged.
+/// that holds `nix/guest-wrapper`, see [`guest_wrapper_root`]), as `{root}?dir=nix/guest`: the guest flake imports
+/// `../lib/guest.nix`, so the whole tree must be the nix source. Any other reference is returned unchanged.
 ///
 /// # Errors
 ///
@@ -140,7 +141,7 @@ pub fn resolve_bundled_flake(flake_ref: &str, root: impl FnOnce() -> Result<Path
             guest.display()
         );
     }
-    Ok(format!("path:{}", guest.display()))
+    Ok(format!("{}?dir=nix/guest", flake_ref_root_prefix(&root)))
 }
 
 /// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
