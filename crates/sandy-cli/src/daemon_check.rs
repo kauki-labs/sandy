@@ -173,6 +173,17 @@ mod tests {
         assert!(result.message.contains("sandy-host-executor"), "{}", result.message);
     }
 
+    /// `sandy run` submits an untrusted VM job: executors that declare only `trusted` pass, with a warning that names
+    /// the gap.
+    #[test]
+    fn executors_that_declare_no_untrusted_class_pass_with_a_warning() {
+        let hosts = vec![host("linux", &["process"], &[IsolationClass::Trusted], "x86_64")];
+        let result = daemon_check_result(Path::new("/run/sandyd.sock"), Ok(hosts));
+        assert_eq!(result.exit_code, 0, "{}", result.message);
+        assert!(result.message.contains("warning"), "{}", result.message);
+        assert!(result.message.contains("untrusted"), "{}", result.message);
+    }
+
     /// With executors registered the check passes and lists each one with what it declared.
     #[test]
     fn registered_executors_pass_and_are_listed() {
@@ -187,6 +198,7 @@ mod tests {
         ];
         let result = daemon_check_result(Path::new("/run/sandyd.sock"), Ok(hosts));
         assert_eq!(result.exit_code, 0, "{}", result.message);
+        assert!(!result.message.contains("warning"), "{}", result.message);
         assert!(result.message.contains("2 executors"), "{}", result.message);
         assert!(
             result.message.contains("mac (vm; trusted, untrusted; aarch64)"),

@@ -21,6 +21,8 @@ enum Behaviour {
     Error(&'static str),
     WrongReply,
     Stall,
+    /// Read the request, then close the connection without answering (a daemon that does not know it).
+    Drop,
 }
 
 /// Serve `behaviour` on a fresh socket under `dir` until the test ends.
@@ -40,6 +42,7 @@ fn serve(dir: &std::path::Path, behaviour: Behaviour) -> anyhow::Result<PathBuf>
                             message: (*message).to_owned(),
                         }),
                         (_, Behaviour::Stall) => std::future::pending().await,
+                        (_, Behaviour::Drop) => break,
                         _ => control_response::Result::List(ListResponse { jobs: Vec::new() }),
                     };
                     let reply = ControlResponse {
@@ -129,5 +132,18 @@ async fn a_stalled_daemon_ends_at_the_bound() -> anyhow::Result<()> {
     assert!(matches!(err, ListHostsError::Unreachable(_)), "{err:?}");
     assert!(err.to_string().contains("did not answer"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(3), "ended at the bound");
+    Ok(())
+}
+
+/// A daemon that reads the request and closes the connection is running but does not answer it: refused (maybe an
+/// older daemon), not unreachable.
+#[tokio::test]
+async fn a_daemon_that_drops_the_connection_is_refused_not_unreachable() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir().context("temp dir")?;
+    let sock = serve(dir.path(), Behaviour::Drop)?;
+    let err = list_hosts(&sock, Duration::from_secs(5))
+        .await
+        .expect_err("a dropped connection");
+    assert!(matches!(err, ListHostsError::Refused(_)), "{err:?}");
     Ok(())
 }
