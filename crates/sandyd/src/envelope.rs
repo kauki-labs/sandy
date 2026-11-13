@@ -157,7 +157,9 @@ pub(crate) fn from_run(
             job_id,
             exit_code,
             host_id,
-            egress_receipt(facts.egress.as_ref(), allow),
+            // A report is meaningful only for a job that asked for a boundary: a `PROXIED` for a job with no
+            // policy would read as `Enforced` with an empty allow-list.
+            egress_receipt(facts.egress.as_ref().filter(|_| allow.is_some()), allow),
         )),
     )
 }
@@ -166,7 +168,17 @@ pub(crate) fn from_run(
 /// is, so it can hold a token and can be as large as the frame that carried it (sandy-5e on #835). Redact first so a
 /// token straddling the cut leaves no suffix, then keep the last `MAX_MESSAGE_BYTES`.
 pub(crate) fn bound_egress_reason(envelope: &mut ResultEnvelope, redact: impl FnOnce(String) -> String) {
-    let _ = (envelope, redact);
+    let Some(reason) = envelope
+        .receipt
+        .as_mut()
+        .and_then(|receipt| receipt.host_observed.egress.reason.take())
+    else {
+        return;
+    };
+    let reason = redact(reason);
+    if let Some(receipt) = envelope.receipt.as_mut() {
+        receipt.host_observed.egress.reason = Some(tail(&reason, MAX_MESSAGE_BYTES).to_owned());
+    }
 }
 
 /// The envelope for a job cancelled before a terminal guest result: the shape the direct `kill` writes (status

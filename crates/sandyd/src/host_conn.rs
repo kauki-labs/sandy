@@ -690,6 +690,10 @@ async fn finish_job(
         );
         let message = redact_console(credentials.as_deref(), &jid, envelope.message);
         envelope.message = crate::envelope::tail(&message, crate::envelope::MAX_MESSAGE_BYTES).to_owned();
+        // The executor's egress reason is its own words too: redacted whole, then cut.
+        crate::envelope::bound_egress_reason(&mut envelope, |reason| {
+            redact_console(credentials.as_deref(), &jid, reason)
+        });
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;
