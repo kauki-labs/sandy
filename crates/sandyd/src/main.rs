@@ -271,6 +271,18 @@ async fn main() {
     };
     tracing::info!(socket = %attach_socket_path.display(), "sandyd attach data plane listening");
 
+    // #830: a job still open in the store has no connection that can deliver its result to this process, so it ends
+    // `Failed` (retryable) now, before anything is served. After the socket lock: a second daemon on the same store
+    // must not fail the first one's live jobs. A store that cannot be written aborts the start.
+    match store.recover_unfinished("sandyd restarted while the job was running") {
+        Ok(recovered) if recovered.is_empty() => {}
+        Ok(recovered) => tracing::warn!(jobs = ?recovered, "failed the jobs a previous sandyd left open"),
+        Err(e) => {
+            tracing::error!(error = %e, "could not recover the jobs a previous sandyd left open");
+            std::process::exit(1);
+        }
+    }
+
     // #481: a Submit naming `credential` mints from this host's trust roots,
     // the ones `sandy cred github register` wrote, through the resolver chosen at start-up.
     let registry = match JobRegistry::new() {

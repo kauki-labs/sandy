@@ -54,6 +54,10 @@ async fn main() {
         tracing::info!(swept, "removed stale staging roots left by a process that is gone");
     }
 
+    // A killed executor leaves its job VMs running with no parent. Stop the ones a box record proves are ours, whose
+    // owner is gone (#830, #666); the sweep logs its own report and never touches a live owner's boxes.
+    let _ = sandy_impls_vm::sweep_orphaned_vms();
+
     let capabilities = match detect_register_capabilities() {
         Ok(capabilities) => capabilities,
         Err(e) => {

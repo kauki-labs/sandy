@@ -2752,6 +2752,13 @@ change, which also fixes the queue-time loss).
 - A sandyd crash or kill while a credentialed job runs leaves its token valid until the native expiry
   (GitHub: one hour), and the staged file on disk until `sandy gc` sweeps stale `cred-*` dirs. No restart
   sweep revokes it. The bracket exposes the lease handle so a later reconcile could.
+- Restart recovery (#830), rows. At start, after the socket lock and before anything is served, every `Pending` or
+  `Running` row becomes `Failed` with a retryable infra-fault envelope ("sandyd restarted while the job was
+  running") in one transaction, because no connection can deliver its result to the new process. The row's console
+  and exit code stay, terminal rows are not touched, and a second start finds nothing. A failure of that write
+  exits the daemon with code 1. The job VMs belong to the host-executor, which now sweeps its own orphans at start
+  (`sweep_orphaned_vms`); `sandyd`'s own startup sweep covers only the environment VMs it launches (decision 34).
+  Revoking the credentials of those jobs is the follow-up in the same issue.
 - A clean shutdown revokes nothing at all: every live token survives a normal sandyd restart until its
   native expiry, and revokes already in flight are not waited for. `sandyd cancel` (the offline operator
   cancel) only marks the row: it cannot revoke.
