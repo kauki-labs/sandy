@@ -512,6 +512,18 @@ pub fn outcome_result_message_with_outputs(
     outcome: Outcome,
     outputs_follow: bool,
 ) -> HostExecutorMessage {
+    outcome_result_message_with_egress(job_id, outcome, outputs_follow, None)
+}
+
+/// [`outcome_result_message_with_outputs`] with the egress report of a run that carried a policy (A2b of #483), in
+/// `JobResult.egress`. `None` sends no report, which the orchestrator reads as unenforced.
+#[must_use]
+pub fn outcome_result_message_with_egress(
+    job_id: String,
+    outcome: Outcome,
+    outputs_follow: bool,
+    egress: Option<sandy_executor_proto::EgressReport>,
+) -> HostExecutorMessage {
     HostExecutorMessage {
         op: Some(host_executor_message::Op::Result(JobResult {
             job_id,
@@ -521,6 +533,7 @@ pub fn outcome_result_message_with_outputs(
             transport_error: outcome.transport_error,
             console: outcome.console,
             outputs_follow,
+            egress,
         })),
     }
 }
@@ -542,6 +555,7 @@ pub fn failure_result_message(job_id: String, reason: String) -> HostExecutorMes
             transport_error: Some(reason),
             console: String::new(),
             outputs_follow: false,
+            egress: None,
         })),
     }
 }
@@ -1043,6 +1057,33 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    /// A2b (#483): the result message carries the executor's egress report, and no report when the run had no policy.
+    #[test]
+    fn a_result_message_carries_the_egress_report() {
+        let outcome = || Outcome {
+            booted: true,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        };
+        let report = sandy_executor_proto::EgressReport {
+            state: sandy_executor_proto::EgressState::Proxied.into(),
+            reason: None,
+        };
+        let sent = outcome_result_message_with_egress("job-1".to_owned(), outcome(), false, Some(report.clone()));
+        let Some(host_executor_message::Op::Result(result)) = sent.op else {
+            panic!("expected a JobResult");
+        };
+        assert_eq!(result.egress, Some(report));
+        let none = outcome_result_message_with_egress("job-1".to_owned(), outcome(), false, None);
+        let Some(host_executor_message::Op::Result(result)) = none.op else {
+            panic!("expected a JobResult");
+        };
+        assert_eq!(result.egress, None, "no policy, no report");
     }
 
     /// Regression (CodeRabbit on #344): a failed result write must not be

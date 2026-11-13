@@ -100,6 +100,9 @@ pub struct JobChannel {
     /// The outputs the Submit declared, as `(name, destination)`, for every placement (A2c of #483): the envelope
     /// lists what the run left at these destinations once its outputs have settled, as the direct path lists its own.
     pub declared_outputs: Vec<(Option<String>, std::path::PathBuf)>,
+    /// The egress allow-list the job was dispatched with (A2b of #483), or `None` for a job with no policy. The
+    /// executor reports the boundary's state; this is what that boundary enforced, for the envelope's receipt.
+    pub egress_allow: Option<sandy::AllowList>,
     /// How the receive of `data_outputs` came out, for the result relay to wait on.
     pub outputs: crate::output_slot::OutputsSlot,
     /// Caps derived from the manifest's `requested_caps`, bounded by the
@@ -272,6 +275,7 @@ pub async fn mint_job_channel(job_id: &str, authority: &SharedCapAuthority) -> R
         data_inputs: Vec::new(),
         data_outputs: Vec::new(),
         declared_outputs: Vec::new(),
+        egress_allow: None,
         outputs: crate::output_slot::OutputsSlot::new(),
         granted_caps: Vec::new(),
         session: Uuid::nil(),

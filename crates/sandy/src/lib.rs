@@ -93,7 +93,8 @@ pub use result::{
     AuditReceipt, Classification, ContentDigests, CredentialReceipt, EgressAttempt, EgressEnforcement, EgressReceipt,
     FileDigest, GuestReported, HostObserved, Location, Logs, OutputRef, OutputSizeRef, OutputStatus, ProcessExit,
     Provenance, RESULT_SCHEMA_VERSION, Receipt, ResultEnvelope, SkipReason, SkippedEntry, Status, Timing, What, Who,
-    build_envelope, classify_backend_error, classify_invalid_plan, classify_outcome,
+    build_egress_receipt, build_envelope, classify_backend_error, classify_invalid_plan, classify_outcome,
+    proxy_receipt_result,
 };
 /// fsync a directory so a preceding create/rename within it is durable across a
 /// crash (INV-4/INV-6).

@@ -29,7 +29,8 @@ use sandy::{
     JobRecord, JobState, Journal, Lease, MAX_TTL_SECS, Outcome, OutputStatus, PlanError, ProcessExit, Profile,
     ResultEnvelope, Scope, SecretSource, Status, VmBackend, build_envelope, classify_backend_error,
     classify_invalid_plan, classify_outcome, enforce, mint_lease, mint_lease_checked, new_job_id, plan_egress_scoped,
-    reconcile_job, validate_egress_hosts, validate_network_mode, validate_no_secret_leak, validate_proxy_egress,
+    proxy_receipt_result, reconcile_job, validate_egress_hosts, validate_network_mode, validate_no_secret_leak,
+    validate_proxy_egress,
 };
 use zeroize::Zeroizing;
 
@@ -137,25 +138,6 @@ fn validate_run_egress(plan: &JobPlan, egress_os: EgressOs, tap: Option<&str>) -
         validate_egress_hosts(&plan.allow, egress_os)?;
     }
     validate_network_mode(egress_os, plan.network, tap, plan.egress_proxy)
-}
-
-/// The receipt's egress outcome for a proxy-mode run, read from what the backend did.
-///
-/// The host applies nothing in proxy mode: the backend starts the proxy and boots the
-/// guest behind it, so "enforced" is true only once a guest ran. `Spawn` means the
-/// backend refused the policy or could not start the proxy, before any boot. A guest that never
-/// booted ran behind nothing. Anything later, a proxy that died mid-run included, means the
-/// proxy served the run, so it stays enforced: that fault is already a band-3 result of its own.
-/// A proxy found dead before the guest booted (`booted: false`) counts as a guest that never booted.
-fn proxy_receipt_result(run: &Result<Outcome, BackendError>) -> Result<EgressOutcome, String> {
-    match run {
-        Err(BackendError::Spawn(why)) => Err(why.clone()),
-        Err(BackendError::EgressProxyDied { booted: false, .. }) => {
-            Err("the egress proxy died before the guest booted, so it served no run".to_string())
-        }
-        Ok(outcome) if !outcome.booted => Err("the guest never booted, so the egress proxy served no run".to_string()),
-        _ => Ok(EgressOutcome::Proxied),
-    }
 }
 
 /// The shared core of [`run_job`] and [`run_job_with_credential`]: validates the

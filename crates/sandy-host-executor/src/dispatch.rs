@@ -580,6 +580,23 @@ impl HandleDispatchError {
     }
 }
 
+/// The executor's egress report for a run that carried an egress policy (A2b of #483): the same outcome the direct
+/// path's receipt reads, `sandy::proxy_receipt_result`, in its wire shape. `PROXIED` only when the per-run egress
+/// proxy served a booted guest; a refusal before boot or a guest that never booted is `FAILED` with the reason.
+#[must_use]
+pub fn egress_report(run: &Result<Outcome, BackendError>) -> sandy_executor_proto::EgressReport {
+    use sandy_executor_proto::EgressState;
+    let (state, reason) = match sandy::proxy_receipt_result(run) {
+        Ok(sandy::EgressOutcome::Proxied | sandy::EgressOutcome::Enforced) => (EgressState::Proxied, None),
+        Ok(sandy::EgressOutcome::Unenforced { reason }) => (EgressState::Unenforced, Some(reason)),
+        Err(reason) => (EgressState::Failed, Some(reason)),
+    };
+    sandy_executor_proto::EgressReport {
+        state: state.into(),
+        reason,
+    }
+}
+
 /// What a dispatch produced: the physical outcome, and whether the job's outputs went back over the data link.
 #[derive(Debug)]
 pub struct Dispatched {
@@ -588,6 +605,8 @@ pub struct Dispatched {
     /// True when the outputs were sent over the data link (even if the send failed), so the orchestrator must wait
     /// for them before it records the job as finished (#482).
     pub outputs_follow: bool,
+    /// What the executor observed of the egress boundary: `Some` only for a run that carried a policy.
+    pub egress: Option<sandy_executor_proto::EgressReport>,
 }
 
 /// Plan where a remote job's outputs are collected: `None` for a local dispatch (no data link) or a job with no
@@ -612,6 +631,7 @@ fn dispatched(
     staging: Option<OutputStaging>,
     rt: &tokio::runtime::Handle,
     control: &RunControl,
+    egress: Option<sandy_executor_proto::EgressReport>,
 ) -> Dispatched {
     let outputs_follow = match (staged, &staging) {
         (Some(mut staged), Some(staging)) => send_staged_outputs(
@@ -626,6 +646,7 @@ fn dispatched(
     Dispatched {
         outcome,
         outputs_follow,
+        egress,
     }
 }
 
@@ -821,7 +842,7 @@ pub fn handle_dispatch(
                 control: &control,
             };
             let outcome = backend.run(&spec)?;
-            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control, None))
         }
         // Defense in depth (#332, mirroring `check_isolation_class`'s own
         // re-probe discipline): `vm_available` is the caller's own fresh
@@ -917,9 +938,13 @@ pub fn handle_dispatch(
             // `_kept_topology_file` (the temp JSON file, for a Prebuilt
             // template) must outlive `backend.run`'s own read of `template`
             // — held in scope here, across the call, not dropped before it.
-            let outcome = backend.run(&spec)?;
+            let run = backend.run(&spec);
+            // A run that carried a policy reports what became of its boundary, read from the same facts the direct
+            // path's receipt reads (A2b of #483). A run that failed to start returns the error and no report.
+            let egress = allow.is_some().then(|| egress_report(&run));
+            let outcome = run?;
             drop(_kept_topology_file);
-            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control))
+            Ok(dispatched(outcome, staged, staging, &data_link_rt, &control, egress))
         }
         _ => Err(HandleDispatchError::UnsupportedBackend(dispatch.backend)),
     }
@@ -1639,7 +1664,7 @@ mod tests {
         // A local job: no link, no staging.
         let local = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control)).await?
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), None, None, &rt, &control, None)).await?
         };
         assert!(!local.outputs_follow, "a local job has nothing following");
 
@@ -1648,7 +1673,8 @@ mod tests {
         let staged = StagedInputs::for_test(near).context("staged inputs")?;
         let linked = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control)).await?
+            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), None, &rt, &control, None))
+                .await?
         };
         assert!(!linked.outputs_follow, "no outputs declared: nothing follows");
         let mut rest = Vec::new();
@@ -1662,8 +1688,10 @@ mod tests {
         let staged = StagedInputs::for_test(near).context("staged inputs")?;
         let sent = {
             let (rt, control) = (rt.clone(), control.clone());
-            tokio::task::spawn_blocking(move || dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control))
-                .await?
+            tokio::task::spawn_blocking(move || {
+                dispatched(an_outcome(), Some(staged), Some(staging), &rt, &control, None)
+            })
+            .await?
         };
         assert!(sent.outputs_follow, "staged outputs over a link follow");
         let mut frames = Vec::new();
@@ -1792,6 +1820,62 @@ mod tests {
             "expected EgressPolicyInvalid before the manifest decode, got {err:?}"
         );
         Ok(())
+    }
+
+    /// A2b (#483): the report the executor sends is `sandy::proxy_receipt_result` in its wire shape, one row per way a
+    /// proxy-mode run can end, so the daemon's receipt reads the same fact the direct path's does.
+    #[test]
+    fn the_egress_report_mirrors_the_direct_proxy_receipt() {
+        use sandy_executor_proto::EgressState;
+        let outcome = |booted: bool| Outcome {
+            booted,
+            guest_exit: Some(0),
+            transport_error: None,
+            timed_out: false,
+            console: String::new(),
+            digests: None,
+        };
+        type Row<'a> = (&'a str, Result<Outcome, BackendError>, EgressState, Option<&'a str>);
+        let rows: Vec<Row<'_>> = vec![
+            ("booted guest", Ok(outcome(true)), EgressState::Proxied, None),
+            (
+                "guest never booted",
+                Ok(outcome(false)),
+                EgressState::Failed,
+                Some("the guest never booted, so the egress proxy served no run"),
+            ),
+            (
+                "refused before boot",
+                Err(BackendError::Spawn("no proxy binary".to_owned())),
+                EgressState::Failed,
+                Some("no proxy binary"),
+            ),
+            (
+                "proxy dead before the guest booted",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: false,
+                    guest_exit: None,
+                }),
+                EgressState::Failed,
+                Some("the egress proxy died before the guest booted, so it served no run"),
+            ),
+            (
+                "proxy dead after the guest booted",
+                Err(BackendError::EgressProxyDied {
+                    status: Some(1),
+                    booted: true,
+                    guest_exit: None,
+                }),
+                EgressState::Proxied,
+                None,
+            ),
+        ];
+        for (name, run, state, reason) in rows {
+            let report = egress_report(&run);
+            assert_eq!(report.state, i32::from(state), "{name}: state");
+            assert_eq!(report.reason.as_deref(), reason, "{name}: reason");
+        }
     }
 
     /// Adversarial (#332): an unrecognized/unspecified `backend` value is

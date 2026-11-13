@@ -36,9 +36,9 @@ pub mod v1 {
 /// direct `prost` dependency just for that bound.
 pub use prost::Message;
 pub use v1::{
-    Arch, AttachStateChanged, Cancel, Capabilities, DataLinkMessage, Dispatch, EgressPolicy, EgressRule,
-    HostExecutorMessage, Input, InputChunk, InputEnd, IsolationClass, JobResult, OrchestratorMessage, Output,
-    OutputChunk, OutputEnd, Register, RegisterRefused, Registered, SandboxKind, SecretRef, TransferError,
+    Arch, AttachStateChanged, Cancel, Capabilities, DataLinkMessage, Dispatch, EgressPolicy, EgressReport, EgressRule,
+    EgressState, HostExecutorMessage, Input, InputChunk, InputEnd, IsolationClass, JobResult, OrchestratorMessage,
+    Output, OutputChunk, OutputEnd, Register, RegisterRefused, Registered, SandboxKind, SecretRef, TransferError,
     data_link_message, host_executor_message, orchestrator_message,
 };
 
@@ -318,6 +318,7 @@ mod tests {
                 transport_error: None,
                 console: "hi\n".to_owned(),
                 outputs_follow: false,
+                egress: None,
             })),
         };
         write_frame(&mut write_side, &message).await?;
