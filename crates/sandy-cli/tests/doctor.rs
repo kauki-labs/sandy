@@ -114,7 +114,12 @@ fn run_doctor(
     sock: &std::path::Path,
 ) -> anyhow::Result<(std::process::Output, Vec<Box<dyn std::any::Any>>)> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sandy"));
-    command.arg("doctor").env("SANDY_HOME", home).env("SANDY_SOCK", sock);
+    // `$HOME` too: doctor stages a probe credential under `~/.config/sandy`, which a developer host may not allow.
+    command
+        .arg("doctor")
+        .env("SANDY_HOME", home)
+        .env("SANDY_SOCK", sock)
+        .env("HOME", home);
     let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
     if cfg!(target_os = "macos") {
         let (path, path_dir) = fake_nix_path()?;

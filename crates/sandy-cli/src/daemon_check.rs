@@ -1,8 +1,7 @@
 //! `sandy doctor`'s check of the two-process setup (promote-and-remove prep, #483): `sandyd` answers on its control
 //! socket and at least one host-executor is registered with it.
 //!
-//! The check is a library function, not yet a step of `sandy doctor`: the direct verbs need no daemon until they are
-//! removed, so doctor refuses on a missing daemon only from the promotion on.
+//! The verbs are the daemon's, so `sandy doctor` refuses (exit `2`) when the daemon or its executors are missing.
 
 use std::{path::Path, time::Duration};
 
@@ -11,46 +10,80 @@ use sandy_control_proto::{HostSummary, IsolationClass, ListHostsRequest, control
 
 use crate::doctor::DoctorResult;
 
+/// Why the host list could not be had. The two arms send the operator different ways: start `sandyd`, or look at the
+/// one that is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListHostsError {
+    /// Nothing usable answered: the socket could not be connected, the call failed, or the daemon did not answer in
+    /// time.
+    Unreachable(String),
+    /// A daemon answered, but with an error or with a reply of another kind (an older `sandyd` does not know
+    /// `ListHosts`).
+    Refused(String),
+}
+
+impl std::fmt::Display for ListHostsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Unreachable(why) | Self::Refused(why)) = self;
+        f.write_str(why)
+    }
+}
+
+impl std::error::Error for ListHostsError {}
+
 /// Ask the `sandyd` on `socket` for its connected host-executors, within `bound` for the whole exchange.
 ///
 /// # Errors
 ///
-/// A message naming what failed: the socket could not be connected, the daemon did not answer within `bound`, it
-/// answered with an error, or it answered something other than a host list.
-pub async fn list_hosts(socket: &Path, bound: Duration) -> Result<Vec<HostSummary>, String> {
+/// [`ListHostsError::Unreachable`] when the socket could not be connected, the call failed or the daemon did not answer
+/// within `bound`; [`ListHostsError::Refused`] when it answered with an error or with something other than a host list.
+pub async fn list_hosts(socket: &Path, bound: Duration) -> Result<Vec<HostSummary>, ListHostsError> {
+    use ListHostsError::{Refused, Unreachable};
     let exchange = async {
         let mut stream = tokio::net::UnixStream::connect(socket)
             .await
-            .map_err(|e| format!("could not connect to {}: {e}", socket.display()))?;
+            .map_err(|e| Unreachable(format!("could not connect to {}: {e}", socket.display())))?;
         let op = control_request::Op::ListHosts(ListHostsRequest {});
         let response = sandy_control_proto::client::call(&mut stream, 1, op)
             .await
-            .map_err(|e| format!("the daemon call failed: {e}"))?;
+            .map_err(|e| Unreachable(format!("the daemon call failed: {e}")))?;
         match response.result {
             Some(control_response::Result::Hosts(r)) => Ok(r.hosts),
-            Some(control_response::Result::Error(e)) => Err(e.message),
-            other => Err(format!("the daemon answered a host list request with {other:?}")),
+            Some(control_response::Result::Error(e)) => Err(Refused(e.message)),
+            other => Err(Refused(format!(
+                "the daemon answered a host list request with {other:?}"
+            ))),
         }
     };
-    tokio::time::timeout(bound, exchange)
-        .await
-        .map_err(|_| format!("sandyd at {} did not answer within {bound:?}", socket.display()))?
+    tokio::time::timeout(bound, exchange).await.map_err(|_| {
+        Unreachable(format!(
+            "sandyd at {} did not answer within {bound:?}",
+            socket.display()
+        ))
+    })?
 }
 
 /// The doctor verdict for the daemon check: ok with the executors listed, or a refusal (exit `2`, invalid environment)
 /// that names the fix. `socket` is only named in the messages.
 #[must_use]
-pub fn daemon_check_result(socket: &Path, hosts: Result<Vec<HostSummary>, String>) -> DoctorResult {
+pub fn daemon_check_result(socket: &Path, hosts: Result<Vec<HostSummary>, ListHostsError>) -> DoctorResult {
     let refuse = |message: String| DoctorResult {
         exit_code: ProcessExit::InvalidPlan.code(),
         message: format!("sandy doctor: {message}"),
     };
     let hosts = match hosts {
         Ok(hosts) => hosts,
-        Err(why) => {
+        Err(ListHostsError::Unreachable(why)) => {
             return refuse(format!(
                 "sandyd is not reachable at {}: {why}; start `sandyd` (it listens on $SANDY_SOCK, else in the default \
                  runtime directory) and retry",
+                socket.display()
+            ));
+        }
+        Err(ListHostsError::Refused(why)) => {
+            return refuse(format!(
+                "sandyd at {} is running but did not list its executors: {why}; it may be older than this `sandy`, so \
+                 restart it from the same build",
                 socket.display()
             ));
         }
@@ -113,12 +146,29 @@ mod tests {
     fn an_unreachable_daemon_is_refused_naming_the_socket_and_the_fix() {
         let result = daemon_check_result(
             Path::new("/run/sandyd.sock"),
-            Err("could not connect: No such file or directory".to_owned()),
+            Err(ListHostsError::Unreachable(
+                "could not connect: No such file or directory".to_owned(),
+            )),
         );
         assert_eq!(result.exit_code, 2, "{}", result.message);
         assert!(result.message.contains("/run/sandyd.sock"), "{}", result.message);
         assert!(result.message.contains("No such file"), "{}", result.message);
         assert!(result.message.contains("start `sandyd`"), "{}", result.message);
+    }
+
+    /// A running daemon that answers wrongly is not called unreachable: "start `sandyd`" would send the operator the
+    /// wrong way (it may be an older daemon).
+    #[test]
+    fn a_daemon_that_answers_wrongly_is_not_called_unreachable() {
+        let result = daemon_check_result(
+            Path::new("/run/sandyd.sock"),
+            Err(ListHostsError::Refused("unknown request".to_owned())),
+        );
+        assert_eq!(result.exit_code, 2, "{}", result.message);
+        assert!(result.message.contains("unknown request"), "{}", result.message);
+        assert!(result.message.contains("older"), "{}", result.message);
+        assert!(!result.message.contains("not reachable"), "{}", result.message);
+        assert!(!result.message.contains("start `sandyd`"), "{}", result.message);
     }
 
     /// A daemon with no registered executor is up but cannot place anything: refused, naming the executor to start.
