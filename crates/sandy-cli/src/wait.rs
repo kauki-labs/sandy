@@ -128,7 +128,7 @@ mod tests {
     }
 
     /// A wait returns the first terminal status and polls until then, once per interval.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_wait_polls_until_the_job_is_terminal() -> anyhow::Result<()> {
         let script = std::sync::Mutex::new(vec![
             response(JobStatus::Pending, None),
@@ -142,8 +142,8 @@ mod tests {
                 let next = script.lock().map(|mut s| s.remove(0)).map_err(|e| e.to_string());
                 async move { next }
             },
-            Duration::from_secs(1),
-            Duration::from_secs(60),
+            Duration::from_millis(5),
+            Duration::from_secs(30),
         )
         .await
         .context("the job ends")?;
@@ -153,12 +153,12 @@ mod tests {
     }
 
     /// A job that never ends is reported after the bound, naming the state it was in.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_wait_that_passes_its_bound_says_what_state_the_job_was_in() {
         let err = wait_until_terminal(
             || async { Ok(response(JobStatus::Running, None)) },
-            Duration::from_secs(1),
-            Duration::from_secs(5),
+            Duration::from_millis(5),
+            Duration::from_millis(60),
         )
         .await
         .expect_err("a running job never ends");
@@ -166,16 +166,16 @@ mod tests {
             panic!("expected a timeout, got {err:?}");
         };
         assert!(state.contains("RUNNING"), "{state}");
-        assert_eq!(bound, Duration::from_secs(5));
+        assert_eq!(bound, Duration::from_millis(60));
     }
 
     /// A failing status call ends the wait with that failure, not a hang.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_failing_status_call_ends_the_wait() {
         let err = wait_until_terminal(
             || async { Err("the daemon closed the connection".to_owned()) },
-            Duration::from_secs(1),
-            Duration::from_secs(5),
+            Duration::from_millis(5),
+            Duration::from_millis(60),
         )
         .await
         .expect_err("the call fails");
