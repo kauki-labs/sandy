@@ -951,13 +951,13 @@ async fn wait_and_report(
         return ProcessExit::InfraFault.code();
     };
     let ids = std::sync::atomic::AtomicU64::new(2);
-    let cell = std::cell::RefCell::new(&mut stream);
+    let cell = tokio::sync::Mutex::new(&mut stream);
     let mut waiting = Box::pin(sandy_cli::wait::wait_until_terminal(
         || {
             let id = ids.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let cell = &cell;
             async move {
-                let mut stream = cell.borrow_mut();
+                let mut stream = cell.lock().await;
                 status_call(&mut stream, id, job_id).await
             }
         },
@@ -989,12 +989,12 @@ async fn wait_and_report(
             if let Err(e) = sandy_control_proto::client::call(&mut fresh, 1, cancel).await {
                 eprintln!("sandy: the cancel call failed: {e}");
             }
-            let fresh = std::cell::RefCell::new(fresh);
+            let fresh = tokio::sync::Mutex::new(fresh);
             sandy_cli::wait::wait_until_terminal(
                 || {
                     let fresh = &fresh;
                     async move {
-                        let mut stream = fresh.borrow_mut();
+                        let mut stream = fresh.lock().await;
                         status_call(&mut stream, 2, job_id).await
                     }
                 },
