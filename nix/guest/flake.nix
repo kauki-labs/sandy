@@ -25,37 +25,6 @@
       guestLib = import ../lib/guest.nix { inherit nixpkgs microvm; };
       inherit (guestLib) mkGuest mkTopology;
 
-      # Guest networking for the #29 live egress gate and the #602 `nic` profile (the vfkit guest carries it
-      # too; there the NIC has no host egress boundary, #603). sandy's qemu backend adds
-      # the NIC itself (`-netdev tap,ifname=$SANDY_TAP` + virtio-net with the fixed
-      # `02:00:00:00:00:01` MAC) because it assembles its own qemu argv rather than
-      # using microvm's declaredRunner — so the guest only needs to bring up and
-      # DHCP whatever ethernet interface appears. `Type = "ether"` matches it
-      # without depending on a predictable name; the host side of the tap runs the
-      # DHCP server (the gate starts dnsmasq). The guest's own firewall is off: the
-      # host enforces egress (guest-scoped nftables on the tap), and the
-      # "bypass impossible" row flushes the guest's rules anyway.
-      networkingModule =
-        { pkgs, ... }:
-        {
-          networking.useNetworkd = true;
-          systemd.network.enable = true;
-          systemd.network.networks."10-ether" = {
-            matchConfig.Type = "ether";
-            networkConfig.DHCP = "yes";
-          };
-          networking.firewall.enable = false;
-          # `nft` in the guest so the #29 "bypass impossible" row can really flush
-          # the guest's own ruleset — otherwise that step is a silent no-op and the
-          # assertion is vacuous. `glibc.bin` for `getent`: NixOS doesn't put it on
-          # PATH by default, and the #376 live gate needs it to prove the guest
-          # really can't resolve a name through a host-local resolver.
-          environment.systemPackages = [
-            pkgs.nftables
-            pkgs.glibc.bin
-          ];
-        };
-
       # A minimal HTTP service for the environment and bridge live gates. The service workload kind (#589) starts
       # it, never the image; the image holds no key, token or config. `sandy-http-ready` is the probe: it succeeds
       # once an HTTP server answers on the loopback port with a status below 500 (a service may reply 503 while it
@@ -163,13 +132,12 @@
           ];
         };
 
-      # qemu guest for the Linux node (x86_64-linux/KVM), console ttyS0. Carries the
-      # networking module so the #29 egress gate has guest egress to filter.
+      # qemu guest for the Linux node (x86_64-linux/KVM), console ttyS0. No NIC: its only network path is the
+      # egress proxy over vsock (#483).
       qemuGuest = mkGuest {
         system = "x86_64-linux";
         hypervisor = "qemu";
         extraModules = [
-          networkingModule
           credentialModule
         ];
       };
@@ -179,7 +147,6 @@
         system = "x86_64-linux";
         hypervisor = "qemu";
         extraModules = [
-          networkingModule
           credentialModule
           serviceModule
         ];
@@ -190,7 +157,6 @@
         hypervisor = "vfkit";
         vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
         extraModules = [
-          networkingModule
           credentialModule
           serviceModule
         ];
@@ -204,7 +170,6 @@
         hypervisor = "vfkit";
         vmHostPackages = nixpkgs.legacyPackages.aarch64-darwin;
         extraModules = [
-          networkingModule
           credentialModule
         ];
       };

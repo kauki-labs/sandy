@@ -61,12 +61,9 @@ The design still guarantees, even from inside a compromised guest:
   the sandy user's full syscall surface (#392). Each `virtiofsd` runs under its default seccomp filter in the host's
   namespaces (`--sandbox=none`; namespace mode does not start under the executor unit, `guest-shares.md` decision 3,
   #523). Resource limits (cgroup) are not yet enforced;
-- **no egress at all on macOS, until #360.** `vfkit_args`
-  (`impls/vm/src/vfkit.rs`) emits no `virtio-net` device, so a macOS guest has
-  no NIC to reach anything over: denied by construction, not merely
-  unfiltered (`egress.md` decision 2). A non-empty `--allow` list has no
-  effect there either and the envelope's `warnings` says so (#358). This
-  guarantee ends once #360 gives guests network.
+- **no guest NIC (#483).** qemu passes `-nic none` and `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
+  `virtio-net` device, so a guest has no network path except the per-run egress proxy over vsock. This holds on
+  both hypervisors.
 
 It does not guarantee:
 
@@ -337,68 +334,37 @@ sequenceDiagram
 
 ## 5. Egress
 
-**Purpose.** Bracket the boot with an allow-list so the guest's network is filtered,
-never the host's.
+**Purpose.** Give the guest one network path, a per-run host proxy that applies an allow-list, and no other.
 
 **Decisions.**
 
-- **Guest-scoped, fail-closed (#29, INV-7).** On Linux with a bound tap, a
-  guest-scoped nftables **forward** ruleset filters only the guest and can never
-  lock the host off the network; if the boundary can't be applied, the run fails
-  closed (band 3) rather than booting unprotected. It is always reverted, on the ok
-  and the error path, so a boot failure never leaves rules up.
-- **Host-destined traffic is covered too (#376).** Traffic from the guest to the
-  host itself doesn't cross `forward`; it lands in `input`. `to_nftables_forward`
-  also emits an `input`-hook chain scoped to the guest's `iface`: DHCP is allowed,
-  everything else from the guest is dropped. An empty allow-list blocks it the
-  same as forwarded egress — there is no way to allow-list a host address here
-  (see `docs/decisions/egress.md`). IPv4 only, TCP only on the data-plane side;
-  no guest DNS is resolved or trusted.
-- **macOS is a no-op.** `vfkit_args` (`impls/vm/src/vfkit.rs`) emits no
-  `virtio-net` device, so a macOS guest has no NIC at all; `plan_egress_scoped`
-  yields `NoBoundary` and the run proceeds without enforcement (documented, not
-  silent). A Linux guest with no bound tap has no NIC either, for the same
-  reason.
-- **A no-NIC guest's `--allow` list warns when non-empty (#358).** With no
-  network device (macOS, or Linux without a tap) a non-empty `--allow` list has
-  no effect to grant, so the envelope's `warnings` carries `egress unavailable:
-the guest has no network device, so --allow entries have no effect (see
-#360)`. An empty allow-list does not add an envelope warning. The decision keys on structure
-  (`EgressOs::MacOs` or no tap), never on the `Unenforced` reason string. No
-  schema bump: `warnings` already exists at schema 2 (section 6).
-- **IP-only matching, no guest DNS (#359).** An allow-list entry is an IPv4
-  address or IPv4 CIDR plus port; matching is by destination IPv4 address and TCP
-  port only — IPv6, UDP, and QUIC from the guest are dropped. The guest gets no
-  DNS through the boundary, so a job must connect by IP. A hostname entry is
-  refused at plan time on the nftables (Linux) path: band 2, no job record,
-  no boot, naming the entry and #377. nft pins a hostname to one address at
-  ruleset-load time, rejects a name with several addresses, and the guest can't
-  resolve names through the boundary anyway, so a hostname entry only ever helps
-  a job that already connects by IP — refusing it turns that silent no-op into a
-  clear error. macOS enforces no boundary, so a hostname entry stays accepted
-  there (#358). Hostname policy arrives with the #360 egress proxy (#377), which
-  resolves names host-side.
-- **Planned: a NIC-less guest with a vsock host proxy (#360).** The guest gets
-  no NIC. `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
-  sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host
-  proxy that the backend owns beside `virtiofsd`. The proxy matches the target
-  name or IP and port against the allow-list before any resolution, resolves
-  names host-side, refuses loopback and host-local addresses, and refuses
-  private addresses the allow-list does not name. A proxy that fails to start
-  or dies mid-run is band 3. It replaces both decisions above once qemu and
-  vfkit pass the live parity gate. Full record:
-  [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md). Planned live
-  KPIs: [`kpi.md#planned-egress-proxy`](kpi.md#planned-egress-proxy).
+- **No guest NIC (#483).** qemu always passes `-nic none` (without it qemu adds a user-mode NAT NIC), and
+  `vfkit_args` emits no `virtio-net` device. The guest reaches the host only over virtio-fs and vsock. The opt-in
+  NIC profile (`SANDY_NETWORK=nic`, `SANDY_TAP`, #602) and the tap and nftables boundary of #29 are removed
+  ([`../decisions/egress-proxy.md`](../decisions/egress-proxy.md) decision 7). A routable guest is the backlog item #677.
+- **The egress proxy is the boundary (#360).** `sandy-agent egress-relay` serves `127.0.0.1:3128` in the guest and
+  sets `HTTP(S)_PROXY` for the job. Each CONNECT crosses vsock to a per-run host proxy that the backend owns beside
+  `virtiofsd`. The proxy matches the target name or IP and port against the allow-list before any resolution,
+  resolves names host-side, refuses loopback and host-local addresses, and refuses private addresses the allow-list
+  does not name. A proxy that fails to start or dies mid-run is band 3. Full record:
+  [`../decisions/egress-proxy.md`](../decisions/egress-proxy.md); live KPIs:
+  [`kpi.md#planned-egress-proxy`](kpi.md#planned-egress-proxy).
+- **Host-destined traffic (#376).** With no NIC there is no IP path from the guest to the host. The qemu leg still
+  reaches host `AF_VSOCK` listeners (see the adversarial pass in the decision record).
+- **A process job has no boundary.** A dispatch that carries an egress policy to a process job is refused
+  (`EgressPolicyUnsupported`), never run unfiltered (A1, #483).
+- **Superseded:** the guest-scoped nftables forward ruleset, its `input` chain (#376) and the macOS no-op
+  (`egress.md` decisions 1, 1a and 2). `to_nftables`, `plan_egress` and `validate_egress_hosts` remain as
+  unreferenced library functions; no production applier is left.
 
 **KPI.**
 
-- Integration: `egress` unit tests (ruleset generation, `plan_egress_scoped`,
-  `validate_egress_hosts`), apply-failure-fails-closed (over `FakeApplier`). The
-  fake-backed `cli_jobs` egress and warning tests were removed in #483 with the direct
-  path.
-- End-to-end: K13 (`live_egress.rs`, real nftables around a boot) is retired (#483):
-  the guest NIC profile is removed and `--allow` through the egress proxy (KP rows,
-  not yet re-proven through the daemon, #858) is the only network path.
+- Integration: `qemu_args_never_emit_a_nic` and `vfkit_args_never_emit_a_nic` (NN1 in `kpi.md`); the `egress` unit
+  tests for the remaining host-wide translation, apply-failure-fails-closed (over `FakeApplier`). The fake-backed
+  `cli_jobs` egress and warning tests were removed in #483 with the direct path.
+- End-to-end: K13 (`live_egress.rs`, real nftables around a boot) is retired (#483): the guest NIC profile is
+  removed and `--allow` through the egress proxy (KP rows, not yet re-proven through the daemon, #858) is the only
+  network path.
 
 ---
 

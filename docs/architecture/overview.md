@@ -34,7 +34,7 @@ flowchart TD
   sup --> cred{"--credential?"}
   cred -- yes --> mint["mint_lease → stage token 0600<br/>(revoke at teardown)"]
   cred -- no --> egress
-  mint --> egress["egress bracket<br/>plan_egress_scoped + enforce"]
+  mint --> egress["egress proxy per run<br/>(allow-list over vsock, no NIC)"]
   egress --> run["VmBackend::run (Qemu | Vfkit)"]
   run --> stage["stage inputs/outputs/secrets → ShareSpec[]"]
   stage --> xport["GuestShareTransport<br/>virtiofsd (qemu) / virtio-fs (vfkit)"]
@@ -68,7 +68,6 @@ flowchart LR
   GuestShareTransport --> VirtioFsTransport["VirtioFsTransport (vfkit)"]
   CredentialProvider --> GithubAdapter
   CredentialProvider --> FakeProvider["FakeProvider (tests)"]
-  EgressApplier --> NftablesApplier["NftablesApplier (Linux)"]
   EgressApplier --> FakeApplier["FakeApplier (tests)"]
 ```
 
