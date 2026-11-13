@@ -1303,7 +1303,13 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             }
         }
-        Some(control_response::Result::Status(r)) => succeed_or(emit(&JobStatusReport::from(&r), output)),
+        Some(control_response::Result::Status(r)) => match JobStatusReport::from_response(&r) {
+            Ok(report) => succeed_or(emit(&report, output)),
+            Err(e) => {
+                eprintln!("sandy: sandyd sent a status reply with a result envelope that does not decode: {e}");
+                ProcessExit::InfraFault.code()
+            }
+        },
         Some(control_response::Result::List(r)) => succeed_or(emit(&JobSummaries::from(&r), output)),
         // The same report and spelling `sandy gc` prints, so the promotion of `daemon prune` to `gc` changes no format.
         Some(control_response::Result::Prune(r)) => succeed_or(emit(
