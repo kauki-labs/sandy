@@ -115,6 +115,34 @@ pub enum ResolvedTemplate {
     },
 }
 
+/// The reserved flake reference for sandy's own guest flake (`nix/guest`), the one a bare topology attr names (the
+/// owner ruling on #483: `sandy run topologies.<system>.<hypervisor>` keeps working). It is not a nix flake reference:
+/// the host that resolves a template swaps it for the guest flake that ships beside its own `nix/guest-wrapper`, so a
+/// submitter never sends a path of its own machine.
+pub const BUNDLED_GUEST_FLAKE: &str = "bundled:guest";
+
+/// `flake_ref` with [`BUNDLED_GUEST_FLAKE`] replaced by this host's bundled guest flake, found under `root` (the tree
+/// that holds `nix/guest-wrapper`, see [`guest_wrapper_root`]); any other reference is returned unchanged.
+///
+/// # Errors
+///
+/// An error naming `$SANDY_GUEST_WRAPPER` when the bundled flake is asked for and `root` does not hold
+/// `nix/guest/flake.nix`.
+pub fn resolve_bundled_flake(flake_ref: &str, root: impl FnOnce() -> Result<PathBuf>) -> Result<String> {
+    if flake_ref != BUNDLED_GUEST_FLAKE {
+        return Ok(flake_ref.to_owned());
+    }
+    let root = root()?;
+    let guest = root.join("nix/guest");
+    if !guest.join("flake.nix").is_file() {
+        bail!(
+            "the bundled guest flake is not at {} (set $SANDY_GUEST_WRAPPER to a tree that holds nix/guest)",
+            guest.display()
+        );
+    }
+    Ok(format!("path:{}", guest.display()))
+}
+
 /// Resolve `--flake <flake_ref>` (with optional `--kind`/`--attr` overrides,
 /// or `--from-devshell` for kind `devshell`, #326) into a [`ResolvedTemplate`],
 /// printing the kind it picked (or was told) to stderr before doing anything
@@ -153,6 +181,7 @@ pub fn resolve_flake_template(
     mac_prereq_check: impl FnOnce() -> Option<String>,
     deadline: Option<std::time::Instant>,
 ) -> Result<ResolvedTemplate> {
+    let flake_ref = &resolve_bundled_flake(flake_ref, guest_wrapper_root)?;
     let host = host_target();
     let (kind, resolved_attr) = if from_devshell {
         if kind.is_some() {
@@ -746,8 +775,9 @@ pub fn guest_wrapper_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostTarget, TemplateKind, attribute_missing, configuration_attrs, devshell_attrs, direct_topology_ref,
-        flake_ref_root_prefix, module_attrs, nix_subprocess_path_with, parse_kind, summarize_nix_error,
+        BUNDLED_GUEST_FLAKE, HostTarget, TemplateKind, attribute_missing, configuration_attrs, devshell_attrs,
+        direct_topology_ref, flake_ref_root_prefix, module_attrs, nix_subprocess_path_with, parse_kind,
+        resolve_bundled_flake, summarize_nix_error,
     };
 
     /// A non-git root (the packaged store-copy shape) gets an explicit
@@ -1030,5 +1060,37 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 200_000);
         Ok(())
+    }
+
+    /// The bundled guest flake resolves to `path:<root>/nix/guest` when the root ships it, and any other reference,
+    /// a `path:` one included, is left alone without asking for the root at all.
+    #[test]
+    fn the_bundled_guest_flake_resolves_under_the_guest_wrapper_root() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("nix/guest"))?;
+        std::fs::write(root.path().join("nix/guest/flake.nix"), "{}")?;
+        let want = format!("path:{}", root.path().join("nix/guest").display());
+        assert_eq!(
+            resolve_bundled_flake(BUNDLED_GUEST_FLAKE, || Ok(root.path().to_owned()))?,
+            want
+        );
+        for untouched in ["github:acme/guest", "./guest", "path:/srv/guest"] {
+            let got = resolve_bundled_flake(untouched, || anyhow::bail!("the root must not be asked for"))?;
+            assert_eq!(got, untouched);
+        }
+        Ok(())
+    }
+
+    /// A host whose tree does not ship the guest flake refuses the bundled reference naming the fix, not a nix error.
+    #[test]
+    fn a_root_without_the_guest_flake_refuses_the_bundled_reference_naming_the_fix() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let err = resolve_bundled_flake(BUNDLED_GUEST_FLAKE, || Ok(root.path().to_owned()))
+            .expect_err("no nix/guest/flake.nix under the root");
+        assert!(err.to_string().contains("SANDY_GUEST_WRAPPER"), "{err}");
+        assert!(err.to_string().contains("nix/guest"), "{err}");
+        let err = resolve_bundled_flake(BUNDLED_GUEST_FLAKE, || anyhow::bail!("no root"))
+            .expect_err("the root lookup failed");
+        assert!(err.to_string().contains("no root"), "{err}");
     }
 }

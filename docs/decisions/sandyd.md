@@ -1484,8 +1484,13 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   object shape available.
 - A3 (#483): the positional of `daemon submit` is a manifest file with `--manifest-encoding`, else a TEMPLATE, sent as a
   `flake/v1` manifest with kind `topology` (the executor adds its own system and hypervisor, so a submitter's host attr
-  never travels). A template that names an existing file or `-` is refused as a forgotten `--manifest-encoding`, and one
-  with a `#` is refused naming `--flake`. The plain flags apply to a template or `--flake` and are refused with a
+  never travels). A template that names an existing file or `-` is refused as a forgotten `--manifest-encoding`. What a
+  TEMPLATE names (owner ruling on #483): a bare `topologies.<system>.<hypervisor>` is a topology of sandy's own guest
+  flake, sent as the reserved reference `bundled:guest`, which the executor swaps for the `nix/guest` that ships beside
+  its own `nix/guest-wrapper` (a submitter never sends a path of its own machine); `REF#topologies.<system>.<hypervisor>`
+  is the flake `REF`; anything else with a `/` or `:` is a flake reference as typed. The system and hypervisor a user
+  typed are not sent, and the client says so on stderr. Any other `#` attr, an empty reference, and a bare word are
+  refused naming `topologies.<system>.<hypervisor>` and `--flake`. The plain flags apply to a template or `--flake` and are refused with a
   manifest file. `--from-devshell` is a `flake/v1` field (`from_devshell`, absent when false); an executor that predates
   it refuses the manifest naming the field.
 - A1 (#483): `sandy daemon submit --allow HOST:PORT` (repeatable) sends an egress policy, `SubmitRequest.egress`, copied

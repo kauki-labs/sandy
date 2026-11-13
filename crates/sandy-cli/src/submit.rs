@@ -39,7 +39,7 @@ pub struct PlainFlags {
 /// # Errors
 ///
 /// [`PlanError::Invalid`] for a template that names an existing file or `-` (a forgotten `--manifest-encoding`, never
-/// a silent flake lookup) and for one that holds a `#` (use `--flake`).
+/// a silent flake lookup).
 pub fn classify_positional<'a>(
     positional: &'a str,
     manifest_encoding: Option<&str>,
@@ -53,13 +53,73 @@ pub fn classify_positional<'a>(
             "`{positional}` looks like a manifest file; pass --manifest-encoding to submit it as one"
         )));
     }
-    if positional.contains('#') {
-        return Err(PlanError::Invalid(format!(
-            "template `{positional}` has a `#`: a template is a flake reference, not a full attr; use --flake (with \
-             --kind) for one"
-        )));
-    }
     Ok(Positional::Template(positional))
+}
+
+/// What a TEMPLATE names, as the `flake` of a `flake/v1` manifest with kind `topology`, and a note for the user when
+/// part of what they typed is not sent (owner ruling on #483):
+///
+/// - a bare `topologies.<system>.<hypervisor>` names a topology of sandy's own guest flake
+///   ([`sandy_guest_template::BUNDLED_GUEST_FLAKE`]);
+/// - `REF#topologies.<system>.<hypervisor>` is the flake `REF`;
+/// - anything with a `/` and no `#` is a flake reference as typed.
+///
+/// The executor adds its own system and hypervisor, so the `<system>.<hypervisor>` a user typed is not sent; the note
+/// says so, so a request for another architecture is never ignored silently.
+///
+/// # Errors
+///
+/// [`PlanError::Invalid`] for a `#` attr that is not a `topologies.<system>.<hypervisor>` (use `--flake` with
+/// `--kind`/`--attr`), an empty reference before the `#`, and a bare word that is neither a topology attr nor a
+/// reference.
+pub fn template_source(template: &str) -> Result<(String, Option<String>), PlanError> {
+    let refuse = |why: String| {
+        PlanError::Invalid(format!(
+            "template `{template}`: {why}; a template is `topologies.<system>.<hypervisor>` or a flake reference (use \
+             --flake with --kind/--attr for another attr)"
+        ))
+    };
+    let note = |flake: &str| {
+        format!(
+            "sandy: note: `{template}` names a topology of {flake}, but the executor picks its own system and \
+             hypervisor, so those parts are not sent"
+        )
+    };
+    if let Some((reference, attr)) = template.split_once('#') {
+        if reference.is_empty() {
+            return Err(refuse("the flake reference before the `#` is empty".to_owned()));
+        }
+        if !is_topology_attr(attr) {
+            return Err(refuse(format!("`{attr}` is not a topology attr")));
+        }
+        return Ok((reference.to_owned(), Some(note(reference))));
+    }
+    if is_topology_attr(template) {
+        let bundled = sandy_guest_template::BUNDLED_GUEST_FLAKE;
+        return Ok((bundled.to_owned(), Some(note("sandy's guest flake"))));
+    }
+    if template.starts_with("topologies.") {
+        return Err(refuse(
+            "a topology attr has exactly a system and a hypervisor".to_owned(),
+        ));
+    }
+    if template.contains(['/', ':']) || template == "." {
+        return Ok((template.to_owned(), None));
+    }
+    Err(refuse("it is neither a topology attr nor a flake reference".to_owned()))
+}
+
+/// Whether `attr` is `topologies.<system>.<hypervisor>`: three non-empty dot-separated parts without spaces.
+fn is_topology_attr(attr: &str) -> bool {
+    let mut parts = attr.split('.');
+    parts.next() == Some("topologies")
+        && parts
+            .by_ref()
+            .take(2)
+            .filter(|p| !p.is_empty() && !p.contains(char::is_whitespace))
+            .count()
+            == 2
+        && parts.next().is_none()
 }
 
 /// The `flake/v1` manifest for a flake reference.
@@ -145,13 +205,12 @@ mod tests {
         }
     }
 
+    /// A `#` is part of a template now (ruling on #483): the positional classifies as a template and
+    /// [`template_source`] decides what it names.
     #[test]
-    fn a_template_with_a_hash_is_refused_naming_flake() {
-        let text = classify_positional("./g#topologies.x86_64-linux.qemu", None, |_| false)
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(text.contains("--flake"), "{text}");
+    fn a_template_with_a_hash_classifies_as_a_template() {
+        let got = classify_positional("./g#topologies.x86_64-linux.qemu", None, |_| false);
+        assert_eq!(got, Ok(Positional::Template("./g#topologies.x86_64-linux.qemu")));
     }
 
     #[test]
@@ -294,5 +353,58 @@ mod tests {
             ..plain()
         };
         assert!(template_manifest("t", flags).is_err());
+    }
+
+    /// Owner ruling on #483: a bare topology attr names sandy's own guest flake; `REF#topologies.<s>.<h>` is `REF`;
+    /// a reference with a `/` is sent as typed. Whatever the user typed for system and hypervisor is not sent, and the
+    /// note says the executor picks its own.
+    #[test]
+    fn a_template_names_a_flake_by_the_rulings_three_forms() -> anyhow::Result<()> {
+        let bundled = sandy_guest_template::BUNDLED_GUEST_FLAKE;
+        let rows: [(&str, &str, bool); 5] = [
+            ("topologies.aarch64-linux.vfkit", bundled, true),
+            ("topologies.x86_64-linux.qemu", bundled, true),
+            ("./guest#topologies.x86_64-linux.qemu", "./guest", true),
+            (
+                "github:acme/guest#topologies.aarch64-linux.vfkit",
+                "github:acme/guest",
+                true,
+            ),
+            ("github:acme/guest", "github:acme/guest", false),
+        ];
+        for (template, flake, noted) in rows {
+            let (got, note) = template_source(template).map_err(|e| anyhow::anyhow!("{template}: {e}"))?;
+            assert_eq!(got, flake, "{template}");
+            assert_eq!(note.is_some(), noted, "{template}: note {note:?}");
+            if let Some(note) = note {
+                assert!(note.contains("its own system and hypervisor"), "{template}: {note}");
+            }
+        }
+        assert_eq!(
+            template_source("./guest")?.0,
+            "./guest",
+            "a path with a slash is a reference"
+        );
+        Ok(())
+    }
+
+    /// What is neither of those forms is refused with a message that names what would work, never guessed.
+    #[test]
+    fn a_template_that_is_neither_a_topology_attr_nor_a_reference_is_refused() {
+        for bad in [
+            "nixpkgs",
+            "topologies.x86_64-linux",
+            "topologies..qemu",
+            "topologies.a.b.c",
+            "./guest#nixosConfigurations.dev",
+            "#topologies.x86_64-linux.qemu",
+        ] {
+            let text = template_source(bad).err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(!text.is_empty(), "{bad} must be refused");
+            assert!(
+                text.contains("topologies.<system>.<hypervisor>") && text.contains("--flake"),
+                "{bad}: {text}"
+            );
+        }
     }
 }
