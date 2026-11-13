@@ -705,6 +705,8 @@ async fn finish_job(
         crate::envelope::bound_egress_reason(&mut envelope, |reason| {
             redact_console(credentials.as_deref(), &jid, reason)
         });
+        // Last: whatever the parts add up to, the stored envelope stays inside the budget.
+        crate::envelope::enforce_size(&mut envelope);
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;

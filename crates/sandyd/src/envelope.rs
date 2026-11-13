@@ -381,6 +381,52 @@ pub(crate) fn bound_egress_reason(envelope: &mut ResultEnvelope, redact: impl Fn
     }
 }
 
+/// The most bytes the stored envelope may serialize to. A `Status` reply carries the envelope beside the console tail
+/// (up to `MAX_CONSOLE_BYTES`) in one 1 MiB frame, so this leaves a wide margin however the executor-controlled parts
+/// (the log tail, the message, the egress reason, the output listing and the digest lists, all escaped at up to six
+/// bytes a byte) add up.
+pub(crate) const MAX_ENVELOPE_BYTES: usize = 512 * 1024;
+
+fn serialized_len(envelope: &ResultEnvelope) -> usize {
+    serde_json::to_vec(envelope).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// Keep the finished envelope inside [`MAX_ENVELOPE_BYTES`] by shedding what a hostile executor can inflate, least
+/// valuable first, and saying so in a warning: the digest lists and the output hashes, then the output listing, then
+/// the log tail. The per-part bounds usually keep it under without this; it is the guarantee when they do not.
+pub(crate) fn enforce_size(envelope: &mut ResultEnvelope) {
+    if serialized_len(envelope) <= MAX_ENVELOPE_BYTES {
+        return;
+    }
+    if let Some(receipt) = envelope.receipt.as_mut() {
+        receipt.host_observed.input_digests = None;
+        receipt.guest_reported.skipped_outputs.clear();
+        for output in &mut receipt.guest_reported.outputs {
+            output.sha256 = None;
+        }
+    }
+    envelope
+        .warnings
+        .push("envelope: the digests were dropped to keep the result inside one frame".to_owned());
+    if serialized_len(envelope) <= MAX_ENVELOPE_BYTES {
+        return;
+    }
+    envelope.outputs.clear();
+    if let Some(receipt) = envelope.receipt.as_mut() {
+        receipt.guest_reported.outputs.clear();
+    }
+    envelope
+        .warnings
+        .push("envelope: the output listing was dropped to keep the result inside one frame".to_owned());
+    if serialized_len(envelope) <= MAX_ENVELOPE_BYTES {
+        return;
+    }
+    envelope.logs.tail = tail(&envelope.logs.tail, 16 * 1024).to_owned();
+    envelope
+        .warnings
+        .push("envelope: the log tail was cut to keep the result inside one frame".to_owned());
+}
+
 /// The envelope for a job cancelled before a terminal guest result: the shape the direct `kill` writes (status
 /// `Cancelled`, not retryable, no exit, no receipt: no backend run was observed).
 pub(crate) fn cancelled(job_id: &str) -> ResultEnvelope {
