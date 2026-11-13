@@ -12,24 +12,17 @@ use crate::doctor::DoctorResult;
 
 /// Why the host list could not be had. The two arms send the operator different ways: start `sandyd`, or look at the
 /// one that is running.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ListHostsError {
     /// Nothing usable answered: the socket could not be connected, the call failed, or the daemon did not answer in
     /// time.
+    #[error("{0}")]
     Unreachable(String),
     /// A daemon answered, but with an error or with a reply of another kind (an older `sandyd` does not know
     /// `ListHosts`).
+    #[error("{0}")]
     Refused(String),
 }
-
-impl std::fmt::Display for ListHostsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::Unreachable(why) | Self::Refused(why)) = self;
-        f.write_str(why)
-    }
-}
-
-impl std::error::Error for ListHostsError {}
 
 /// Ask the `sandyd` on `socket` for its connected host-executors, within `bound` for the whole exchange.
 ///
