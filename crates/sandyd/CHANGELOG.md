@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.2...sandyd-v0.2.3) - 2026-11-13
+
+### Added
+
+- _(cli)_ doctor refuses without a sandyd or an executor, docs for the daemon-backed verbs (refs #483) ([#861](https://github.com/kauki-labs/sandy/pull/861))
+- _(cli)_ run, ls, status, wait, kill and gc are daemon-backed (refs #483) ([#860](https://github.com/kauki-labs/sandy/pull/860))
+- _(cli)_ the doctor's check of sandyd and its executors (refs #483) ([#857](https://github.com/kauki-labs/sandy/pull/857))
+- _(sandyd)_ ListHosts lists the connected executors (refs #483) ([#854](https://github.com/kauki-labs/sandy/pull/854))
+- _(sandyd)_ revoke the credentials a dead daemon left, at the next start and on offline cancel (refs #830) ([#847](https://github.com/kauki-labs/sandy/pull/847))
+- _(sandyd)_ fail the jobs a killed daemon left open at the next start (refs #830) ([#844](https://github.com/kauki-labs/sandy/pull/844))
+- _(host-executor,sandyd,cli)_ digests over the daemon, hashed by the executor and recorded in the receipt (refs #483) ([#840](https://github.com/kauki-labs/sandy/pull/840))
+- _(proto)_ digest fields on SubmitRequest, Dispatch, Capabilities and JobResult, wire only (refs #483) ([#839](https://github.com/kauki-labs/sandy/pull/839))
+- _(sandyd)_ the daemon's envelope lists the outputs left at the declared destinations (refs #483) ([#837](https://github.com/kauki-labs/sandy/pull/837))
+- _(host-executor,sandyd)_ the executor reports its egress outcome and the envelope receipt reads it (refs #483) ([#835](https://github.com/kauki-labs/sandy/pull/835))
+- _(sandyd,cli)_ daemon prune, the gc equivalent over the control RPC (refs #483) ([#832](https://github.com/kauki-labs/sandy/pull/832))
+- _(sandyd)_ a terminal job records and serves the result envelope (refs #483) ([#828](https://github.com/kauki-labs/sandy/pull/828))
+- _(sandyd)_ cap the inputs and outputs one Submit may declare (slice 7 of #482) ([#826](https://github.com/kauki-labs/sandy/pull/826))
+- _(sandyd,host-executor,cli)_ daemon submit --allow, placed on an egress_proxy host and applied by the executor (refs #483) ([#818](https://github.com/kauki-labs/sandy/pull/818))
+- _(sandyd)_ refuse an unsafe input or output name at Submit ([#822](https://github.com/kauki-labs/sandy/pull/822))
+- _(sandyd)_ place a job with inputs or outputs on a host that declares transfer ([#825](https://github.com/kauki-labs/sandy/pull/825))
+- _(cli)_ daemon submit takes a TEMPLATE, --from-devshell and the plain flags without --flake (refs #483) ([#813](https://github.com/kauki-labs/sandy/pull/813))
+- _(sandyd)_ the driver deletes an ephemeral environment when its TTL runs out (refs #812) ([#821](https://github.com/kauki-labs/sandy/pull/821))
+- _(proto)_ EgressPolicy on SubmitRequest and Dispatch, an egress_proxy capability, wire only (refs #360) ([#816](https://github.com/kauki-labs/sandy/pull/816))
+- _(sandyd)_ receive a job's outputs over the data link and record the job once they are in place (refs #482) ([#805](https://github.com/kauki-labs/sandy/pull/805))
+- _(sandyd)_ receive a host's outputs beneath their destinations (refs #482) ([#778](https://github.com/kauki-labs/sandy/pull/778))
+- _(sandyd)_ send a job's inputs over the claimed data link (refs #482) ([#768](https://github.com/kauki-labs/sandy/pull/768))
+- _(sandyd)_ a second per-job data link, minted at dispatch and demuxed by token (refs #482) ([#752](https://github.com/kauki-labs/sandy/pull/752))
+- _(executor-proto)_ Dispatch.data_link_token and JobResult.outputs_follow, wire only (refs #482) ([#751](https://github.com/kauki-labs/sandy/pull/751))
+- _(sandyd)_ SANDY_ENV_VM_HOST_CHECK picks the host readiness check, connect for a non-HTTP service ([#732](https://github.com/kauki-labs/sandy/pull/732)) ([#748](https://github.com/kauki-labs/sandy/pull/748))
+
+### Fixed
+
+- _(sandyd)_ an input digest must belong to a declared input and each path is reported once ([#845](https://github.com/kauki-labs/sandy/pull/845))
+- _(sandy,sandyd)_ the output listing's walk stops at the cap (fixes #838) ([#843](https://github.com/kauki-labs/sandy/pull/843))
+- _(sandyd)_ a result that never booted is not Succeeded, whatever its exit code (fixes #829) ([#831](https://github.com/kauki-labs/sandy/pull/831))
+- _(sandyd)_ bound the input send by a read timeout and the job's end ([#824](https://github.com/kauki-labs/sandy/pull/824))
+- _(sandyd)_ the input sender validates wire names and refuses duplicate declared names ([#809](https://github.com/kauki-labs/sandy/pull/809))
+- _(sandyd)_ release a job's credential when its result arrives, not when its outputs settle (fixes #481) ([#808](https://github.com/kauki-labs/sandy/pull/808))
+- _(sandyd)_ sweep the stale .sandy-recv-* temp files of dead processes (fixes #782) ([#801](https://github.com/kauki-labs/sandy/pull/801))
+- _(fsutil,sandyd)_ refuse a rename onto a file the receive completed, decided by file identity (fixes #787) ([#798](https://github.com/kauki-labs/sandy/pull/798))
+- _(sandyd)_ a failed flush removes the file first; the temp-name retry counts per file (fixes #793) ([#796](https://github.com/kauki-labs/sandy/pull/796))
+- _(sandyd)_ the output receive remembers entries by a fixed-size key (fixes #780) ([#795](https://github.com/kauki-labs/sandy/pull/795))
+- _(sandyd)_ run the output receive's filesystem work on the blocking pool (fixes #779) ([#792](https://github.com/kauki-labs/sandy/pull/792))
+- _(sandyd)_ bound the whole output receive in time and in frames (fixes #781) ([#790](https://github.com/kauki-labs/sandy/pull/790))
+- _(sandyd)_ escape the peer-chosen path in a write error (fixes #786) ([#789](https://github.com/kauki-labs/sandy/pull/789))
+
+### Other
+
+- _(vm)_ remove the guest NIC profile (refs #483) ([#864](https://github.com/kauki-labs/sandy/pull/864))
+- _(cli)_ delete the direct execution path and the Journal (refs #483, #221) ([#863](https://github.com/kauki-labs/sandy/pull/863))
+- _(sandyd)_ the crate doc says what the daemon does now (refs #205) ([#853](https://github.com/kauki-labs/sandy/pull/853))
+- _(sandyd)_ a named file output equals the locally collected file; an ancestor symlink is followed (refs #783, #784) ([#800](https://github.com/kauki-labs/sandy/pull/800))
+- _(t3)_ replace the T3 guest with a generic service guest (part 2 of 3) ([#777](https://github.com/kauki-labs/sandy/pull/777))
+- _(t3)_ strip T3 names from crates/impls code (part 1 of 3) ([#766](https://github.com/kauki-labs/sandy/pull/766))
+
 ## [0.2.2](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.1...sandyd-v0.2.2) - 2026-11-10
 
 ### Added
