@@ -1504,6 +1504,13 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   `sandy::build_egress_receipt`, pairing `PROXIED` with the allow-list it dispatched. No report, or an unspecified one,
   is `Unenforced` with the reason that the executor reported nothing: the receipt never says applied without a report.
   A run that failed to start returns an error and no report.
+- A4 (#483): `sandy daemon prune [--keep-last N]` (default 20) is `sandy gc` for the daemon: the `Prune` control RPC
+  deletes the terminal rows (succeeded, failed, cancelled) except the newest N, newest by creation time then insertion
+  order, and sweeps stale `cred-*` and `verify-*` dirs past `MAX_TTL_SECS` under the daemon host's sandy staging base. A
+  pending or running job is never deleted and does not count toward N. A deleted row takes its stored result envelope
+  with it. The report is `gc`'s (`evicted`, `swept_staging_dirs`), so promoting the verb to `gc` changes no format. Prune
+  is an operator verb over the 0700 socket, the same trust as `list`; it needs no attach token because it touches no
+  running job. A credential provider configured with another staging base is not swept.
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's

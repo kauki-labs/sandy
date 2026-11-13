@@ -13,8 +13,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use sandy_control_proto::{
     AttachResponse, CancelResponse, ControlError, ControlRequest, ControlResponse, JobStatus,
-    JobSummary as WireJobSummary, ListResponse, StatusResponse, SubmitRequest, SubmitResponse, control_request,
-    control_response,
+    JobSummary as WireJobSummary, ListResponse, PruneResponse, StatusResponse, SubmitRequest, SubmitResponse,
+    control_request, control_response,
 };
 use sandy_executor_proto::{Dispatch, IsolationClass, SandboxKind};
 use sandy_fabric::{
@@ -1299,6 +1299,22 @@ pub async fn handle(
                     .collect(),
             })
         }
+        Some(control_request::Op::Prune(prune)) => {
+            let store = Arc::clone(store);
+            let keep_last = usize::try_from(prune.keep_last).unwrap_or(usize::MAX);
+            let evicted = tokio::task::spawn_blocking(move || store.prune_terminal(keep_last)).await??;
+            let swept_staging_dirs = tokio::task::spawn_blocking(sweep_stale_staging_dirs).await?;
+            tracing::info!(
+                evicted = evicted.len(),
+                swept = swept_staging_dirs.len(),
+                keep_last,
+                "pruned terminal jobs"
+            );
+            control_response::Result::Prune(PruneResponse {
+                evicted,
+                swept_staging_dirs,
+            })
+        }
         // Environment operations are routed to `crate::environment` by
         // `serve_connection` before this function is called.
         Some(
@@ -1320,6 +1336,25 @@ pub async fn handle(
     Ok(ControlResponse {
         request_id: request.request_id,
         result: Some(result),
+    })
+}
+
+/// Remove the stale `cred-*` and `verify-*` dirs under the sandy staging base, the sweep `sandy gc` runs (#195). A dir
+/// younger than the longest credential TTL is never touched. Best effort: a failure is logged and sweeps nothing.
+fn sweep_stale_staging_dirs() -> Vec<String> {
+    let swept = sandy_fsutil::ensure_sandy_staging_base()
+        .map_err(|e| e.to_string())
+        .and_then(|base| {
+            sandy_fsutil::sweep_stale_staging_dirs(
+                &base,
+                sandy_fsutil::STALE_STAGING_PREFIXES,
+                std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+            )
+            .map_err(|e| e.to_string())
+        });
+    swept.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "prune: could not sweep stale credential staging dirs");
+        Vec::new()
     })
 }
 
@@ -1358,7 +1393,9 @@ fn attach_tokens_match(stored: &[u8], presented: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use sandy_control_proto::{AttachRequest, CancelRequest, JobStatus, ListRequest, StatusRequest, SubmitRequest};
+    use sandy_control_proto::{
+        AttachRequest, CancelRequest, JobStatus, ListRequest, PruneRequest, StatusRequest, SubmitRequest,
+    };
     use sandy_fabric::{
         capauth::{CapAuthority, CapRights, CapScope},
         types::{ChannelId, PeerId},
@@ -2535,6 +2572,39 @@ mod tests {
             }
             other => anyhow::bail!("expected a List response, got {other:?}"),
         }
+        Ok(())
+    }
+
+    /// A4 of #483: a Prune over the control RPC deletes the oldest terminal jobs past `keep_last`, returns their ids,
+    /// spares a running job, and leaves a following List without the deleted rows. Applying it twice finds nothing.
+    #[tokio::test]
+    async fn a_prune_deletes_old_terminal_jobs_and_spares_a_running_one() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        for id in ["old", "mid", "new"] {
+            store.insert_pending(id, b"m", "argv/v1")?;
+            store.finish(id, JobStatus::Succeeded, Some(0), "")?;
+        }
+        store.insert_pending("live", b"m", "argv/v1")?;
+        store.mark_running("live")?;
+        let prune = |id: u64, keep_last: u32| req(id, control_request::Op::Prune(PruneRequest { keep_last }));
+
+        let first = handle(&store, &registry, &host_registry, None, test_session(), prune(1, 1)).await?;
+        match first.result {
+            Some(control_response::Result::Prune(r)) => {
+                let mut evicted = r.evicted;
+                evicted.sort();
+                assert_eq!(evicted, ["mid", "old"]);
+            }
+            other => anyhow::bail!("expected a Prune response, got {other:?}"),
+        }
+        let again = handle(&store, &registry, &host_registry, None, test_session(), prune(2, 1)).await?;
+        match again.result {
+            Some(control_response::Result::Prune(r)) => assert!(r.evicted.is_empty(), "got {:?}", r.evicted),
+            other => anyhow::bail!("expected a Prune response, got {other:?}"),
+        }
+        let mut left: Vec<String> = store.list()?.into_iter().map(|s| s.job_id).collect();
+        left.sort();
+        assert_eq!(left, ["live", "new"]);
         Ok(())
     }
 

@@ -31,7 +31,8 @@ pub mod v1 {
 pub use v1::{
     AttachRequest, AttachResponse, CancelRequest, CancelResponse, ControlError, ControlRequest, ControlResponse,
     EgressPolicy, EgressRule, Input, IsolationClass, JobStatus, JobSummary, ListRequest, ListResponse, Output,
-    SecretRef, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse, control_request, control_response,
+    PruneRequest, PruneResponse, SecretRef, StatusRequest, StatusResponse, SubmitRequest, SubmitResponse,
+    control_request, control_response,
 };
 
 pub mod client;

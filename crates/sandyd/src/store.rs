@@ -577,6 +577,39 @@ impl JobStore {
         }
         Ok(summaries)
     }
+
+    /// Delete the terminal rows except the `keep_last` newest, and return the deleted ids (A4 of #483, the `sandy gc`
+    /// policy). A `Pending` or `Running` row is never deleted and does not count toward `keep_last`. Newest is by
+    /// creation time, then by insertion order, since `created_at` is whole seconds.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read or a delete fails; nothing is deleted then.
+    pub fn prune_terminal(&self, keep_last: usize) -> Result<Vec<String>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let evicted: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT job_id FROM jobs WHERE status IN (?1, ?2, ?3) ORDER BY created_at DESC, rowid DESC LIMIT -1 \
+                 OFFSET ?4",
+            )?;
+            let offset = i64::try_from(keep_last).unwrap_or(i64::MAX);
+            stmt.query_map(
+                (
+                    status_name(JobStatus::Succeeded),
+                    status_name(JobStatus::Failed),
+                    status_name(JobStatus::Cancelled),
+                    offset,
+                ),
+                |row| row.get(0),
+            )?
+            .collect::<Result<_, _>>()?
+        };
+        for id in &evicted {
+            tx.execute("DELETE FROM jobs WHERE job_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(evicted)
+    }
 }
 
 /// `SELECT status FROM jobs WHERE job_id = ?1`, parsed, or `None` if no such
@@ -648,6 +681,70 @@ mod tests {
                 status: JobStatus::Pending,
             }]
         );
+        Ok(())
+    }
+
+    /// A4 of #483: prune deletes the oldest terminal rows past `keep_last`, in every terminal status, and returns the
+    /// ids it deleted. Pending and Running rows survive and do not count toward `keep_last`.
+    #[test]
+    fn prune_keeps_the_newest_terminal_rows_and_every_live_one() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        for (id, end) in [
+            ("old-ok", Some(JobStatus::Succeeded)),
+            ("old-failed", Some(JobStatus::Failed)),
+            ("running", None),
+            ("mid-cancelled", Some(JobStatus::Cancelled)),
+            ("new-ok", Some(JobStatus::Succeeded)),
+            ("pending", Some(JobStatus::Pending)),
+        ] {
+            store.insert_pending(id, b"m", "argv/v1")?;
+            match end {
+                None => {
+                    store.mark_running(id)?;
+                }
+                Some(JobStatus::Pending) => {}
+                Some(status) => {
+                    store.finish(id, status, Some(0), "")?;
+                }
+            }
+        }
+
+        let mut evicted = store.prune_terminal(2)?;
+        evicted.sort();
+
+        assert_eq!(evicted, ["old-failed", "old-ok"]);
+        let mut left: Vec<String> = store.list()?.into_iter().map(|s| s.job_id).collect();
+        left.sort();
+        assert_eq!(left, ["mid-cancelled", "new-ok", "pending", "running"]);
+        Ok(())
+    }
+
+    /// `keep_last = 0` deletes every terminal row and still spares the live ones; a second prune finds nothing.
+    #[test]
+    fn prune_with_zero_deletes_all_terminal_rows_and_is_idempotent() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("done", b"m", "argv/v1")?;
+        store.finish("done", JobStatus::Failed, Some(1), "")?;
+        store.insert_pending("live", b"m", "argv/v1")?;
+        store.mark_running("live")?;
+
+        assert_eq!(store.prune_terminal(0)?, ["done"]);
+        assert_eq!(store.prune_terminal(0)?, Vec::<String>::new());
+        assert_eq!(store.status("live")?, Some(JobStatus::Running));
+        assert_eq!(store.status("done")?, None);
+        Ok(())
+    }
+
+    /// `keep_last` at or above the number of terminal rows deletes nothing.
+    #[test]
+    fn prune_with_a_large_keep_last_deletes_nothing() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("done", b"m", "argv/v1")?;
+        store.finish("done", JobStatus::Succeeded, Some(0), "")?;
+
+        assert_eq!(store.prune_terminal(1)?, Vec::<String>::new());
+        assert_eq!(store.prune_terminal(usize::MAX)?, Vec::<String>::new());
+        assert_eq!(store.status("done")?, Some(JobStatus::Succeeded));
         Ok(())
     }
 

@@ -30,6 +30,8 @@ message ControlRequest {
     AttachRequest attach = 12;
     StatusRequest status = 13;
     ListRequest list = 14;
+    // Delete terminal job rows past the newest `keep_last`: the daemon's `sandy gc` (A4 of #483).
+    PruneRequest prune = 15;
     // Environment operations (#587, slice A2). Served by sandyd's environment
     // handler, separate from the job operations above.
     CreateEnvironmentRequest create_environment = 20;
@@ -57,6 +59,7 @@ message ControlResponse {
     StatusResponse status = 13;
     ListResponse list = 14;
     ControlError error = 15;
+    PruneResponse prune = 16;
     EnvironmentResponse environment = 20;
     ListEnvironmentsResponse environments = 21;
     // A typed refusal of an environment operation. Kept apart from
@@ -271,6 +274,20 @@ message JobSummary {
 
 message ListResponse {
   repeated JobSummary jobs = 1;
+}
+
+// Delete the terminal jobs (succeeded, failed, cancelled) except the newest `keep_last`, then sweep stale credential
+// staging dirs on the daemon's host (A4 of #483, the policy `sandy gc` had). A pending or running job is never deleted
+// and does not count toward `keep_last`. The job's stored result envelope goes with its row.
+message PruneRequest {
+  uint32 keep_last = 1;
+}
+
+message PruneResponse {
+  // The ids of the deleted job rows.
+  repeated string evicted = 1;
+  // The names of the stale staging dirs the sweep removed.
+  repeated string swept_staging_dirs = 2;
 }
 
 // A control-plane failure: the request was understood but could not be

@@ -24,7 +24,8 @@ use sandy_cli::{
     supervisor,
 };
 use sandy_control_proto::{
-    AttachRequest, CancelRequest, ListRequest, StatusRequest, SubmitRequest, control_request, control_response,
+    AttachRequest, CancelRequest, ListRequest, PruneRequest, StatusRequest, SubmitRequest, control_request,
+    control_response,
 };
 
 /// Command-line surface for `sandy`.
@@ -343,6 +344,13 @@ enum DaemonOp {
     },
     /// List every job `sandyd` knows about.
     List,
+    /// Delete terminal jobs from `sandyd`'s store (keeping the newest N) and sweep stale credential staging dirs
+    /// past their mint TTL: `sandy gc` for the daemon. A running or pending job is never deleted.
+    Prune {
+        /// How many terminal jobs to keep (newest first).
+        #[arg(long, default_value_t = 20)]
+        keep_last: usize,
+    },
 }
 
 /// `sandy mesh <op>`: today, only a node's TLS identity key (decision 20).
@@ -1179,6 +1187,9 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         }
         DaemonOp::Status { job_id } => control_request::Op::Status(StatusRequest { job_id }),
         DaemonOp::List => control_request::Op::List(ListRequest {}),
+        DaemonOp::Prune { keep_last } => control_request::Op::Prune(PruneRequest {
+            keep_last: u32::try_from(keep_last).unwrap_or(u32::MAX),
+        }),
     };
 
     let response = match sandy_control_proto::client::call(&mut stream, 1, request_op).await {
@@ -1287,6 +1298,14 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
         }
         Some(control_response::Result::Status(r)) => succeed_or(emit(&JobStatusReport::from(&r), output)),
         Some(control_response::Result::List(r)) => succeed_or(emit(&JobSummaries::from(&r), output)),
+        // The same report and spelling `sandy gc` prints, so the promotion of `daemon prune` to `gc` changes no format.
+        Some(control_response::Result::Prune(r)) => succeed_or(emit(
+            &supervisor::GcReport {
+                evicted: r.evicted,
+                swept_staging_dirs: r.swept_staging_dirs,
+            },
+            output,
+        )),
         // The daemon understood the request but could not honour it (unknown
         // job id, not yet dispatchable, …): the request itself is the fault,
         // the same InvalidPlan band `run` uses for an unbootable plan.
