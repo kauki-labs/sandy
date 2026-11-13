@@ -14,6 +14,10 @@
 use std::{io::Write as _, process::Command};
 
 use anyhow::Context;
+use sandy_control_proto::{
+    ControlRequest, ControlResponse, HostSummary, IsolationClass, ListHostsResponse, control_response, read_frame,
+    write_frame,
+};
 
 /// Strip any `PATH` entry containing a real `nix` binary, then prepend a fresh
 /// temp dir holding a placeholder `nix` file. `nix_on_path` (src/doctor.rs)
@@ -58,29 +62,79 @@ fn machines_file_for_this_arch() -> anyhow::Result<tempfile::NamedTempFile> {
     Ok(file)
 }
 
-#[test]
-fn doctor_exits_0_for_a_local_temp_dir_sandy_home() -> anyhow::Result<()> {
-    let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
+/// A fake `sandyd` that answers every `ListHosts` with `hosts`, on a socket under `dir`. Serves from its own thread
+/// until the test process ends.
+fn fake_sandyd(dir: &std::path::Path, hosts: Vec<HostSummary>) -> anyhow::Result<std::path::PathBuf> {
+    let sock = dir.join("sandyd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).context("bind the fake sandyd")?;
+    listener.set_nonblocking(true).context("nonblocking")?;
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            let Ok(listener) = tokio::net::UnixListener::from_std(listener) else {
+                return;
+            };
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let hosts = hosts.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(request)) = read_frame::<ControlRequest>(&mut stream).await {
+                        let reply = ControlResponse {
+                            request_id: request.request_id,
+                            result: Some(control_response::Result::Hosts(ListHostsResponse {
+                                hosts: hosts.clone(),
+                            })),
+                        };
+                        if write_frame(&mut stream, &reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    });
+    Ok(sock)
+}
 
+fn executor(id: &str) -> HostSummary {
+    HostSummary {
+        host_id: id.to_owned(),
+        sandbox_kinds: vec!["vm".to_owned()],
+        isolation_classes: vec![i32::from(IsolationClass::Untrusted)],
+        arch: std::env::consts::ARCH.to_owned(),
+    }
+}
+
+/// `sandy doctor` against `$SANDY_HOME` `home` and the control socket `sock`. On macOS it also injects a fake `nix` and
+/// a matching remote builder, so the host-prerequisite half does not depend on the sandbox's real nix install (#163).
+/// The guards keep those temp files alive through the run.
+fn run_doctor(
+    home: &std::path::Path,
+    sock: &std::path::Path,
+) -> anyhow::Result<(std::process::Output, Vec<Box<dyn std::any::Any>>)> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sandy"));
-    command.arg("doctor").env("SANDY_HOME", home.path());
-
-    // macOS additionally gates on nix + a matching remote builder; inject both
-    // so this fs-locality test doesn't depend on the sandbox's real nix
-    // install (#163). The guards keep the temp files alive through `.output()`.
-    let _path_guard;
-    let _machines_guard;
+    command.arg("doctor").env("SANDY_HOME", home).env("SANDY_SOCK", sock);
+    let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
     if cfg!(target_os = "macos") {
         let (path, path_dir) = fake_nix_path()?;
         let machines = machines_file_for_this_arch()?;
         command
             .env("PATH", path)
             .env("SANDY_NIX_MACHINES_FILE", machines.path());
-        _path_guard = path_dir;
-        _machines_guard = machines;
+        guards.push(Box::new(path_dir));
+        guards.push(Box::new(machines));
     }
-
     let output = command.output().context("running `sandy doctor`")?;
+    Ok((output, guards))
+}
+
+#[test]
+fn doctor_exits_0_for_a_local_temp_dir_sandy_home() -> anyhow::Result<()> {
+    let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
+    let sock = fake_sandyd(home.path(), vec![executor("exec-1")])?;
+
+    let (output, _guards) = run_doctor(home.path(), &sock)?;
 
     assert_eq!(
         output.status.code(),
@@ -89,6 +143,38 @@ fn doctor_exits_0_for_a_local_temp_dir_sandy_home() -> anyhow::Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("exec-1"), "the registered executor is listed: {stdout}");
+    Ok(())
+}
+
+/// With no `sandyd` on the control socket, doctor refuses (exit 2): the verbs are the daemon's, so a missing daemon is
+/// a failed precondition, named with the socket and the fix (#483).
+#[test]
+fn doctor_refuses_when_no_daemon_answers() -> anyhow::Result<()> {
+    let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
+    let sock = home.path().join("nobody-home.sock");
+
+    let (output, _guards) = run_doctor(home.path(), &sock)?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("nobody-home.sock"), "names the socket: {stderr}");
+    assert!(stderr.contains("start `sandyd`"), "names the fix: {stderr}");
+    Ok(())
+}
+
+/// A daemon with no executor registered is up but cannot place a job: refused (exit 2), naming the executor to start.
+#[test]
+fn doctor_refuses_a_daemon_with_no_executor() -> anyhow::Result<()> {
+    let home = tempfile::tempdir().context("creating a temp SANDY_HOME")?;
+    let sock = fake_sandyd(home.path(), Vec::new())?;
+
+    let (output, _guards) = run_doctor(home.path(), &sock)?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("sandy-host-executor"), "names the fix: {stderr}");
     Ok(())
 }
 
