@@ -325,6 +325,11 @@ enum DaemonOp {
         /// policy.
         #[arg(long = "allow")]
         allow: Vec<String>,
+        /// Record a sha256 of each staged input and each collected output in the result envelope, as `sandy run
+        /// --digests` (#373, A2c of #483). Needs a host-executor that declared `digests`; `sandyd` refuses the Submit
+        /// otherwise.
+        #[arg(long)]
+        digests: bool,
     },
     /// Cancel a submitted job.
     Cancel {
@@ -1121,6 +1126,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             manifest_encoding,
             credential,
             cred_capability,
+            digests,
             ..
         } => {
             // clap's `required_unless_present = "flake"`/`conflicts_with`
@@ -1153,7 +1159,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 (bytes, encoding)
             };
             control_request::Op::Submit(SubmitRequest {
-                digests: false,
+                digests,
                 manifest: bytes,
                 manifest_encoding: encoding,
                 submitter_caps,
@@ -1872,6 +1878,32 @@ mod tests {
         let path = write_cap_file(tmp.path(), "cap-1", &format!("  {encoded}\n"))?;
         let decoded = read_submitter_caps(&[path]).map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(decoded, vec![b"a-real-cap-blob".to_vec()]);
+        Ok(())
+    }
+
+    /// A2c (#483): `sandy daemon submit --digests` is a flag of the Submit, off by default.
+    #[test]
+    fn daemon_submit_takes_a_digests_flag() -> anyhow::Result<()> {
+        use clap::Parser;
+        let parse = |extra: &[&str]| -> anyhow::Result<bool> {
+            let mut args = vec![
+                "sandy",
+                "daemon",
+                "submit",
+                "github:acme/guest",
+                "--isolation-class",
+                "trusted",
+            ];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args)?.command {
+                Command::Daemon {
+                    op: DaemonOp::Submit { digests, .. },
+                } => Ok(digests),
+                _ => anyhow::bail!("not a daemon submit"),
+            }
+        };
+        assert!(parse(&["--digests"])?);
+        assert!(!parse(&[])?);
         Ok(())
     }
 

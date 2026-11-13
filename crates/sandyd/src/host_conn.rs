@@ -521,6 +521,7 @@ async fn record_job_result(
         timed_out: result.timed_out,
         transport_error: result.transport_error.clone(),
         egress: crate::envelope::egress_from_report(result.egress.as_ref()),
+        digests: result.digests.clone(),
     };
     // Only a job dispatched on this connection may have its credential ended
     // here: a buggy or hostile executor must not revoke another host's job (#481).
@@ -670,13 +671,15 @@ async fn finish_job(
     let credentials = job_registry.credentials().cloned();
     let jid = job_id.to_owned();
     let facts = facts.clone();
-    let (host_id, declared, allow) = job_registry.get(job_id).map_or((None, Vec::new(), None), |job| {
-        (
-            job.host_id.clone(),
-            job.declared_outputs.clone(),
-            job.egress_allow.clone(),
-        )
-    });
+    let (host_id, declared, allow, digests_requested) =
+        job_registry.get(job_id).map_or((None, Vec::new(), None, false), |job| {
+            (
+                job.host_id.clone(),
+                job.declared_outputs.clone(),
+                job.egress_allow.clone(),
+                job.digests_requested,
+            )
+        });
     let transition = tokio::task::spawn_blocking(move || {
         // The staged token never reaches the stored console, whatever the job printed.
         let console = redact_console(credentials.as_deref(), &jid, console);
@@ -693,6 +696,7 @@ async fn finish_job(
                 host_id: host_id.as_deref(),
                 allow: allow.as_ref(),
                 declared: &declared,
+                digests_requested,
             },
         );
         let message = redact_console(credentials.as_deref(), &jid, envelope.message);
@@ -701,6 +705,8 @@ async fn finish_job(
         crate::envelope::bound_egress_reason(&mut envelope, |reason| {
             redact_console(credentials.as_deref(), &jid, reason)
         });
+        // Last: whatever the parts add up to, the stored envelope stays inside the budget.
+        crate::envelope::enforce_size(&mut envelope);
         store.finish_with(&jid, status, exit_code, &console, Some(&envelope))
     })
     .await;
@@ -2501,6 +2507,273 @@ mod tests {
             }
             assert_eq!(receipt.allow_list, applied.then(allow), "{name}: allow-list");
         }
+        Ok(())
+    }
+
+    fn wire_digests(
+        input_files: &[(&str, &str)],
+        output_files: &[(&str, &str)],
+        skipped: &[(&str, i32)],
+    ) -> sandy_executor_proto::RunDigests {
+        let files = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(path, sha256)| sandy_executor_proto::FileDigest {
+                    path: (*path).to_owned(),
+                    sha256: (*sha256).to_owned(),
+                })
+                .collect()
+        };
+        sandy_executor_proto::RunDigests {
+            inputs: Some(sandy_executor_proto::ContentDigests {
+                files: files(input_files),
+                skipped: Vec::new(),
+            }),
+            outputs: Some(sandy_executor_proto::ContentDigests {
+                files: files(output_files),
+                skipped: skipped
+                    .iter()
+                    .map(|(path, reason)| sandy_executor_proto::SkippedEntry {
+                        path: (*path).to_owned(),
+                        reason: *reason,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    /// The envelope of a clean job that left `a.txt` under the named output `out`, whether it `requested` digests and
+    /// what its executor `reported`.
+    async fn envelope_with_digests(
+        requested: bool,
+        reported: Option<sandy_executor_proto::RunDigests>,
+    ) -> anyhow::Result<sandy::ResultEnvelope> {
+        let dest = tempfile::tempdir().context("dest")?;
+        std::fs::write(dest.path().join("a.txt"), b"abc")?;
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.declared_outputs = vec![(Some("out".to_owned()), dest.path().to_owned())];
+        job.digests_requested = requested;
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                digests: reported,
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        store.envelope("job-1")?.context("a terminal job carries an envelope")
+    }
+
+    /// A2c (#483): a job that asked for digests records them as the direct path does: the inputs in
+    /// `host_observed.input_digests`, the output digests joined to the listing by path in `guest_reported.outputs`,
+    /// and the skipped entries in `skipped_outputs`.
+    #[tokio::test]
+    async fn a_digest_job_records_the_executors_digests_in_the_receipt() -> anyhow::Result<()> {
+        let sha_in = "1".repeat(64);
+        let sha_out = "2".repeat(64);
+        let reported = wire_digests(
+            &[("data/x.txt", &sha_in)],
+            &[("out/a.txt", &sha_out)],
+            &[("out/link", sandy_executor_proto::SkipReason::Symlink.into())],
+        );
+        let envelope = envelope_with_digests(true, Some(reported)).await?;
+        let receipt = envelope.receipt.context("the audit receipt")?;
+        let inputs = receipt
+            .host_observed
+            .input_digests
+            .context("input digests are recorded")?;
+        assert_eq!(inputs.files.len(), 1);
+        assert_eq!(
+            (inputs.files[0].path.as_str(), inputs.files[0].sha256.as_str()),
+            ("data/x.txt", sha_in.as_str())
+        );
+        let outputs = receipt.guest_reported.outputs;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].path, "out/a.txt");
+        assert_eq!(
+            outputs[0].sha256.as_deref(),
+            Some(sha_out.as_str()),
+            "joined to the listing by path"
+        );
+        let skipped = receipt.guest_reported.skipped_outputs;
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, "out/link");
+        assert_eq!(skipped[0].reason, sandy::SkipReason::Symlink);
+        Ok(())
+    }
+
+    /// A2c (#483): a report the daemon cannot trust is dropped whole, never partly believed: a hash that is not 64
+    /// lowercase hex digits, a path that is empty, absolute, climbs or is over-long, and a skip reason that is
+    /// unspecified or unknown. The envelope says so in a warning.
+    #[tokio::test]
+    async fn a_malformed_digest_report_is_dropped_with_a_warning() -> anyhow::Result<()> {
+        let good = "3".repeat(64);
+        let long_path = "p".repeat(4097);
+        let cases: Vec<(&str, sandy_executor_proto::RunDigests)> = vec![
+            ("short hash", wire_digests(&[("data/x", &"3".repeat(63))], &[], &[])),
+            ("uppercase hash", wire_digests(&[("data/x", &"A".repeat(64))], &[], &[])),
+            ("empty path", wire_digests(&[("", &good)], &[], &[])),
+            ("absolute path", wire_digests(&[("/etc/passwd", &good)], &[], &[])),
+            ("climbing path", wire_digests(&[("../x", &good)], &[], &[])),
+            ("over-long path", wire_digests(&[(&long_path, &good)], &[], &[])),
+            (
+                "unspecified skip reason",
+                wire_digests(
+                    &[],
+                    &[],
+                    &[("out/l", sandy_executor_proto::SkipReason::Unspecified.into())],
+                ),
+            ),
+            ("unknown skip reason", wire_digests(&[], &[], &[("out/l", 99)])),
+        ];
+        for (name, reported) in cases {
+            let envelope = envelope_with_digests(true, Some(reported)).await?;
+            let receipt = envelope.receipt.context("the audit receipt")?;
+            assert!(
+                receipt.host_observed.input_digests.is_none(),
+                "{name}: nothing is believed"
+            );
+            assert!(receipt.guest_reported.skipped_outputs.is_empty(), "{name}");
+            assert!(
+                envelope
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("digests") && w.contains("malformed")),
+                "{name}: a warning says the report was dropped: {:?}",
+                envelope.warnings
+            );
+        }
+        Ok(())
+    }
+
+    /// A2c (#483): a job that asked and got nothing back says so; a job that did not ask ignores what an executor
+    /// sends anyway.
+    #[tokio::test]
+    async fn digests_are_recorded_only_for_a_job_that_asked_and_a_missing_report_is_said() -> anyhow::Result<()> {
+        let sha = "4".repeat(64);
+        let asked_nothing_back = envelope_with_digests(true, None).await?;
+        assert!(
+            asked_nothing_back
+                .warnings
+                .iter()
+                .any(|w| w.contains("digests") && w.contains("requested")),
+            "{:?}",
+            asked_nothing_back.warnings
+        );
+        let unasked = envelope_with_digests(false, Some(wire_digests(&[("data/x", &sha)], &[], &[]))).await?;
+        let receipt = unasked.receipt.context("the audit receipt")?;
+        assert!(receipt.host_observed.input_digests.is_none(), "not asked, not recorded");
+        assert!(unasked.warnings.is_empty(), "{:?}", unasked.warnings);
+        Ok(())
+    }
+
+    /// A2c (#483, sandy-5e on #840): every part of the envelope a hostile executor controls, at its own cap and escaped
+    /// at six bytes a byte, adds up to more than one frame. A final guard on the finished envelope keeps the `Status`
+    /// reply inside one frame whatever the parts add up to: it sheds the digest lists, then the output listing, then
+    /// the log tail, and says so.
+    #[tokio::test]
+    async fn every_list_at_its_cap_still_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let ctl = |n: usize| "\u{1}".repeat(n);
+        let dest = tempfile::tempdir().context("dest")?;
+        let mut names = Vec::new();
+        for i in 0..256 {
+            let name = format!("{}{i:03}", ctl(120));
+            std::fs::write(dest.path().join(&name), b"x")?;
+            names.push(name);
+        }
+        let sha = "6".repeat(64);
+        let small_paths: Vec<String> = (0..256).map(|i| format!("{}{i:03}", ctl(28))).collect();
+        let small: Vec<(&str, &str)> = small_paths.iter().map(|p| (p.as_str(), sha.as_str())).collect();
+        let listing: Vec<(&str, &str)> = names.iter().map(|p| (p.as_str(), sha.as_str())).collect();
+        let skipped: Vec<(&str, i32)> = small_paths
+            .iter()
+            .map(|p| (p.as_str(), sandy_executor_proto::SkipReason::Symlink.into()))
+            .collect();
+        let mut digests = wire_digests(&small, &listing, &skipped);
+        if let Some(inputs) = digests.inputs.as_mut() {
+            inputs.skipped = skipped
+                .iter()
+                .map(|(p, r)| sandy_executor_proto::SkippedEntry {
+                    path: (*p).to_owned(),
+                    reason: *r,
+                })
+                .collect();
+        }
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.declared_outputs = vec![(None, dest.path().to_owned())];
+        job.digests_requested = true;
+        job.egress_allow = Some(allow());
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                console: ctl(900 * 1024),
+                transport_error: Some(ctl(100 * 1024)),
+                egress: Some(sandy_executor_proto::EgressReport {
+                    state: sandy_executor_proto::EgressState::Failed.into(),
+                    reason: Some(ctl(100 * 1024)),
+                }),
+                digests: Some(digests),
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let detail = store.detail("job-1")?.context("job detail")?;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        let reply = sandy_control_proto::StatusResponse {
+            job_id: "job-1".to_owned(),
+            status: i32::from(detail.status),
+            exit_code: detail.exit_code,
+            console_tail: detail.console,
+            result_envelope: Some(envelope.into_bytes()),
+        };
+        let size = sandy_executor_proto::Message::encoded_len(&reply);
+        assert!(
+            size < sandy_control_proto::MAX_FRAME_LEN as usize,
+            "the Status reply is {size} bytes, over the {} byte frame",
+            sandy_control_proto::MAX_FRAME_LEN
+        );
+        Ok(())
+    }
+
+    /// A2c (#483): the entries the daemon keeps are bounded (256 a side), so a hostile executor cannot push the
+    /// `Status` reply past one frame; the cut is said in a warning.
+    #[tokio::test]
+    async fn a_long_digest_list_is_cut_with_a_warning() -> anyhow::Result<()> {
+        let sha = "5".repeat(64);
+        let paths: Vec<String> = (0..300).map(|i| format!("data/f{i:03}")).collect();
+        let files: Vec<(&str, &str)> = paths.iter().map(|p| (p.as_str(), sha.as_str())).collect();
+        let envelope = envelope_with_digests(true, Some(wire_digests(&files, &[], &[]))).await?;
+        let receipt = envelope.receipt.context("the audit receipt")?;
+        let inputs = receipt
+            .host_observed
+            .input_digests
+            .context("input digests are recorded")?;
+        assert_eq!(inputs.files.len(), 256);
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|w| w.contains("digests") && w.contains("300")),
+            "{:?}",
+            envelope.warnings
+        );
         Ok(())
     }
 

@@ -1504,6 +1504,18 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   `sandy::build_egress_receipt`, pairing `PROXIED` with the allow-list it dispatched. No report, or an unspecified one,
   is `Unenforced` with the reason that the executor reported nothing: the receipt never says applied without a report.
   A run that failed to start returns an error and no report.
+- A2c (#483): the envelope lists what the run left at the Submit's declared output destinations, by the same
+  `sandy::collect_output_size_refs` the direct path uses, built once the outputs have settled. `sandy daemon submit
+--digests` asks for digests (#373): the job is placed only on an executor that declared `digests` (placement is
+  mandatory, so a digest job never runs unhashed locally), the executor hashes the staged inputs and the collected
+  outputs, and the daemon records `input_digests`, joins output hashes to the listing by path and records
+  `skipped_outputs`. The output hashes are the executor's: the daemon does not re-hash the files it received over the
+  data link. The report is validated whole (plain relative paths, 64 lowercase hex hashes, known skip reasons) and one
+  failure drops it with a warning. Everything an executor controls is bounded: 256 entries and 32 KiB of path text for
+  the output listing, 256 entries and 8 KiB of path text a digest list, 4 KiB for the message and the egress reason,
+  64 KiB of console. Because the parts can still add up past one frame when escaped, a final guard serializes the
+  finished envelope and, over 512 KiB, drops the digests, then the output listing, then cuts the log tail, with a
+  warning each time.
 - A4 (#483): `sandy daemon prune [--keep-last N]` (default 20) is `sandy gc` for the daemon: the `Prune` control RPC
   deletes the terminal rows (succeeded, failed, cancelled) except the newest N, newest by creation time then insertion
   order, and sweeps stale `cred-*` and `verify-*` dirs past `MAX_TTL_SECS` under the daemon host's sandy staging base. A
