@@ -13,6 +13,11 @@ pub(crate) const MAX_CONSOLE_BYTES: usize = 64 * 1024;
 /// The most output paths the envelope lists (with their sizes in the receipt).
 const MAX_LISTED_OUTPUTS: usize = 256;
 
+/// The most bytes of output paths the envelope lists, per copy (each path is in `outputs` and in the receipt, so the
+/// envelope holds twice this). With the console, the message and the egress reason it keeps a `Status` reply inside one
+/// frame.
+const MAX_LISTED_PATH_BYTES: usize = 32 * 1024;
+
 /// The most bytes of the envelope's `message` the daemon keeps. Applied after redaction, never before: a cut first
 /// would leave the end of a token that straddles it.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024;
@@ -178,12 +183,22 @@ pub(crate) fn from_run(
         .collect();
     let mut listed = sandy::collect_output_size_refs(&destinations, None);
     let total = listed.len();
+    // Bounded by count and by path bytes: a job chooses its own output names (up to 4096 bytes a path) and each path
+    // is listed twice, so a count cap alone would still overflow the frame.
+    let mut path_bytes = 0usize;
+    let kept = listed
+        .iter()
+        .take(MAX_LISTED_OUTPUTS)
+        .take_while(|output| {
+            path_bytes += output.path.len();
+            path_bytes <= MAX_LISTED_PATH_BYTES
+        })
+        .count();
     let mut cut = None;
-    if total > MAX_LISTED_OUTPUTS {
-        listed.truncate(MAX_LISTED_OUTPUTS);
+    if kept < total {
+        listed.truncate(kept);
         cut = Some(format!(
-            "outputs: {total} files were left at the declared destinations, only the first {MAX_LISTED_OUTPUTS} are \
-             listed"
+            "outputs: {total} files were left at the declared destinations, only the first {kept} are listed"
         ));
     }
     let refs = listed
