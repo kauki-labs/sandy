@@ -989,8 +989,15 @@ async fn wait_and_report(
             if let Err(e) = sandy_control_proto::client::call(&mut fresh, 1, cancel).await {
                 eprintln!("sandy: the cancel call failed: {e}");
             }
+            let fresh = std::cell::RefCell::new(fresh);
             sandy_cli::wait::wait_until_terminal(
-                || async { status_call(&mut fresh, 2, job_id).await },
+                || {
+                    let fresh = &fresh;
+                    async move {
+                        let mut stream = fresh.borrow_mut();
+                        status_call(&mut stream, 2, job_id).await
+                    }
+                },
                 WAIT_POLL,
                 CANCEL_SETTLE,
             )
