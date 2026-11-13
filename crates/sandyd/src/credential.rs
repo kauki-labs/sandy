@@ -1252,6 +1252,36 @@ mod tests {
         Ok(())
     }
 
+    /// #830 (review): recovery runs beside the accept loop, so it can read a record a Submit of this daemon just wrote.
+    /// A credential this daemon holds live is not revoked, and its staged file stays.
+    #[tokio::test]
+    async fn recovery_leaves_a_credential_this_daemon_holds_live() -> anyhow::Result<()> {
+        let d = daemon(FakeProvider::returning(TOKEN))?;
+        let mut dispatch_rx = register_host(&d, true)?;
+        let submitted = submit_ok(&d).await?;
+        let dispatch = tokio::time::timeout(WAIT, dispatch_rx.recv())
+            .await
+            .context("timed out waiting for the dispatch")?
+            .context("dispatch channel closed")?;
+        let path = staged_token_path(&dispatch)?;
+        let credentials = Arc::clone(d.registry.credentials().context("the registry has credentials")?);
+
+        let report = tokio::task::spawn_blocking(move || credentials.recover()).await?;
+
+        assert_eq!(
+            report,
+            RecoveryReport::default(),
+            "a live job's credential is not recovered"
+        );
+        assert!(d.provider.revoked().is_empty(), "the live token is not revoked");
+        assert!(path.exists(), "the live job keeps its staged file");
+        assert!(
+            d.store.credential_record(&submitted.job_id)?.is_some(),
+            "and its record"
+        );
+        Ok(())
+    }
+
     /// #830: the normal path forgets the record too, so a clean run leaves nothing for the next start to revoke.
     #[tokio::test]
     async fn a_released_credential_leaves_no_record() -> anyhow::Result<()> {
