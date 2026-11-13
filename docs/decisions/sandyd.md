@@ -1526,7 +1526,9 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   pending or running job is never deleted and does not count toward N. A deleted row takes its stored result envelope
   with it. The report is `gc`'s (`evicted`, `swept_staging_dirs`), so promoting the verb to `gc` changes no format. Prune
   is an operator verb over the 0700 socket, the same trust as `list`; it needs no attach token because it touches no
-  running job. A credential provider configured with another staging base is not swept.
+  running job. A credential provider configured with another staging base is not swept. A deleted row takes its
+  archive transcript with it. A credentialed job that runs past `MAX_TTL_SECS` can lose its `cred-*` dir to a prune
+  (#834). The sweep creates the staging base if it is absent (`ensure_sandy_staging_base`).
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's
@@ -2753,19 +2755,31 @@ change, which also fixes the queue-time loss).
 
 **Known gaps.**
 
-- A sandyd crash or kill while a credentialed job runs leaves its token valid until the native expiry
-  (GitHub: one hour), and the staged file on disk until `sandy gc` sweeps stale `cred-*` dirs. No restart
-  sweep revokes it. The bracket exposes the lease handle so a later reconcile could.
-- Restart recovery (#830), rows. At start, after the socket lock and before anything is served, every `Pending` or
-  `Running` row becomes `Failed` with a retryable infra-fault envelope ("sandyd restarted while the job was
-  running") in one transaction, because no connection can deliver its result to the new process. The row's console
-  and exit code stay, terminal rows are not touched, and a second start finds nothing. A failure of that write
-  exits the daemon with code 1. The job VMs belong to the host-executor, which now sweeps its own orphans at start
-  (`sweep_orphaned_vms`); `sandyd`'s own startup sweep covers only the environment VMs it launches (decision 34).
-  Revoking the credentials of those jobs is the follow-up in the same issue.
 - A clean shutdown revokes nothing at all: every live token survives a normal sandyd restart until its
-  native expiry, and revokes already in flight are not waited for. `sandyd cancel` (the offline operator
-  cancel) only marks the row: it cannot revoke.
+  native expiry, and revokes already in flight are not waited for. The next start revokes them (restart
+  recovery, below), so a token outlives a restart only until that start finishes its pass.
+- Restart recovery (#830). A job's credential has a revocation record in the job store (`jobs.credential`: trust
+  root, provider handle, expiry, staged token path; never the token), written when the job adopts its bracket and
+  cleared when the revoke succeeds. At start, after the socket lock and before anything is served, every `Pending`
+  or `Running` row becomes `Failed` with a retryable infra-fault envelope ("sandyd restarted while the job was
+  running") in one transaction, because no connection can deliver its result to the new process; the row's console
+  and exit code stay. In the background, after the bind, each remaining record is revoked through its trust root's
+  provider (at most 8 at once, each bounded by the provider's own deadline), its staged file and `cred-*` dir are
+  removed, and the record is cleared. A record past its expiry is cleared with no provider call, since a GitHub
+  revoke authenticates with a token that has died. A failed revoke is logged naming the job and the handle, keeps
+  the record, and still removes the staged file; the daemon starts either way. The kept record is the evidence and
+  the handle for a provider whose revoke needs no token; a GitHub retry cannot succeed, since its revoke
+  authenticates with the staged token that is already removed, so that token lives to its native expiry. Each
+  revoke is bounded by the provider call bound (45 s), in the recovery pass and in the offline cancel, so a hung
+  provider cannot hold either. Recovery skips a job this daemon holds live, and the records are read before the
+  daemon serves, so a Submit it takes later is never in the set. A failed record write at adopt is logged only: the
+  job runs, and a crash before its release leaves that token to its native expiry. `sandyd cancel`
+  (the offline operator cancel) marks the row and revokes the same record. The record lives in the store, not in a
+  file beside the token: the store is already `0600`, scoped to this daemon (a shared staging base needs no owner
+  marker, and a live `sandy run`'s dirs are never touched), and the bracket's `remove_dir_on_revoke` needs the
+  dir empty. A crash between the mint and the record write (one store write) leaves a token that lives to its
+  native expiry. A job VM belongs to the host-executor, which sweeps its own orphans at start; `sandyd`'s own
+  startup sweep covers only the environment VMs it launches (decision 34).
 - A host-executor that never reports a result and never disconnects keeps the job's credential entry and
   its staged file until the daemon stops.
 - The host-executor must run as the daemon's uid to read the `0700` dir, as for any #496 path secret.

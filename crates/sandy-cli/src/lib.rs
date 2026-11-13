@@ -28,3 +28,4 @@ pub mod profiles;
 pub mod signals;
 pub mod submit;
 pub mod supervisor;
+pub mod wait;

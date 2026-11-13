@@ -7,9 +7,15 @@
 //! It holds the store's lock file for the whole call, so it refuses while a daemon uses that store.
 //! It only marks the row `Cancelled`: see [`cancel_offline`] for what it does not stop.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use crate::store::{CancelOutcome, JobStore, StoreError};
+use crate::{
+    credential::{CredentialResolver, DAEMON_CALL_TIMEOUT, revoke_recorded_bounded},
+    store::{CancelOutcome, JobStore, StoreError},
+};
 
 /// Why [`cancel_offline`] did not cancel.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +92,37 @@ pub fn cancel_offline(db: &Path, job_id: &str) -> Result<CancelOutcome, Operator
         return Err(OperatorCancelError::NoStore(db.to_owned()));
     }
     Ok(JobStore::open(db)?.cancel(job_id)?)
+}
+
+/// [`cancel_offline`], then revoke the job's recorded credential through `resolver` (#830, #719 item 1) while the
+/// store is still locked, bounded by the provider call bound. The revoke result is `None` when the job holds no
+/// credential record, so a cancel with nothing to revoke prints nothing extra. A failed revoke keeps the record: the
+/// next daemon start tries again.
+///
+/// # Errors
+/// As [`cancel_offline`].
+pub fn cancel_offline_and_revoke(
+    db: &Path,
+    job_id: &str,
+    resolver: Arc<dyn CredentialResolver>,
+) -> Result<(CancelOutcome, Option<Result<(), String>>), OperatorCancelError> {
+    let _lock = lock_store(db)?;
+    if !db.exists() {
+        return Err(OperatorCancelError::NoStore(db.to_owned()));
+    }
+    let store = JobStore::open(db)?;
+    let outcome = store.cancel(job_id)?;
+    if outcome == CancelOutcome::NotFound {
+        return Ok((outcome, None));
+    }
+    let Some(record) = store.credential_record(job_id)? else {
+        return Ok((outcome, None));
+    };
+    let revoked = revoke_recorded_bounded(resolver, &record, DAEMON_CALL_TIMEOUT);
+    if revoked.is_ok() {
+        store.clear_credential(job_id)?;
+    }
+    Ok((outcome, Some(revoked)))
 }
 
 #[cfg(test)]
@@ -174,6 +211,89 @@ mod tests {
 
         assert!(matches!(err, OperatorCancelError::DaemonRunning(_)), "got {err:?}");
         assert_eq!(JobStore::open(&db)?.status("job-1")?, Some(JobStatus::Pending));
+        Ok(())
+    }
+    /// A resolver that hands every trust root the same provider.
+    struct OneProvider(std::sync::Arc<sandy_test_support::FakeProvider>);
+
+    impl CredentialResolver for OneProvider {
+        fn resolve(&self, _: &str, _: &[String]) -> Result<(sandy::SharedProvider, sandy::Scope), String> {
+            Err("the offline cancel resolves a provider only".to_owned())
+        }
+
+        fn provider(&self, _: &str) -> Result<sandy::SharedProvider, String> {
+            let provider: sandy::SharedProvider = self.0.clone();
+            Ok(provider)
+        }
+    }
+
+    /// A store holding `job-1` with a credential record and a staged token file in a `cred-*` dir.
+    fn store_with_a_credentialed_job(tmp: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let db = tmp.join("sandyd.db");
+        let dir = tmp.join("cred-abc");
+        std::fs::create_dir(&dir)?;
+        let token = dir.join(crate::credential::CREDENTIAL_SECRET_NAME);
+        std::fs::write(&token, b"t")?;
+        let store = JobStore::open(&db)?;
+        store.insert_pending("job-1", b"m", "enc")?;
+        store.set_credential(
+            "job-1",
+            &crate::store::CredentialRecord {
+                trust_root: "gh".to_owned(),
+                handle_id: "h-1".to_owned(),
+                expires_at_unix: u64::MAX / 2,
+                token_path: token.clone(),
+            },
+        )?;
+        Ok((db, token))
+    }
+
+    /// #830, #719 item 1: the offline cancel marks the row and also revokes the job's recorded credential, removes
+    /// its staged file and forgets the record.
+    #[test]
+    fn an_offline_cancel_revokes_the_recorded_credential() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (db, token) = store_with_a_credentialed_job(tmp.path())?;
+        let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t"));
+
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider.clone())))?;
+
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert!(matches!(revoked, Some(Ok(()))), "{revoked:?}");
+        assert_eq!(provider.revoked().len(), 1, "revoked exactly once");
+        assert!(!token.exists(), "the staged token file is removed");
+        assert_eq!(JobStore::open(&db)?.credential_record("job-1")?, None);
+        Ok(())
+    }
+
+    /// A revoke that fails is reported and keeps the record for the next daemon start.
+    #[test]
+    fn an_offline_cancel_keeps_the_record_when_the_revoke_fails() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (db, _token) = store_with_a_credentialed_job(tmp.path())?;
+        let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t").with_failing_revoke());
+
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider)))?;
+
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert!(matches!(revoked, Some(Err(_))), "{revoked:?}");
+        assert!(JobStore::open(&db)?.credential_record("job-1")?.is_some());
+        Ok(())
+    }
+
+    /// A job with no credential record cancels as before and reports no revoke.
+    #[test]
+    fn an_offline_cancel_of_a_job_with_no_credential_reports_no_revoke() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = tmp.path().join("sandyd.db");
+        JobStore::open(&db)?.insert_pending("job-1", b"m", "enc")?;
+        let provider = std::sync::Arc::new(sandy_test_support::FakeProvider::returning("t"));
+
+        let (outcome, revoked) = cancel_offline_and_revoke(&db, "job-1", Arc::new(OneProvider(provider.clone())))?;
+
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert!(revoked.is_none());
+        assert!(provider.revoked().is_empty());
         Ok(())
     }
 }
