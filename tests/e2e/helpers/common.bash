@@ -18,13 +18,16 @@ setup() {
   if [ ! -x "$SANDY_BIN" ]; then
     skip "sandy binary not found at $SANDY_BIN (build: nix develop -c cargo build -p sandy-cli, or pass SANDY_BIN)"
   fi
-  # Isolate all host state: the journal ($SANDY_HOME), the credential trust
-  # roots ($XDG_CONFIG_HOME/sandy), and the sandy staging base
-  # ($TMPDIR/sandy, #195's gc sweep lives under it). Tests never touch the
-  # real ~/.config/sandy or /tmp/sandy. BATS_TEST_TMPDIR is per-test and
-  # bats removes it itself, so teardown here never rm -rf's $TMPDIR.
+  # Isolate all host state: $SANDY_HOME, the credential trust roots
+  # ($XDG_CONFIG_HOME/sandy), and the sandy staging base ($TMPDIR/sandy). Tests
+  # never touch the real ~/.config/sandy or /tmp/sandy. BATS_TEST_TMPDIR is
+  # per-test and bats removes it itself, so teardown here never rm -rf's $TMPDIR.
+  # The control socket points at nothing: the basic suite runs with no sandyd, and
+  # a live test takes the caller's socket back in `require_live`.
+  SANDY_LIVE_SOCK="${SANDY_SOCK:-}"
   SANDY_HOME="$(mktemp -d)"
   export SANDY_HOME
+  export SANDY_SOCK="$SANDY_HOME/no-sandyd.sock"
   XDG_CONFIG_HOME="$(mktemp -d)"
   export XDG_CONFIG_HOME
   export TMPDIR="$BATS_TEST_TMPDIR"
@@ -39,13 +42,12 @@ teardown() {
 sandy() { "$SANDY_BIN" "$@"; }
 
 # Skip unless a real boot is both requested and possible: SANDY_LIVE=1, a guest
-# template to boot (SANDY_E2E_TEMPLATE, e.g. /path/to/guest#topologies.<sys>.<hv>),
-# and the host's hypervisor on PATH (vfkit on macOS, qemu on Linux). Mirrors the
-# Rust `require_live` gate (INV-S9): off-matrix is skipped, never counted green.
+# template to boot (SANDY_E2E_TEMPLATE, e.g. topologies.<sys>.<hv>), and a running
+# sandyd with a VM-capable sandy-host-executor registered (SANDY_SOCK is its socket).
+# Mirrors the Rust `require_live` gate (INV-S9): off-matrix is skipped, never counted green.
 require_live() {
   [ "${SANDY_LIVE:-}" = "1" ] || skip "live boot: set SANDY_LIVE=1 (needs nixos + virtualization)"
   [ -n "${SANDY_E2E_TEMPLATE:-}" ] || skip "live boot: set SANDY_E2E_TEMPLATE to a bootable guest attr"
-  local hv
-  hv=$([ "$(uname)" = "Darwin" ] && echo vfkit || echo qemu)
-  command -v "$hv" >/dev/null 2>&1 || skip "live boot: $hv not on PATH"
+  [ -S "$SANDY_LIVE_SOCK" ] || skip "live boot: start sandyd and a VM-capable sandy-host-executor and set SANDY_SOCK"
+  export SANDY_SOCK="$SANDY_LIVE_SOCK"
 }

@@ -1,12 +1,13 @@
 #!/usr/bin/env bats
 #
-# The live boot surface: a real job booted through `sandy run` to a locked result
-# envelope. Needs nixos + virtualization (a hypervisor and a buildable guest), so
-# every test is gated by `require_live` and SKIPPED off-matrix (INV-S9) — it never
-# runs in the plain sandbox and is not wired into CI. Run it on a capable host:
+# The live boot surface: a real job booted through `sandy run` (sandyd and a
+# VM-capable sandy-host-executor) to a locked result envelope. Needs nixos +
+# virtualization, so every test is gated by `require_live` and SKIPPED off-matrix
+# (INV-S9) — it never runs in the plain sandbox and is not wired into CI. Start
+# sandyd and the executor on a capable host, then:
 #
-#   SANDY_LIVE=1 SANDY_E2E_TEMPLATE='/path/to/guest#topologies.<system>.<hv>' \
-#     nix develop -c bats tests/e2e/live
+#   SANDY_LIVE=1 SANDY_SOCK=/path/to/sandyd.sock \
+#   SANDY_E2E_TEMPLATE='topologies.<system>.<hv>' nix develop -c bats tests/e2e/live
 #
 # Envelope field names are the LOCKED snake_case schema from result.rs: status is
 # "succeeded" | "failed" | "cancelled", with exit_code and result_schema_version.

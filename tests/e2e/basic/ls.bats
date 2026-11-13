@@ -1,25 +1,21 @@
 #!/usr/bin/env bats
 #
-# `ls`: the empty-home listing in plain and json, and the global `-o` placement.
+# `ls` talks to sandyd: with none running it is an infrastructure fault (exit 3), and the global `-o` may follow the
+# subcommand. The listing itself is covered by crates/sandy-cli/tests/daemon_verbs.rs.
 
 bats_require_minimum_version 1.5.0
 
 load ../helpers/common
 
-@test "ls on an empty home exits 0 with no records" {
+@test "ls with no sandyd running exits 3 naming the socket" {
   run --separate-stderr sandy ls
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
+  [[ "$stderr" == *"could not connect to sandyd at $SANDY_SOCK"* ]]
   [ -z "$output" ]
-}
-
-@test "ls -o json on an empty home is an empty JSON array" {
-  run --separate-stderr sandy -o json ls
-  [ "$status" -eq 0 ]
-  [ "$(printf '%s' "$output" | jq -c .)" = "[]" ]
 }
 
 @test "the -o flag is global and may follow the subcommand" {
   run --separate-stderr sandy ls -o json
-  [ "$status" -eq 0 ]
-  [ "$(printf '%s' "$output" | jq -c .)" = "[]" ]
+  [ "$status" -eq 3 ]
+  [[ "$stderr" == *"could not connect to sandyd"* ]]
 }
