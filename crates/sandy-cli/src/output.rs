@@ -441,16 +441,32 @@ pub struct JobStatusReport {
     pub exit_code: Option<i32>,
     /// The console tail, up to about 64 KiB. JSON only: the plain form stays one line.
     pub console_tail: String,
+    /// The terminal result envelope (INV-11): the same value `sandy status -o json` prints under `result` for a direct
+    /// job (A2 of #483). `null` while the job is not terminal and for a job recorded before `sandyd` stored envelopes.
+    pub result: Option<ResultEnvelope>,
 }
 
-impl From<&StatusResponse> for JobStatusReport {
-    fn from(response: &StatusResponse) -> Self {
-        Self {
+impl JobStatusReport {
+    /// The report for `response`, decoding the envelope bytes `sandyd` sent.
+    ///
+    /// # Errors
+    ///
+    /// A message when the envelope bytes do not decode: a corrupt reply is refused, never printed as a job with no
+    /// result.
+    pub fn from_response(response: &StatusResponse) -> Result<Self, String> {
+        let result = response
+            .result_envelope
+            .as_deref()
+            .map(serde_json::from_slice::<ResultEnvelope>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
             job_id: response.job_id.clone(),
             status: job_status_name(response.status).to_owned(),
             exit_code: response.exit_code,
             console_tail: response.console_tail.clone(),
-        }
+            result,
+        })
     }
 }
 
@@ -542,7 +558,10 @@ mod tests {
     }
 
     fn format_status(response: &StatusResponse, format: OutputFormat) -> Result<String, EmitError> {
-        emitted(&JobStatusReport::from(response), format)
+        emitted(
+            &JobStatusReport::from_response(response).map_err(std::io::Error::other)?,
+            format,
+        )
     }
 
     fn format_list(response: &ListResponse, format: OutputFormat) -> Result<String, EmitError> {
@@ -572,6 +591,7 @@ mod tests {
             status: "JOB_STATUS_SUCCEEDED".into(),
             exit_code: Some(0),
             console_tail: "hi\n".into(),
+            result: None,
         })?;
         round_trip(&JobSummaries::from(&ListResponse {
             jobs: vec![JobSummary {
@@ -658,10 +678,13 @@ mod tests {
             status: "JOB_STATUS_FAILED".into(),
             exit_code: None,
             console_tail: String::new(),
+            result: None,
         })?;
         assert_eq!(
             status,
-            serde_json::json!({"job_id": "j", "status": "JOB_STATUS_FAILED", "exit_code": null, "console_tail": ""})
+            serde_json::json!({
+                "job_id": "j", "status": "JOB_STATUS_FAILED", "exit_code": null, "console_tail": "", "result": null
+            })
         );
         assert_eq!(
             serde_json::to_value(CancelledJob::new("j"))?,
@@ -1282,6 +1305,71 @@ mod tests {
             Some("JOB_STATUS_RUNNING")
         );
         Ok(())
+    }
+
+    fn terminal_response(envelope: Option<Vec<u8>>) -> StatusResponse {
+        StatusResponse {
+            job_id: "job-a".to_string(),
+            status: JobStatus::Failed as i32,
+            exit_code: Some(3),
+            console_tail: "boom\n".to_string(),
+            result_envelope: envelope,
+        }
+    }
+
+    /// A2 (#483): `daemon status -o json` of a terminal job carries the result envelope under `result`, byte for byte
+    /// the value the direct `sandy status -o json` prints under `result` of its `JobRecord`, so promoting the daemon
+    /// verbs is a rename and not a format change.
+    #[test]
+    fn a_terminal_status_prints_the_envelope_the_direct_record_prints() -> anyhow::Result<()> {
+        let envelope = sample_envelope("job-a");
+        let bytes = serde_json::to_vec(&envelope)?;
+        let json = format_status(&terminal_response(Some(bytes)), OutputFormat::Json).context("format status json")?;
+        let daemon: serde_json::Value = serde_json::from_str(&json).context("parse status json")?;
+        let record = JobRecord {
+            schema_version: sandy::JOURNAL_SCHEMA_VERSION,
+            job_id: "job-a".to_owned(),
+            box_id: None,
+            state: sandy::JobState::Failed,
+            writer_pid: 1,
+            started: std::time::SystemTime::UNIX_EPOCH,
+            result: Some(envelope),
+        };
+        let direct = serde_json::to_value(&record)?;
+        assert_eq!(
+            daemon.get("result"),
+            direct.get("result"),
+            "the same envelope under the same key"
+        );
+        assert_eq!(
+            daemon.get("exit_code"),
+            Some(&serde_json::json!(3)),
+            "the existing keys stay"
+        );
+        assert_eq!(daemon.get("console_tail"), Some(&serde_json::json!("boom\n")));
+        Ok(())
+    }
+
+    /// A2 (#483): a job that is not terminal prints `result: null`, as the direct record does, and the plain form
+    /// stays the one line it was.
+    #[test]
+    fn a_status_without_an_envelope_prints_a_null_result_and_the_plain_line_is_unchanged() -> anyhow::Result<()> {
+        let json = format_status(&terminal_response(None), OutputFormat::Json).context("format status json")?;
+        let parsed: serde_json::Value = serde_json::from_str(&json).context("parse status json")?;
+        assert_eq!(parsed.get("result"), Some(&serde_json::Value::Null));
+        let plain = format_status(
+            &terminal_response(Some(serde_json::to_vec(&sample_envelope("job-a"))?)),
+            OutputFormat::Plain,
+        )
+        .context("format status plain")?;
+        assert_eq!(plain.lines().count(), 1, "plain stays one line: {plain}");
+        Ok(())
+    }
+
+    /// A2 (#483): envelope bytes that do not decode are refused, never printed as a job with no result.
+    #[test]
+    fn a_corrupt_envelope_is_refused_not_hidden() {
+        assert!(format_status(&terminal_response(Some(b"not json".to_vec())), OutputFormat::Json).is_err());
     }
 
     /// A terminal job's exit code and console tail reach both output forms
