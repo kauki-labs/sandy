@@ -1835,7 +1835,8 @@ mod tests {
             console: String::new(),
             digests: None,
         };
-        let rows: Vec<(&str, Result<Outcome, BackendError>, EgressState, Option<&str>)> = vec![
+        type Row<'a> = (&'a str, Result<Outcome, BackendError>, EgressState, Option<&'a str>);
+        let rows: Vec<Row<'_>> = vec![
             ("booted guest", Ok(outcome(true)), EgressState::Proxied, None),
             (
                 "guest never booted",
