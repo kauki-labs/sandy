@@ -1336,6 +1336,11 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
             eprintln!("sandy: daemon answered a job request with an environment response");
             ProcessExit::InfraFault.code()
         }
+        // No `daemon` verb asks for the host list; `sandy doctor` does, over its own connection.
+        Some(control_response::Result::Hosts(_)) => {
+            eprintln!("sandy: daemon answered a job request with a hosts response");
+            ProcessExit::InfraFault.code()
+        }
         None => {
             eprintln!("sandy: daemon sent a response with no result set");
             ProcessExit::InfraFault.code()

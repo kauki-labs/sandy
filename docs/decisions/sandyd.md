@@ -1488,6 +1488,10 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   with a `#` is refused naming `--flake`. The plain flags apply to a template or `--flake` and are refused with a
   manifest file. `--from-devshell` is a `flake/v1` field (`from_devshell`, absent when false); an executor that predates
   it refuses the manifest naming the field.
+- `ListHosts` (#483): a read-only control RPC (`ListHostsRequest`, `ListHostsResponse`) that lists the connected
+  host-executors ordered by id, each with the sandbox kinds (`process`, `vm`), isolation classes and arch it declared at
+  Register. It reads the live `HostRegistry`, so a host that disconnected is gone at once. `sandy doctor` uses it to say
+  that `sandyd` is reachable and an executor is registered before a promoted `run` is submitted.
 - A1 (#483): `sandy daemon submit --allow HOST:PORT` (repeatable) sends an egress policy, `SubmitRequest.egress`, copied
   into `Dispatch.egress`. A policy is a message field, so an empty one (deny all) stays apart from none. A policy runs
   the guest behind the executor's per-run egress proxy, the same `Some(AllowList)` `sandy run` builds under

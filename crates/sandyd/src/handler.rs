@@ -321,6 +321,43 @@ fn to_dispatch_path_fields(
     (inputs, outputs, secrets)
 }
 
+/// A connected host as `ListHosts` reports it: what it declared at Register. An unset or unknown enum value is left
+/// out rather than guessed.
+fn host_summary(
+    host_id: String,
+    capabilities: &sandy_executor_proto::Capabilities,
+) -> sandy_control_proto::HostSummary {
+    let sandbox_kinds = capabilities
+        .supported_sandbox_kinds
+        .iter()
+        .filter_map(|k| match SandboxKind::try_from(*k) {
+            Ok(SandboxKind::Process) => Some("process".to_owned()),
+            Ok(SandboxKind::Vm) => Some("vm".to_owned()),
+            _ => None,
+        })
+        .collect();
+    let isolation_classes = capabilities
+        .supported_isolation_classes
+        .iter()
+        .filter_map(|c| match IsolationClass::try_from(*c) {
+            Ok(IsolationClass::Trusted) => Some(sandy_control_proto::IsolationClass::Trusted.into()),
+            Ok(IsolationClass::Untrusted) => Some(sandy_control_proto::IsolationClass::Untrusted.into()),
+            _ => None,
+        })
+        .collect();
+    let arch = match sandy_executor_proto::Arch::try_from(capabilities.arch) {
+        Ok(sandy_executor_proto::Arch::X8664) => "x86_64",
+        Ok(sandy_executor_proto::Arch::Aarch64) => "aarch64",
+        _ => "unknown",
+    };
+    sandy_control_proto::HostSummary {
+        host_id,
+        sandbox_kinds,
+        isolation_classes,
+        arch: arch.to_owned(),
+    }
+}
+
 /// Parse `SubmitRequest.required_isolation_class`'s wire value (the
 /// client-facing `sandy_control_proto::IsolationClass`) into the internal
 /// `sandy_executor_proto::IsolationClass` placement/dispatch uses. `None` for
@@ -1324,10 +1361,13 @@ pub async fn handle(
                     .collect(),
             })
         }
-        // Stub: the registry snapshot lands with the green step.
-        Some(control_request::Op::ListHosts(_)) => {
-            control_response::Result::Hosts(ListHostsResponse { hosts: Vec::new() })
-        }
+        Some(control_request::Op::ListHosts(_)) => control_response::Result::Hosts(ListHostsResponse {
+            hosts: host_registry
+                .connected()
+                .into_iter()
+                .map(|(id, c)| host_summary(id, &c))
+                .collect(),
+        }),
         Some(control_request::Op::Prune(prune)) => {
             let store = Arc::clone(store);
             let keep_last = usize::try_from(prune.keep_last).unwrap_or(usize::MAX);
