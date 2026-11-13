@@ -10,7 +10,7 @@ The live **KPIs** are consolidated as an acceptance matrix in [`kpi.md`](kpi.md)
 
 Invariants referenced here: **INV-1** secrets never reach argv/env/the store
 ([attacker model](#attacker-model)); **INV-3** liveness only through
-`VmBackend::boxes` + the job flock, never a direct registry read ([attacker
+`VmBackend::boxes`, never a direct registry read ([attacker
 model](#attacker-model)); **INV-6** a `Running` record is written before the
 backend runs and a terminal record always carries the envelope; **INV-7**
 fail-closed (a mint or egress-apply failure is an infra fault, never a degraded

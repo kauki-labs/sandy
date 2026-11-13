@@ -143,6 +143,8 @@ that. Operators who need that guarantee supply it at the deployment layer.
 
 **Status:** accepted. The heartbeat went with the refresh loop in #483; sandyd's prune still sweeps by mtime.
 
+**Historical (#483).** The refresh loop, its mtime heartbeat and `safe_heartbeat_tick` described below were deleted with the direct path. The text records why they existed. Only the sweep by mtime remains, in sandyd's prune.
+
 **Context.** `sandy run --credential` and the trust-root verify probe stage a
 token into a fresh, randomly named private dir under the sandy staging base
 (`cred-<hex>` / `verify-<hex>`, #174's `private_staging_dir`). A drop guard
