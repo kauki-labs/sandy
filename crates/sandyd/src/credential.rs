@@ -1233,7 +1233,7 @@ mod tests {
 
         let report = recover(restarted(&d)).await?;
 
-        assert_eq!(report.revoked, [submitted.job_id.clone()]);
+        assert_eq!(report.revoked, std::slice::from_ref(&submitted.job_id));
         assert_eq!(d.provider.revoked().len(), 1, "revoked exactly once");
         assert!(!path.exists(), "the staged token file is removed");
         assert!(
@@ -1291,7 +1291,7 @@ mod tests {
 
         let report = recover(restarted(&d)).await?;
 
-        assert_eq!(report.failed, [submitted.job_id.clone()]);
+        assert_eq!(report.failed, std::slice::from_ref(&submitted.job_id));
         assert!(report.revoked.is_empty());
         assert!(
             d.store.credential_record(&submitted.job_id)?.is_some(),
