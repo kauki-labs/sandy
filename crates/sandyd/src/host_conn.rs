@@ -2673,6 +2673,83 @@ mod tests {
         Ok(())
     }
 
+    /// A2c (#483, sandy-5e on #840): every part of the envelope a hostile executor controls, at its own cap and escaped
+    /// at six bytes a byte, adds up to more than one frame. A final guard on the finished envelope keeps the `Status`
+    /// reply inside one frame whatever the parts add up to: it sheds the digest lists, then the output listing, then
+    /// the log tail, and says so.
+    #[tokio::test]
+    async fn every_list_at_its_cap_still_leaves_a_status_reply_that_fits_one_frame() -> anyhow::Result<()> {
+        let ctl = |n: usize| "\u{1}".repeat(n);
+        let dest = tempfile::tempdir().context("dest")?;
+        let mut names = Vec::new();
+        for i in 0..256 {
+            let name = format!("{}{i:03}", ctl(120));
+            std::fs::write(dest.path().join(&name), b"x")?;
+            names.push(name);
+        }
+        let sha = "6".repeat(64);
+        let small_paths: Vec<String> = (0..256).map(|i| format!("{}{i:03}", ctl(28))).collect();
+        let small: Vec<(&str, &str)> = small_paths.iter().map(|p| (p.as_str(), sha.as_str())).collect();
+        let listing: Vec<(&str, &str)> = names.iter().map(|p| (p.as_str(), sha.as_str())).collect();
+        let skipped: Vec<(&str, i32)> = small_paths
+            .iter()
+            .map(|p| (p.as_str(), sandy_executor_proto::SkipReason::Symlink.into()))
+            .collect();
+        let mut digests = wire_digests(&small, &listing, &skipped);
+        if let Some(inputs) = digests.inputs.as_mut() {
+            inputs.skipped = skipped
+                .iter()
+                .map(|(p, r)| sandy_executor_proto::SkippedEntry {
+                    path: (*p).to_owned(),
+                    reason: *r,
+                })
+                .collect();
+        }
+        let (store, job_registry) = (test_store(), test_job_registry());
+        store.insert_pending("job-1", b"m", "test/v1")?;
+        store.mark_running("job-1")?;
+        let mut job = crate::dispatch::mint_job_channel("job-1", job_registry.authority())
+            .await
+            .context("mint job channel")?;
+        job.declared_outputs = vec![(None, dest.path().to_owned())];
+        job.digests_requested = true;
+        job.egress_allow = Some(allow());
+        job_registry.insert("job-1".to_owned(), job);
+        record_job_result(
+            &store,
+            &job_registry,
+            &mut HashSet::from(["job-1".to_owned()]),
+            &mut HashSet::new(),
+            JobResult {
+                console: ctl(900 * 1024),
+                transport_error: Some(ctl(100 * 1024)),
+                egress: Some(sandy_executor_proto::EgressReport {
+                    state: sandy_executor_proto::EgressState::Failed.into(),
+                    reason: Some(ctl(100 * 1024)),
+                }),
+                digests: Some(digests),
+                ..result_for("job-1", 0, false)
+            },
+        )
+        .await;
+        let detail = store.detail("job-1")?.context("job detail")?;
+        let envelope = store.envelope_json("job-1")?.context("an envelope")?;
+        let reply = sandy_control_proto::StatusResponse {
+            job_id: "job-1".to_owned(),
+            status: i32::from(detail.status),
+            exit_code: detail.exit_code,
+            console_tail: detail.console,
+            result_envelope: Some(envelope.into_bytes()),
+        };
+        let size = sandy_executor_proto::Message::encoded_len(&reply);
+        assert!(
+            size < sandy_control_proto::MAX_FRAME_LEN as usize,
+            "the Status reply is {size} bytes, over the {} byte frame",
+            sandy_control_proto::MAX_FRAME_LEN
+        );
+        Ok(())
+    }
+
     /// A2c (#483): the entries the daemon keeps are bounded (256 a side), so a hostile executor cannot push the
     /// `Status` reply past one frame; the cut is said in a warning.
     #[tokio::test]
