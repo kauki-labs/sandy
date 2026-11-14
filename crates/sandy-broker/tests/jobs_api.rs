@@ -314,6 +314,60 @@ async fn the_broker_sends_the_clients_root_with_every_host_path() -> Result<()> 
     Ok(())
 }
 
+/// #618 (review of #889): the root sandyd opens is followed, so it must be the operator's configured root, never a
+/// spelling the client chose. A client that names its path through a symlink it controls (`alias` here, in a directory
+/// the client can write) must not make that alias the root: it could retarget the alias after the broker's check.
+/// The Dispatch carries the canonical configured root, and what the sender reads after the retarget is still inside it.
+#[tokio::test]
+async fn a_client_controlled_alias_never_becomes_the_root_sandyd_opens() -> Result<()> {
+    let mut f = fixture_with_opts(Opts {
+        path_host: true,
+        ..Opts::default()
+    })
+    .await?;
+    let root = f.root_a.canonicalize()?;
+    std::fs::write(root.join("in.txt"), b"inside the root")?;
+    let outside = f._dir.path().join("outside");
+    std::fs::create_dir(&outside)?;
+    std::fs::write(outside.join("in.txt"), b"OUTSIDE THE ROOT")?;
+    let alias = f._dir.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias)?;
+    let mut body = submit_body();
+    body["inputs"] = json!([{"host": alias.join("in.txt").to_string_lossy(), "name": "n"}]);
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), f._host_dispatch.recv())
+        .await
+        .context("the job was never dispatched")?
+        .context("the dispatch channel closed")?;
+
+    assert_eq!(
+        dispatch.inputs[0].root.as_deref(),
+        Some(root.to_string_lossy().as_ref()),
+        "the root must be the configured one, not the alias the client spelled"
+    );
+    // The client retargets the alias after the broker's check; the sender then reads what the Dispatch names.
+    std::fs::remove_file(&alias)?;
+    std::os::unix::fs::symlink(&outside, &alias)?;
+    let (mut tx, mut rx) = tokio::io::duplex(1 << 20);
+    let _ =
+        sandyd::data_link_send::send_inputs(&mut tx, &dispatch.inputs, sandyd::data_link_send::SendLimits::default())
+            .await;
+    drop(tx);
+    let mut sent = Vec::new();
+    while let Some(message) = sandy_control_proto::read_frame::<sandy_executor_proto::DataLinkMessage>(&mut rx).await? {
+        if let Some(sandy_executor_proto::data_link_message::Op::InputChunk(chunk)) = message.op {
+            sent.extend(chunk.bytes);
+        }
+    }
+    assert!(
+        !String::from_utf8_lossy(&sent).contains("OUTSIDE"),
+        "the retargeted alias must not redirect the read outside the root"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_planted_symlink_under_the_root_cannot_redirect_a_path() -> Result<()> {
     let f = fixture().await?;

@@ -3707,10 +3707,12 @@ mod tests {
             transfer: true,
             ..trusted_host_capabilities()
         };
-        let bad: [(&str, &str, &str); 3] = [
+        let bad: [(&str, &str, &str); 5] = [
             ("relative root", "data", "data"),
             ("outside the root", "/srv/a", "/srv/b"),
             ("dot-dot below the root", "/srv/a", "/srv/a/x/.."),
+            ("NUL in the root", "/srv/a\0", "/srv/a\0"),
+            ("NUL below the root", "/srv/a", "/srv/a/x\0y"),
         ];
         for (name, root, base) in bad {
             for field in ["inputs", "outputs", "secrets"] {
