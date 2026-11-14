@@ -259,12 +259,9 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
     // client retargets can redirect the open.
     let root_of = |path: &str| {
         root_for(path, &client.roots)
-            .map(|rooted| {
-                (
-                    rooted.root.to_string_lossy().into_owned(),
-                    rooted.path.to_string_lossy().into_owned(),
-                )
-            })
+            // The wire carries text. Startup refuses a root that is not UTF-8, so this never fails for a canonical
+            // root; a lossy conversion would name a different directory than the one authorised.
+            .and_then(|rooted| Some((rooted.root.to_str()?.to_owned(), rooted.path.to_str()?.to_owned())))
             .ok_or(FORBIDDEN)
     };
     let class = match body.required_isolation_class {

@@ -435,7 +435,7 @@ does not know without a word, so a root sent to one that cannot honour it would 
 The executor therefore declares a `path_root` capability, as `egress_proxy` and `digests` do (sandyd A1, A2c), and
 `sandyd` places a Submit with a rooted path only on a host that opens the paths beneath the root: `sandyd` itself, over
 the data link, for a host with `transfer` and inputs or outputs only, and otherwise a host that declared `path_root`.
-Secrets are opened only by the executor, so a rooted secret needs `path_root` always. With no such host the Submit is
+The requirement is per path field: a rooted secret needs `path_root` always (only the executor opens secrets), a rooted input or output needs it only on a host with no `transfer`, so a rooted input beside an unrooted secret is placed on a transfer host that did not declare `path_root`. With no such host the Submit is
 refused naming the capability. No executor declares it before slice 2, so until then a broker client's secrets are
 refused and its inputs and outputs need a `transfer` host. The change is additive on the wire, and a source-break for
 any external struct literal of the sandy-api types once slice 2 adds the field there.

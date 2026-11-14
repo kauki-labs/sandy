@@ -97,8 +97,7 @@ tests keep passing.
 
 **Root sent to sandyd (#618).** The broker also sends the root that contains each path in the optional `root` of the
 control `Submit` input, output and secret messages, and rewrites the path onto it. The root is the operator's
-configured root in canonical form, resolved once at startup (a root that cannot be resolved refuses startup, naming
-it), never a spelling the client chose: `sandyd` follows the root, so a client that named its path through a symlink it
+configured root in canonical form, resolved once at startup (a root that cannot be resolved, or whose real name is not valid UTF-8, refuses startup naming it: the wire carries text, and a lossy conversion would name another directory), never a spelling the client chose: `sandyd` follows the root, so a client that named its path through a symlink it
 controls would otherwise make that alias the root and retarget it after the check. When several of the client's roots
 contain the path, the nearest wins. The path a client sees back (an output destination in the result envelope) is the
 canonical one. The HTTP contract does not change. `root` is not a boundary on the local control RPC: only the broker

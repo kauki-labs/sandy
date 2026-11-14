@@ -99,7 +99,19 @@ fn canonical_roots_with(
 ) -> Result<Vec<PathBuf>, String> {
     roots
         .iter()
-        .map(|root| resolve(root).map_err(|e| format!("root {} cannot be resolved: {e}", root.display())))
+        .map(|root| {
+            let resolved = resolve(root).map_err(|e| format!("root {} cannot be resolved: {e}", root.display()))?;
+            // The root goes on the wire as text: a lossy conversion would name another directory than the one
+            // the broker authorised.
+            if resolved.to_str().is_none() {
+                return Err(format!(
+                    "root {} resolves to {}, which is not valid UTF-8 and cannot be sent exactly",
+                    root.display(),
+                    resolved.display()
+                ));
+            }
+            Ok(resolved)
+        })
         .collect()
 }
 

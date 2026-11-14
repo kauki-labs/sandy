@@ -300,6 +300,17 @@ impl Beneath {
     }
 }
 
+/// `root` must be an absolute path: a relative one would resolve against the working directory.
+fn require_absolute(root: &Path) -> Result<(), FsError> {
+    if root.is_absolute() {
+        return Ok(());
+    }
+    Err(FsError::Unsafe {
+        path: root.to_owned(),
+        reason: "the root is not an absolute path".to_owned(),
+    })
+}
+
 /// The components of `path` below `root`. `root` must be absolute and `path` lexically under it; no component below
 /// it may be `..`, which `O_NOFOLLOW` does not stop (`openat(fd, "..")` leaves the root). `.` and a trailing `/`
 /// are dropped by [`Path::components`].
@@ -338,7 +349,7 @@ pub fn open_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
             reason: "is the root, not a file below it".to_owned(),
         });
     };
-    let mut dir = Beneath::open_root(root)?;
+    let mut dir = Beneath::open_root_search(root)?;
     for part in parts {
         dir = dir.open_search_subdir(part)?;
     }
@@ -400,13 +411,17 @@ impl Beneath {
     ///
     /// [`FsError::Unsafe`] when `root` is not absolute or not a directory, else [`FsError::Io`].
     pub fn open_root(root: &Path) -> Result<Self, FsError> {
-        if !root.is_absolute() {
-            return Err(FsError::Unsafe {
-                path: root.to_owned(),
-                reason: "the root is not an absolute path".to_owned(),
-            });
-        }
+        require_absolute(root)?;
         Self::open_dir_following_leaf(root)
+    }
+
+    /// [`Beneath::open_root`] for a root that is only searched on the way to something below it (#618): on Linux a
+    /// search-only handle (`O_PATH`), which needs search (execute) permission and not read, so a root without read
+    /// permission that holds a readable file still works. Elsewhere it is [`Beneath::open_root`]'s plain read open.
+    /// The handle cannot be listed.
+    fn open_root_search(root: &Path) -> Result<Self, FsError> {
+        require_absolute(root)?;
+        Self::open_parent(root)
     }
 
     /// Open the directory at `path`, which lies beneath `root`: `root` resolves as the OS resolves it, and every
@@ -417,11 +432,17 @@ impl Beneath {
     /// [`FsError::Unsafe`] when `root` is not absolute, `path` is not under it, a component is `..`, or a component
     /// is a symlink or not a directory, else [`FsError::Io`].
     pub fn open_dir_beneath(root: &Path, path: &Path) -> Result<Self, FsError> {
-        let mut dir = Self::open_root(root)?;
-        for part in below_root(root, path)? {
-            dir = dir.open_subdir(part)?;
+        let parts = below_root(root, path)?;
+        // The root is the directory itself: it must be readable. Otherwise it, and every directory above the leaf, is
+        // only searched.
+        let Some((leaf, above)) = parts.split_last() else {
+            return Self::open_root(root);
+        };
+        let mut dir = Self::open_root_search(root)?;
+        for part in above {
+            dir = dir.open_search_subdir(part)?;
         }
-        Ok(dir)
+        dir.open_subdir(leaf)
     }
 
     /// Create the directory at `path`, which lies beneath `root`, with the directories above it that are missing, and
@@ -431,8 +452,12 @@ impl Beneath {
     ///
     /// As [`Beneath::open_dir_beneath`].
     pub fn create_dir_beneath(root: &Path, path: &Path) -> Result<Self, FsError> {
-        let mut dir = Self::open_root(root)?;
-        for part in below_root(root, path)? {
+        let parts = below_root(root, path)?;
+        if parts.is_empty() {
+            return Self::open_root(root);
+        }
+        let mut dir = Self::open_root_search(root)?;
+        for part in parts {
             dir = dir.create_dir(part)?;
         }
         Ok(dir)

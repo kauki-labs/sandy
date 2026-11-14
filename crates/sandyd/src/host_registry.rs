@@ -130,6 +130,32 @@ pub enum PathNeeds {
     SharedFilesystemOrTransfer,
 }
 
+/// Which path fields of a Submit carry a `root` (#618). The requirement on a host differs by field: `sandyd` opens
+/// the rooted inputs and outputs of a `transfer` host itself, and the executor opens everything else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootedPaths {
+    /// An input or an output has a root.
+    pub inputs_or_outputs: bool,
+    /// A secret has a root.
+    pub secrets: bool,
+}
+
+impl RootedPaths {
+    /// Whether any path has a root.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.inputs_or_outputs || self.secrets
+    }
+}
+
+/// Whether a host can take a Submit whose `rooted` paths the executor opens (#618): a rooted secret needs `path_root`
+/// always, a rooted input or output needs it unless the host takes them over the data link (`transfer`).
+fn honours_roots(capabilities: &Capabilities, rooted: RootedPaths) -> bool {
+    let inputs_or_outputs = !rooted.inputs_or_outputs || capabilities.transfer || capabilities.path_root;
+    let secrets = !rooted.secrets || capabilities.path_root;
+    inputs_or_outputs && secrets
+}
+
 /// A registered host identified as a placement candidate (#298): its id,
 /// peer IP (to bind a decision-6 remote link), and declared capabilities (to
 /// decide `Dispatch.backend`), captured together so a placement decision
@@ -432,7 +458,7 @@ impl HostRegistry {
             needs,
             false,
             false,
-            false,
+            RootedPaths::default(),
         )
     }
 
@@ -440,10 +466,11 @@ impl HostRegistry {
     /// `egress_proxy` (A1, #483). An executor drops a `Dispatch.egress` it does not know without a word, so a job with
     /// an egress policy is never placed on a host that did not declare it.
     ///
-    /// `require_path_root` is set when a path field carries a `root` (#618). An executor drops a `root` it does not
-    /// know without a word, so a host that opens the paths itself must have declared `path_root`: every host for
-    /// `SharedFilesystem` (secrets, a credential), and a host with no `transfer` for `SharedFilesystemOrTransfer`,
-    /// because `sandyd` opens the paths of a transfer host over the data link.
+    /// `rooted` says which path fields carry a `root` (#618). An executor drops a `root` it does not know without a
+    /// word, so a host whose executor opens a rooted path must have declared `path_root`: a rooted secret always, and
+    /// a rooted input or output unless the host has `transfer`, because `sandyd` opens the paths of a transfer host
+    /// over the data link. The two are decided apart: a rooted input beside an unrooted secret needs no `path_root`
+    /// on a transfer host.
     #[must_use]
     pub fn pick_host_egress(
         &self,
@@ -452,7 +479,7 @@ impl HostRegistry {
         needs: PathNeeds,
         require_egress_proxy: bool,
         require_digests: bool,
-        require_path_root: bool,
+        rooted: RootedPaths,
     ) -> Option<PlacementCandidate> {
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
@@ -499,13 +526,12 @@ impl HostRegistry {
                     && match needs {
                         PathNeeds::Anywhere => true,
                         PathNeeds::SharedFilesystem => {
-                            host.capabilities.shares_submitter_filesystem
-                                && (!require_path_root || host.capabilities.path_root)
+                            host.capabilities.shares_submitter_filesystem && honours_roots(&host.capabilities, rooted)
                         }
                         PathNeeds::SharedFilesystemOrTransfer => {
                             host.capabilities.transfer
                                 || (host.capabilities.shares_submitter_filesystem
-                                    && (!require_path_root || host.capabilities.path_root))
+                                    && honours_roots(&host.capabilities, rooted))
                         }
                     }
             })

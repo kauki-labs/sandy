@@ -704,9 +704,11 @@ pub async fn handle(
             let wants_digests = submit.digests;
             // #618: a root on any path. A host that opens the paths itself must declare `path_root`, or it would drop
             // the root without a word (see `pick_host_egress`).
-            let rooted = submit.inputs.iter().any(|i| i.root.is_some())
-                || submit.outputs.iter().any(|o| o.root.is_some())
-                || submit.secrets.iter().any(|s| s.root.is_some());
+            let rooted = crate::host_registry::RootedPaths {
+                inputs_or_outputs: submit.inputs.iter().any(|i| i.root.is_some())
+                    || submit.outputs.iter().any(|o| o.root.is_some()),
+                secrets: submit.secrets.iter().any(|s| s.root.is_some()),
+            };
             let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
             // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
@@ -747,7 +749,7 @@ pub async fn handle(
                 egress_placement_refusal()
             } else if wants_digests {
                 digests_placement_refusal()
-            } else if rooted {
+            } else if rooted.any() {
                 path_root_placement_refusal()
             } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
                 format!(
