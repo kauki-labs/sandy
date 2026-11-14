@@ -1516,6 +1516,12 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   (`normalise_name`: 253 bytes after one trailing dot is stripped, labels of at most 63), measured the same way, so a
   host the proxy accepts is never refused here. The proxy has no rule-count bound, so 256 is new. The direct
   `sandy run --allow` stays unbounded.
+- Path roots (#618): a Submit path may carry an optional `root`, the trusted absolute directory it lies beneath (the
+  broker sets it from the client's `roots`). `sandyd` refuses a root that is not absolute, a path not under it and a
+  `..` below it, copies it into the `Dispatch`, and opens a rooted input or output it handles itself (the data link)
+  beneath the root without following a link. A root an executor would have to honour is placed only on a host that
+  declared `path_root` (secrets always, inputs and outputs when the host has no `transfer`), because an executor drops
+  a field it does not know without a word. See guest-shares decision 14.
 - A2 (#483): `sandyd` builds the result envelope with `sandy::build_envelope` and `classify_outcome`, stores it in
   `jobs.envelope` in the statement that makes the job terminal, and serves its JSON in `StatusResponse.result_envelope`.
   `who` is the local-uid fallback with `authenticated: false` (verified caps are #413). A run that carried an egress

@@ -426,12 +426,24 @@ impl HostRegistry {
         required_sandbox_kind: i32,
         needs: PathNeeds,
     ) -> Option<PlacementCandidate> {
-        self.pick_host_egress(required_isolation_class, required_sandbox_kind, needs, false, false)
+        self.pick_host_egress(
+            required_isolation_class,
+            required_sandbox_kind,
+            needs,
+            false,
+            false,
+            false,
+        )
     }
 
     /// [`Self::pick_host`] that also requires, when `require_egress_proxy` is set, a host that declared
     /// `egress_proxy` (A1, #483). An executor drops a `Dispatch.egress` it does not know without a word, so a job with
     /// an egress policy is never placed on a host that did not declare it.
+    ///
+    /// `require_path_root` is set when a path field carries a `root` (#618). An executor drops a `root` it does not
+    /// know without a word, so a host that opens the paths itself must have declared `path_root`: every host for
+    /// `SharedFilesystem` (secrets, a credential), and a host with no `transfer` for `SharedFilesystemOrTransfer`,
+    /// because `sandyd` opens the paths of a transfer host over the data link.
     #[must_use]
     pub fn pick_host_egress(
         &self,
@@ -440,6 +452,7 @@ impl HostRegistry {
         needs: PathNeeds,
         require_egress_proxy: bool,
         require_digests: bool,
+        require_path_root: bool,
     ) -> Option<PlacementCandidate> {
         if required_isolation_class == i32::from(IsolationClass::Unspecified) {
             tracing::debug!(
@@ -485,9 +498,14 @@ impl HostRegistry {
                     && (!require_digests || host.capabilities.digests)
                     && match needs {
                         PathNeeds::Anywhere => true,
-                        PathNeeds::SharedFilesystem => host.capabilities.shares_submitter_filesystem,
+                        PathNeeds::SharedFilesystem => {
+                            host.capabilities.shares_submitter_filesystem
+                                && (!require_path_root || host.capabilities.path_root)
+                        }
                         PathNeeds::SharedFilesystemOrTransfer => {
-                            host.capabilities.shares_submitter_filesystem || host.capabilities.transfer
+                            host.capabilities.transfer
+                                || (host.capabilities.shares_submitter_filesystem
+                                    && (!require_path_root || host.capabilities.path_root))
                         }
                     }
             })

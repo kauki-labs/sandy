@@ -274,6 +274,15 @@ fn digests_placement_refusal() -> String {
         .to_owned()
 }
 
+/// The refusal for a Submit with a rooted path and no host that can honour the root (#618). It names the capability: an
+/// executor that does not know `root` would drop it and open the path as given, with the parent-swap gap still open.
+fn path_root_placement_refusal() -> String {
+    "no registered host can honour the root of this Submit's paths: a rooted secret, or a rooted input or output on a \
+     host with no transfer, needs a host that declares path_root, because an executor that does not know the field \
+     would drop it and open the path without the boundary"
+        .to_owned()
+}
+
 fn egress_placement_refusal() -> String {
     "no registered host declares egress_proxy together with the required isolation class and sandbox kind; this Submit \
      names an egress policy, and an executor that does not know it would drop it and run the job without the boundary"
@@ -689,6 +698,11 @@ pub async fn handle(
             // A2c (#483): a digest job needs an executor that declared `digests`: an older one drops the field
             // silently.
             let wants_digests = submit.digests;
+            // #618: a root on any path. A host that opens the paths itself must declare `path_root`, or it would drop
+            // the root without a word (see `pick_host_egress`).
+            let rooted = submit.inputs.iter().any(|i| i.root.is_some())
+                || submit.outputs.iter().any(|o| o.root.is_some())
+                || submit.secrets.iter().any(|s| s.root.is_some());
             let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
             // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
@@ -714,6 +728,7 @@ pub async fn handle(
                         path_needs,
                         egress_policy,
                         wants_digests,
+                        rooted,
                     )
                     .is_some()
             };
@@ -728,6 +743,8 @@ pub async fn handle(
                 egress_placement_refusal()
             } else if wants_digests {
                 digests_placement_refusal()
+            } else if rooted {
+                path_root_placement_refusal()
             } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
                 format!(
                     "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
@@ -823,6 +840,7 @@ pub async fn handle(
                     path_needs,
                     egress_policy,
                     wants_digests,
+                    rooted,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
