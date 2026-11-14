@@ -1372,10 +1372,11 @@ pub async fn handle(
                 .collect(),
         }),
         Some(control_request::Op::Prune(prune)) => {
-            let store = Arc::clone(store);
             let keep_last = usize::try_from(prune.keep_last).unwrap_or(usize::MAX);
-            let evicted = tokio::task::spawn_blocking(move || store.prune_terminal(keep_last)).await??;
-            let swept_staging_dirs = tokio::task::spawn_blocking(sweep_stale_staging_dirs).await?;
+            let evicting = Arc::clone(store);
+            let evicted = tokio::task::spawn_blocking(move || evicting.prune_terminal(keep_last)).await??;
+            let store = Arc::clone(store);
+            let swept_staging_dirs = tokio::task::spawn_blocking(move || sweep_stale_staging_dirs(&store)).await?;
             tracing::info!(
                 evicted = evicted.len(),
                 swept = swept_staging_dirs.len(),
@@ -1411,19 +1412,40 @@ pub async fn handle(
     })
 }
 
+/// The `cred-*` dirs of jobs that are still live (pending or running), by the credential records in `store` (#834).
+/// Nothing refreshes such a dir's mtime, so the sweep asks the store instead.
+fn live_cred_dirs(store: &JobStore) -> Result<std::collections::HashSet<std::path::PathBuf>, StoreError> {
+    let mut live = std::collections::HashSet::new();
+    for (job_id, record) in store.credential_records()? {
+        if matches!(store.status(&job_id)?, Some(JobStatus::Pending | JobStatus::Running))
+            && let Some(dir) = record.token_path.parent()
+        {
+            live.insert(dir.to_owned());
+        }
+    }
+    Ok(live)
+}
+
+/// [`sweep_stale_staging_dirs`] over `base`; the error text is why it swept nothing.
+fn sweep_stale_staging_dirs_in(store: &JobStore, base: &std::path::Path) -> Result<Vec<String>, String> {
+    let live = live_cred_dirs(store).map_err(|e| e.to_string())?;
+    sandy_fsutil::sweep_stale_staging_dirs_except(
+        base,
+        sandy_fsutil::STALE_STAGING_PREFIXES,
+        std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+        |dir| live.contains(dir),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Remove the stale `cred-*` and `verify-*` dirs under the sandy staging base, the sweep `sandy gc` runs (#195). A dir
-/// younger than the longest credential TTL is never touched. Best effort: a failure is logged and sweeps nothing.
-fn sweep_stale_staging_dirs() -> Vec<String> {
+/// younger than the longest credential TTL is never touched, nor is the dir of a live job whatever its age (#834). A
+/// dir no job record owns keeps the mtime rule. Best effort: a failure is logged and sweeps nothing, and a store that
+/// cannot say which jobs are live sweeps nothing (fail closed).
+fn sweep_stale_staging_dirs(store: &JobStore) -> Vec<String> {
     let swept = sandy_fsutil::ensure_sandy_staging_base()
         .map_err(|e| e.to_string())
-        .and_then(|base| {
-            sandy_fsutil::sweep_stale_staging_dirs(
-                &base,
-                sandy_fsutil::STALE_STAGING_PREFIXES,
-                std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
-            )
-            .map_err(|e| e.to_string())
-        });
+        .and_then(|base| sweep_stale_staging_dirs_in(store, &base));
     swept.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "prune: could not sweep stale credential staging dirs");
         Vec::new()
@@ -2685,6 +2707,64 @@ mod tests {
         let mut left: Vec<String> = store.list()?.into_iter().map(|s| s.job_id).collect();
         left.sort();
         assert_eq!(left, ["live", "new"]);
+        Ok(())
+    }
+
+    /// A staged `cred-<job_id>` dir under `base`, backdated past `MAX_TTL_SECS`, owned by `job_id`'s credential record
+    /// (#834).
+    fn stage_old_cred_dir(
+        store: &JobStore,
+        base: &std::path::Path,
+        job_id: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let dir = base.join(format!("cred-{job_id}"));
+        std::fs::create_dir_all(&dir).context("create cred dir")?;
+        let token = dir.join(CREDENTIAL_SECRET_NAME);
+        std::fs::write(&token, b"t").context("write token")?;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS) + 600);
+        std::fs::File::open(&dir)
+            .context("open dir")?
+            .set_modified(old)
+            .context("backdate dir")?;
+        store.set_credential(
+            job_id,
+            &crate::store::CredentialRecord {
+                trust_root: "gh".to_owned(),
+                handle_id: "h".to_owned(),
+                expires_at_unix: 0,
+                token_path: token,
+            },
+        )?;
+        Ok(dir)
+    }
+
+    /// #834: a prune sweep must not remove the `cred-*` dir of a job that is still live, however old the dir is. Once
+    /// the job is terminal, or when no job record owns the dir, the same dir is swept. The sweep asks the store, not
+    /// the mtime. It runs over a private base, so it cannot race the Prune tests that sweep the real staging base.
+    #[test]
+    fn a_prune_sweep_spares_a_live_jobs_old_cred_dir_and_sweeps_it_once_terminal() -> anyhow::Result<()> {
+        let store = new_store();
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).context("chmod")?;
+        let base = sandy_fsutil::ensure_staging_base_in(tmp.path()).context("staging base")?;
+        store.insert_pending("running", b"m", "argv/v1")?;
+        store.mark_running("running")?;
+        store.insert_pending("pending", b"m", "argv/v1")?;
+        store.insert_pending("done", b"m", "argv/v1")?;
+        store.finish("done", JobStatus::Succeeded, Some(0), "")?;
+        let running = stage_old_cred_dir(&store, &base, "running")?;
+        let pending = stage_old_cred_dir(&store, &base, "pending")?;
+        let done = stage_old_cred_dir(&store, &base, "done")?;
+        let orphan = stage_old_cred_dir(&store, &base, "no-such-job")?;
+
+        let mut swept = sweep_stale_staging_dirs_in(&store, &base).map_err(anyhow::Error::msg)?;
+
+        swept.sort();
+        assert_eq!(swept, ["cred-done", "cred-no-such-job"], "swept dirs");
+        assert!(running.exists(), "a running job's old cred dir must survive");
+        assert!(pending.exists(), "a pending job's old cred dir must survive");
+        assert!(!done.exists(), "a terminal job's old cred dir must be swept");
+        assert!(!orphan.exists(), "a dir no job record owns keeps the mtime rule");
         Ok(())
     }
 

@@ -211,7 +211,22 @@ pub const STALE_STAGING_PREFIXES: &[&str] = &["cred-", "verify-"];
 /// fails to remove outright (e.g. a permission error) is left in place for
 /// a later sweep rather than blocking the rest of this one.
 pub fn sweep_stale_staging_dirs(base: &Path, prefixes: &[&str], max_age: Duration) -> io::Result<Vec<String>> {
-    sweep_stale_staging_dirs_with(base, prefixes, max_age, |path| std::fs::remove_dir_all(path))
+    sweep_stale_staging_dirs_except(base, prefixes, max_age, |_| false)
+}
+
+/// [`sweep_stale_staging_dirs`], except a dir for which `keep` returns `true` is left alone however old it is (#834:
+/// the daemon keeps the dir of a live job). `keep` runs only for a dir already past `max_age`.
+///
+/// # Errors
+///
+/// As [`sweep_stale_staging_dirs`].
+pub fn sweep_stale_staging_dirs_except(
+    base: &Path,
+    prefixes: &[&str],
+    max_age: Duration,
+    keep: impl Fn(&Path) -> bool,
+) -> io::Result<Vec<String>> {
+    sweep_stale_staging_dirs_with(base, prefixes, max_age, keep, |path| std::fs::remove_dir_all(path))
 }
 
 /// [`sweep_stale_staging_dirs`]'s body, with the removal step injected so a
@@ -222,6 +237,7 @@ fn sweep_stale_staging_dirs_with(
     base: &Path,
     prefixes: &[&str],
     max_age: Duration,
+    keep: impl Fn(&Path) -> bool,
     mut remove: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<Vec<String>> {
     let now = SystemTime::now();
@@ -252,7 +268,7 @@ fn sweep_stale_staging_dirs_with(
         let Ok(age) = now.duration_since(modified) else {
             continue; // mtime in the future (clock skew): treat as fresh, never sweep.
         };
-        if age < max_age {
+        if age < max_age || keep(&entry.path()) {
             continue;
         }
         match remove(&entry.path()) {
@@ -548,15 +564,21 @@ mod tests {
         set_mtime_age(&second, Duration::from_secs(3600))?;
 
         let attempted = std::cell::RefCell::new(Vec::new());
-        let removed = sweep_stale_staging_dirs_with(&base, STALE_STAGING_PREFIXES, Duration::from_secs(3000), |path| {
-            let mut attempted = attempted.borrow_mut();
-            attempted.push(path.to_path_buf());
-            if attempted.len() == 1 {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected for the test"))
-            } else {
-                std::fs::remove_dir_all(path)
-            }
-        })
+        let removed = sweep_stale_staging_dirs_with(
+            &base,
+            STALE_STAGING_PREFIXES,
+            Duration::from_secs(3000),
+            |_| false,
+            |path| {
+                let mut attempted = attempted.borrow_mut();
+                attempted.push(path.to_path_buf());
+                if attempted.len() == 1 {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected for the test"))
+                } else {
+                    std::fs::remove_dir_all(path)
+                }
+            },
+        )
         .context("sweep")?;
         let attempted = attempted.into_inner();
 
