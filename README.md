@@ -10,7 +10,7 @@
 [![codecov](https://codecov.io/gh/kauki-labs/sandy/graphs/tree.svg?token=A9TAJHW2FH)](https://codecov.io/gh/kauki-labs/sandy)
 
 `sandy` runs a job in an ephemeral NixOS microVM and returns a locked result
-envelope. One `VmBackend` seam launches the guest (qemu on Linux, vfkit on
+envelope. One `VirtualizationBackend` seam launches the guest (qemu on Linux, vfkit on
 macOS); inputs, outputs, secrets, and a scoped forge credential travel in over
 virtio-fs shares; an egress allow-list wraps the boot.
 
@@ -49,7 +49,7 @@ flowchart TD
   end
   eg --> stage
 
-  subgraph vm_seam["VmBackend seam"]
+  subgraph vm_seam["VirtualizationBackend seam"]
     boot["boot guest + console protocol<br/>(qemu on Linux, vfkit on macOS)"]
   end
   stage --> boot

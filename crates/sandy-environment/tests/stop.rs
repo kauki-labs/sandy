@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use sandy_api::{
-    backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, Outcome, RunSpec, VirtualizationBackend},
     environment::{EnvironmentBackend, EnvironmentSpec},
 };
 use sandy_environment::{StopRequest, VmEnvironmentBackend, VmEnvironmentConfig};
@@ -27,7 +27,7 @@ struct Vm {
     cancelled_at_exit: Arc<Mutex<Option<bool>>>,
 }
 
-impl VmBackend for Vm {
+impl VirtualizationBackend for Vm {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         while !spec.control.is_cancelled() && !self.stopped.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));

@@ -10,7 +10,7 @@ The live **KPIs** are consolidated as an acceptance matrix in [`kpi.md`](kpi.md)
 
 Invariants referenced here: **INV-1** secrets never reach argv/env/the store
 ([attacker model](#attacker-model)); **INV-3** liveness only through
-`VmBackend::boxes`, never a direct registry read ([attacker
+`VirtualizationBackend::boxes`, never a direct registry read ([attacker
 model](#attacker-model)); **INV-6** a `Running` record is written before the
 backend runs and a terminal record always carries the envelope; **INV-7**
 fail-closed (a mint or egress-apply failure is an infra fault, never a degraded
@@ -88,7 +88,7 @@ It does not guarantee:
 
 ---
 
-## 1. Run plane (`VmBackend`)
+## 1. Run plane (`VirtualizationBackend`)
 
 **Purpose.** Launch the guest natively and drive it to a physical `Outcome`
 (`booted`, `guest_exit`, `transport_error`, `timed_out`, `console`).
@@ -97,7 +97,7 @@ It does not guarantee:
 
 - **One seam, two native backends.** `QemuBackend` (Linux/KVM, serial on `ttyS0`)
   and `VfkitBackend` (macOS/Virtualization.framework, console on `hvc0`) implement
-  `VmBackend`. No external VM library; the argv assembly is a pure function so the
+  `VirtualizationBackend`. No external VM library; the argv assembly is a pure function so the
   whole topology→argv mapping is unit-testable without spawning.
 - **Topology from Nix, not hard-coded.** The VM shape (kernel, initrd, store,
   cpu/mem, shares, hypervisor) is a typed `Topology` read from a guest flake attr
@@ -255,7 +255,7 @@ in-guest, and revoke it at teardown. Jobs get no mid-run refresh (#483).
 sequenceDiagram
   participant S as sandyd
   participant P as CredentialProvider
-  participant B as VmBackend
+  participant B as VirtualizationBackend
   participant G as guest
   S->>P: mint(scope, ttl)
   P-->>S: Minted(token, expiry, handle)
@@ -524,7 +524,7 @@ are control-RPC calls to it (the CLI no longer reconciles anything). The history
 - A level-triggered `EnvironmentDriver` converges the boxes an `EnvironmentBackend` runs to the rows: launch, probe to `Ready`, fail on a failed probe or a timeout, and kill any box that no live row names. It is also the restart reconciler (decision 28).
 - An opt-in, trusted-only process backend (`SANDY_ENV_BACKEND=process-insecure`, decision 29) runs the service as a host process group with a cleared environment and no isolation. A failed group kill keeps the entry so a later kill retries.
 - An idle-stop lease (decision 30) stops a `Ready` environment with no owner-visible use or backend-reported connection (#645) for `SANDY_ENV_IDLE_TIMEOUT_SECS`; off by default. `vm-qemu` refuses the setting (decision 34) until the bridge reports connections.
-- The VM backend (decision 31) holds one agent-mode `VmBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 34, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
+- The VM backend (decision 31) holds one agent-mode `VirtualizationBackend::run` per environment. `SANDY_ENV_BACKEND=vm-qemu` (decision 34, Linux only) wires it into `sandyd` with an agent-link relay and a loopback bridge that makes the environment Ready. A Ready VM environment cannot be linked yet: pairing in VM mode has no owner (#590).
 - `SANDY_ENV_BACKEND=vm-vfkit` (decision 35, macOS only) composes the same backend over `VfkitBackend::with_service_socket`: one hashed socket path per environment under the private staging base, and the bridge starts when the agent link comes up. Both backends sweep orphaned VMs once at construction.
 - Mesh join (decision 36, proposed, #671) is an alternative to the host bridge. `sandy-environment::mesh` sequences setup and teardown over generic seams: the caller picks the name, the key is minted just before boot, `.ready` is written last, a failed step expires the key (a failed expiry is carried, not reported burned), teardown stops the VM and expires the key before the node delete and a failed node delete keeps the record, and no key text reaches an error or log. Nothing is specific to one service; deployment routes plug in through `GuestHooks`. Sequencer only; nothing is wired into `sandyd`.
 

@@ -1104,7 +1104,7 @@ mod tests {
     /// A backend that does nothing, so `guarded` has something to wrap.
     struct NullBackend;
 
-    impl sandy_api::backend::VmBackend for NullBackend {
+    impl sandy_api::backend::VirtualizationBackend for NullBackend {
         fn run(
             &self,
             _spec: &sandy_api::backend::RunSpec,

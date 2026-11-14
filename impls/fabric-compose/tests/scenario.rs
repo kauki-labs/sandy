@@ -59,7 +59,7 @@ use sandy_fabric_local::{
     LocalCapAuthority,
     agent::{SandboxAgent, TTY_STDOUT},
     channel::{Channel, ChannelError},
-    executor::VmBackendExecutor,
+    executor::VirtualizationBackendExecutor,
     inmem::InMem,
     placement::{ExecutorCapacity, LeaseTable, StaticRegistry, place},
     roles::{EscalationRole, OrchestratorRole, PeerGroupRole},
@@ -219,7 +219,11 @@ async fn the_all_local_scenario_runs_end_to_end() -> anyhow::Result<()> {
     // (#209): a separately hand-typed Capabilities value here could drift from
     // what's actually wired in, matching a request Discovery never should have.
     let host_id = HostId::from(StaticRegistry::LOCALHOST);
-    let capacity = ExecutorCapacity::new().with_host(host_id.clone(), VmBackendExecutor::new(ProcessBackend::new()), 1);
+    let capacity = ExecutorCapacity::new().with_host(
+        host_id.clone(),
+        VirtualizationBackendExecutor::new(ProcessBackend::new()),
+        1,
+    );
     let discovery = StaticRegistry::new([capacity.descriptor_for(&host_id).context("describe the local host")?]);
     let lifecycle = LeaseTable::new(Duration::from_secs(60));
     lifecycle

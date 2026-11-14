@@ -1,6 +1,6 @@
 [package]
 name = "sandy-backend"
-description = "Native VmBackend implementations for sandy: the macOS vfkit and Linux/KVM qemu backends"
+description = "Native VirtualizationBackend implementations for sandy: the macOS vfkit and Linux/KVM qemu backends"
 version = "0.1.1"
 authors.workspace = true
 homepage.workspace = true
@@ -37,8 +37,8 @@ sandy-impls-vm = { workspace = true, optional = true }
 
 # The hub's own tests exercise every impl directly (not through the feature-gated
 # re-exports), so the impl crates are unconditional dev-deps. sandy-api's
-# `acceptance` feature exposes the shared VmBackend contract suite
-# (vmbackend_contract.rs), test-only.
+# `acceptance` feature exposes the shared VirtualizationBackend contract suite
+# (virtualization_backend_contract.rs), test-only.
 [dev-dependencies]
 anyhow.workspace = true
 sandy-api = { workspace = true, features = ["acceptance"] }

@@ -1,6 +1,6 @@
 //! Local (no-VM) sandy seam implementations.
 //!
-//! The raw-process [`VmBackend`](sandy::VmBackend) ([`ProcessBackend`]), the
+//! The raw-process [`VirtualizationBackend`](sandy::VirtualizationBackend) ([`ProcessBackend`]), the
 //! local-dir [`GuestShareTransport`](sandy_api::share::GuestShareTransport)
 //! ([`LocalDirTransport`]), the host [`Containment`](sandy::Containment)
 //! ([`SystemdRunContainment`]), and the no-op [`EgressApplier`](sandy::EgressApplier)

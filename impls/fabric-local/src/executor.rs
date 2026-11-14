@@ -1,12 +1,12 @@
-//! The Executor seam's generic adapter over any [`VmBackend`] (spec §3.1, #108).
+//! The Executor seam's generic adapter over any [`VirtualizationBackend`] (spec §3.1, #108).
 //!
-//! `VmBackend` stays the host's native, synchronous run plane (process, qemu,
-//! vfkit); [`VmBackendExecutor`] wraps any impl of it into the fabric's async
-//! [`Executor`] seam. This is purely additive: `VmBackend` is not renamed, and
+//! `VirtualizationBackend` stays the host's native, synchronous run plane (process, qemu,
+//! vfkit); [`VirtualizationBackendExecutor`] wraps any impl of it into the fabric's async
+//! [`Executor`] seam. This is purely additive: `VirtualizationBackend` is not renamed, and
 //! none of its existing callers or tests move.
 //!
 //! `capabilities()` is derived, never caller-settable: `kind` self-reports via
-//! [`VmBackend::kind`] (already on the trait); `arch` is the compiled host
+//! [`VirtualizationBackend::kind`] (already on the trait); `arch` is the compiled host
 //! target ([`std::env::consts::ARCH`]), since every backend here (process,
 //! qemu, vfkit) boots a guest matching the host's architecture. A
 //! caller-settable capability would let a backend claim something it cannot
@@ -17,23 +17,23 @@
 //! must report the GUEST arch, not the host's — this adapter does not need to
 //! change for that until it happens.
 //!
-//! `run`/`kill`/`observe` bridge the synchronous `VmBackend` into the fabric's
+//! `run`/`kill`/`observe` bridge the synchronous `VirtualizationBackend` into the fabric's
 //! async trait via [`tokio::task::block_in_place`], so the backend's call runs
 //! to completion without starving the runtime. `block_in_place` panics outside
-//! a multi-thread Tokio runtime, so whatever composes a [`VmBackendExecutor`]
+//! a multi-thread Tokio runtime, so whatever composes a [`VirtualizationBackendExecutor`]
 //! (the fabric composition root, #115) must run on one.
 
 #[cfg(test)]
 use sandy_api::backend::RunControl;
-use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, VmBackend};
+use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, VirtualizationBackend};
 use sandy_fabric::executor::{Arch, Capabilities, Executor, ExecutorError};
 
-/// Adapts a synchronous [`VmBackend`] into the fabric's async [`Executor`] seam.
-pub struct VmBackendExecutor<B> {
+/// Adapts a synchronous [`VirtualizationBackend`] into the fabric's async [`Executor`] seam.
+pub struct VirtualizationBackendExecutor<B> {
     backend: B,
 }
 
-impl<B: VmBackend> VmBackendExecutor<B> {
+impl<B: VirtualizationBackend> VirtualizationBackendExecutor<B> {
     /// Wrap `backend`. `capabilities()` derives from it; nothing here is
     /// caller-supplied (see the module doc).
     pub fn new(backend: B) -> Self {
@@ -41,7 +41,7 @@ impl<B: VmBackend> VmBackendExecutor<B> {
     }
 }
 
-impl<B: VmBackend + Send + Sync> Executor for VmBackendExecutor<B> {
+impl<B: VirtualizationBackend + Send + Sync> Executor for VirtualizationBackendExecutor<B> {
     async fn run(&self, spec: &RunSpec<'_>) -> Result<Outcome, ExecutorError> {
         tokio::task::block_in_place(|| self.backend.run(spec)).map_err(map_err)
     }
@@ -94,9 +94,9 @@ fn host_arch() -> Arch {
 
 #[cfg(test)]
 mod tests {
-    //! Mirrors `vmbackend_contract.rs`'s shape (#108): the same real
+    //! Mirrors `virtualization_backend_contract.rs`'s shape (#108): the same real
     //! `ProcessBackend`, the same adversarial cases, run through the Executor
-    //! seam instead of `VmBackend` directly. `VmBackend`'s own contract tests
+    //! seam instead of `VirtualizationBackend` directly. `VirtualizationBackend`'s own contract tests
     //! (in `sandy-backend`) are untouched.
 
     use sandy_api::backend::{Grants, SandboxKind};
@@ -131,18 +131,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn vm_backend_executor_satisfies_the_executor_contract() -> anyhow::Result<()> {
         executor_suite(expected_caps(), "contract", || {
-            VmBackendExecutor::new(ProcessBackend::new())
+            VirtualizationBackendExecutor::new(ProcessBackend::new())
         })
         .await
         .map_err(Into::into)
     }
 
     /// INV mirror of `process_nonzero_exit_classifies_as_task_failure_not_infra`
-    /// (`vmbackend_contract.rs`): a non-zero exit through the adapter is still a
+    /// (`virtualization_backend_contract.rs`): a non-zero exit through the adapter is still a
     /// carried exit code, never collapsed into an infra fault.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_nonzero_exit_through_the_adapter_is_not_an_infra_fault() -> anyhow::Result<()> {
-        let executor = VmBackendExecutor::new(ProcessBackend::new());
+        let executor = VirtualizationBackendExecutor::new(ProcessBackend::new());
         let grants = Grants {
             secrets: false,
             agent: false,
@@ -177,13 +177,13 @@ mod tests {
     /// about its capability, to prove the suite catches a false claim made
     /// through the production `run`/`kill`/`observe` plumbing, not just
     /// `sandy-fabric`'s `FakeExecutor`. There is no equivalent production API —
-    /// `VmBackendExecutor::capabilities()` stays non-forgeable (see module doc).
+    /// `VirtualizationBackendExecutor::capabilities()` stays non-forgeable (see module doc).
     struct LyingExecutor<B> {
-        inner: VmBackendExecutor<B>,
+        inner: VirtualizationBackendExecutor<B>,
         claims: Capabilities,
     }
 
-    impl<B: VmBackend + Send + Sync> Executor for LyingExecutor<B> {
+    impl<B: VirtualizationBackend + Send + Sync> Executor for LyingExecutor<B> {
         async fn run(&self, spec: &RunSpec<'_>) -> Result<Outcome, ExecutorError> {
             self.inner.run(spec).await
         }
@@ -208,7 +208,7 @@ mod tests {
             ..expected_caps()
         };
         let result = executor_suite(expected_caps(), "contract", || LyingExecutor {
-            inner: VmBackendExecutor::new(ProcessBackend::new()),
+            inner: VirtualizationBackendExecutor::new(ProcessBackend::new()),
             claims: lying_caps,
         })
         .await;

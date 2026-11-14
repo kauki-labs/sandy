@@ -1,4 +1,4 @@
-//! The sandy backend hub: selects which [`VmBackend`](sandy::VmBackend)
+//! The sandy backend hub: selects which [`VirtualizationBackend`](sandy::VirtualizationBackend)
 //! implementation crates compile in, via cargo features, and re-exports the
 //! chosen impls plus the shared share contract so downstream (sandy-cli) imports
 //! one backend surface regardless of which impls are enabled.

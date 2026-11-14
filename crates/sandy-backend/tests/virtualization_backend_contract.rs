@@ -1,15 +1,17 @@
-//! The shared `VmBackend` seam contract: one suite every implementation passes
+//! The shared `VirtualizationBackend` seam contract: one suite every implementation passes
 //! (#131 / #103 seam-first). Run here against the two CI-safe impls — the scripted
 //! `FakeBackend` (sandy-test-support) and the real `ProcessBackend` (this crate). The VM impls
 //! (`QemuBackend`/`VfkitBackend`) satisfy the same contract but need a hypervisor,
 //! so they are proven in the live tier, not here.
 //!
-//! The suite itself lives in `sandy_api::contract::vmbackend_suite` (the
+//! The suite itself lives in `sandy_api::contract::virtualization_backend_suite` (the
 //! `acceptance` feature), shared with `sandy-cli`'s acceptance binaries (#131 R4b)
 //! so the real impl and the fake run the identical checks the capstone binaries do.
 
-use sandy::{Grants, Outcome, OutputStatus, ProcessExit, RunControl, RunSpec, Status, VmBackend, classify_outcome};
-use sandy_api::contract::vmbackend_suite;
+use sandy::{
+    Grants, Outcome, OutputStatus, ProcessExit, RunControl, RunSpec, Status, VirtualizationBackend, classify_outcome,
+};
+use sandy_api::contract::virtualization_backend_suite;
 use sandy_backend::ProcessBackend;
 use sandy_test_support::FakeBackend;
 
@@ -51,12 +53,13 @@ fn fake_backend_satisfies_the_contract() -> anyhow::Result<()> {
         timed_out: false,
         console: String::new(),
     };
-    vmbackend_suite("contract", || FakeBackend::new().with_outcome(success.clone())).map_err(|e| anyhow::anyhow!("{e}"))
+    virtualization_backend_suite("contract", || FakeBackend::new().with_outcome(success.clone()))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[test]
 fn process_backend_satisfies_the_contract() -> anyhow::Result<()> {
-    vmbackend_suite("contract", ProcessBackend::new).map_err(|e| anyhow::anyhow!("{e}"))
+    virtualization_backend_suite("contract", ProcessBackend::new).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// INV-11 guard: a non-zero process exit classifies as a task failure (band 1,

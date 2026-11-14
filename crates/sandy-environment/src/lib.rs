@@ -6,7 +6,7 @@
 //! the whole chain (the service, MCP, broker, `sandyd`, driver, backend) can run before
 //! the VM backend lands, and must stay off by default.
 //!
-//! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VmBackend::run` per environment.
+//! [`VmEnvironmentBackend`] is the isolated one: a held agent-mode `VirtualizationBackend::run` per environment.
 //!
 //! [`mesh`] holds the generic mesh-join setup and teardown sequencer (#671); it stays a public
 //! module because its names (`setup`, `teardown`) are only meaningful namespaced.

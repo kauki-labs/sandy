@@ -1,8 +1,8 @@
 //! The executor seam (spec §3.1): what provides a sandbox, fleet-wide.
 //!
-//! The fleet-level generalization of [`sandy_api::backend::VmBackend`], added
-//! alongside it rather than replacing it: `VmBackend` stays the sync run plane,
-//! and an adapter wraps any `VmBackend` (process, qemu, vfkit) into an
+//! The fleet-level generalization of [`sandy_api::backend::VirtualizationBackend`], added
+//! alongside it rather than replacing it: `VirtualizationBackend` stays the sync run plane,
+//! and an adapter wraps any `VirtualizationBackend` (process, qemu, vfkit) into an
 //! [`Executor`]. The run data types are `sandy-api`'s, so both seams speak one
 //! contract. [`Executor::capabilities`] is the host's self-registration: what kind
 //! of sandbox it provides, matched against a job with [`capabilities_satisfy`].

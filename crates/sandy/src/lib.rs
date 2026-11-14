@@ -4,10 +4,11 @@
 //! `pub use` facade re-exported below — the operations, their contract types, and
 //! the injection trait seams. The capabilities, all provable without a hypervisor:
 //!
-//! - **Run plane** — the pinned [`VmBackend`] seam plus the `snake_case` data types (INV-8) (a `FakeBackend` double
-//!   lives in `sandy-test-support`); the LOCKED result envelope [`ResultEnvelope`] (INV-11); exit-0-only `O_NOFOLLOW`
-//!   [`collect`]ion (INV-2/4). The [`Containment`] seam confines a non-VM executor's job so its whole process tree is
-//!   reaped (the process backend's isolation story, #135); [`admits_untrusted`] is the fail-closed gate.
+//! - **Run plane** — the pinned [`VirtualizationBackend`] seam plus the `snake_case` data types (INV-8) (a
+//!   `FakeBackend` double lives in `sandy-test-support`); the LOCKED result envelope [`ResultEnvelope`] (INV-11);
+//!   exit-0-only `O_NOFOLLOW` [`collect`]ion (INV-2/4). The [`Containment`] seam confines a non-VM executor's job so
+//!   its whole process tree is reaped (the process backend's isolation story, #135); [`admits_untrusted`] is the
+//!   fail-closed gate.
 //! - **Provisioning** — [`classify`] host facts into a [`ProvisioningStrategy`], then [`provision`] /
 //!   [`provision_remote_build`] / [`decide_fallback`] over the [`HostNixProvisioner`] and [`RemoteBuilder`] seams.
 //! - **Seed identity** — [`acquire`] a [`VerifiedSeed`] via a [`SignatureVerifier`].
@@ -52,7 +53,7 @@ mod trust_root;
 
 pub use backend::{
     BackendError, BoxState, DirFingerprint, Grants, Input, Outcome, Output, PlanError, RunControl, RunDigests, RunSpec,
-    SandboxKind, SecretRef, SecretSource, VmBackend, backend_accepts, validate_no_secret_leak,
+    SandboxKind, SecretRef, SecretSource, VirtualizationBackend, backend_accepts, validate_no_secret_leak,
 };
 pub use collect::{CollectError, OutputSpec, collect};
 pub use config::CollectionConfig;

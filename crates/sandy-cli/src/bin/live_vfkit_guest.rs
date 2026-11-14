@@ -10,7 +10,7 @@
 
 use std::{path::PathBuf, process::ExitCode};
 
-use sandy_api::backend::{Grants, Input, RunControl, RunSpec, VmBackend};
+use sandy_api::backend::{Grants, Input, RunControl, RunSpec, VirtualizationBackend};
 use sandy_backend::VfkitBackend;
 use sandy_cli::live_target::{guest_flake, require_live};
 

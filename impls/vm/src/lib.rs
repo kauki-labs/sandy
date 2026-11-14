@@ -1,7 +1,7 @@
 //! VM sandy seam implementations.
 //!
 //! The Linux/KVM [`QemuBackend`] and macOS [`VfkitBackend`] (both concrete
-//! [`VmBackend`](sandy::VmBackend) impls), plus their per-hypervisor virtio-fs
+//! [`VirtualizationBackend`](sandy::VirtualizationBackend) impls), plus their per-hypervisor virtio-fs
 //! [`GuestShareTransport`](sandy_api::share::GuestShareTransport)s
 //! ([`VirtiofsdTransport`] for qemu, [`VirtioFsTransport`] for vfkit) and the
 //! native [console driver](console) the backends drive. The seam contracts live

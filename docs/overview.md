@@ -8,7 +8,7 @@ updated: 2026-10-25
 # sandy overview
 
 sandy runs one job in an ephemeral NixOS microVM and returns a locked result envelope. It
-owns the hypervisor launch natively (qemu on Linux, vfkit on macOS) behind one `VmBackend`
+owns the hypervisor launch natively (qemu on Linux, vfkit on macOS) behind one `VirtualizationBackend`
 seam, delivers inputs/outputs/secrets and a scoped forge credential over virtio-fs shares,
 enforces an egress allow-list around the boot, and classifies the outcome into a status + exit
 band that never disagree.
@@ -16,7 +16,7 @@ band that never disagree.
 ```mermaid
 flowchart LR
     cli["sandy-cli (parse flags)"] --> plan["JobPlan"]
-    plan --> seam{"VmBackend seam"}
+    plan --> seam{"VirtualizationBackend seam"}
     seam -->|Linux| qemu["QemuBackend"]
     seam -->|macOS| vfkit["VfkitBackend"]
     qemu --> vm["NixOS microVM"]

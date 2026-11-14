@@ -32,7 +32,7 @@ re-mints.
 
 ## What's missing — three seams
 
-1. **Concurrency.** `VmBackend::run` blocks until the job exits. A refresh timer
+1. **Concurrency.** `VirtualizationBackend::run` blocks until the job exits. A refresh timer
    has to run on a second thread alongside it.
 2. **A handle to the guest-visible file.** That file is `inst_dir/<NAME>`, where
    `inst_dir = temp_dir/sandy/<run_id>` is derived inside `run` from a `run_id` the
@@ -71,7 +71,7 @@ Seam 3 is the hinge: it decides whether any of seams 1–2 are worth building.
    to a backend-internal layout and has a pre-boot race (the file must exist before
    the first rewrite).
 3. **Backend refresh seam.** `run` takes a refresh channel/callback it drives.
-   Cleanest ownership, most invasive to the `VmBackend` trait.
+   Cleanest ownership, most invasive to the `VirtualizationBackend` trait.
 
 ## Scope note
 

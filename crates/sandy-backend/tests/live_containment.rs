@@ -15,7 +15,7 @@
 
 use std::{process::Command, time::Duration};
 
-use sandy::{Containment, ContainmentStatus, Grants, Input, RunControl, RunSpec, VmBackend};
+use sandy::{Containment, ContainmentStatus, Grants, Input, RunControl, RunSpec, VirtualizationBackend};
 use sandy_backend::{ProcessBackend, SystemdRunContainment};
 
 fn no_grants() -> Grants {

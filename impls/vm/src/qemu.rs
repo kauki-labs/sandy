@@ -8,9 +8,9 @@
 //!   secret share), it builds the `qemu-system-<arch>` command vector with no IO. Proven live on an x86_64 Linux/KVM
 //!   host (`/dev/kvm` world-rw): `sandy run` boots this argv to a `succeeded`/exit-0 result in ~10s with `-nographic
 //!   -serial chardev:sandy-serial console=ttyS0` and the sentinels on the serial socket.
-//! - [`QemuBackend`] — the [`VmBackend`] seam. `run` stages secrets, calls [`qemu_args`], spawns qemu with serial on
-//!   the #33 [`PipeTransport`](crate::PipeTransport), drives [`run_console`](crate::run_console), and populates the
-//!   pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
+//! - [`QemuBackend`] — the [`VirtualizationBackend`] seam. `run` stages secrets, calls [`qemu_args`], spawns qemu with
+//!   serial on the #33 [`PipeTransport`](crate::PipeTransport), drives [`run_console`](crate::run_console), and
+//!   populates the pinned [`Outcome`]. The spawn/boot is host-tier (tier-3), not unit-tested in the sandbox.
 //!
 //! The module is private; `sandy-backend`'s `lib.rs` re-exports only
 //! [`QemuBackend`], [`qemu_args`], and [`StagedArgs`].
@@ -27,9 +27,9 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology, VmBackend,
-    collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares, topology_until as eval_topology, wipe,
-    with_digests,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, SharePlan, StoreBacking, Topology,
+    VirtualizationBackend, collect_outputs, ensure_sandy_staging_base, kill_children, plan_shares,
+    topology_until as eval_topology, wipe, with_digests,
 };
 // Only `spawn_vsock_connector` below (the sole user) is Linux-only
 // (`#[cfg(target_os = "linux")]`); a plain import here is unused, and so a
@@ -253,11 +253,11 @@ fn kernel_cmdline(cmdline: &str) -> String {
     }
 }
 
-/// The native qemu/KVM [`VmBackend`] (Linux).
+/// The native qemu/KVM [`VirtualizationBackend`] (Linux).
 ///
-/// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
+/// Owns its running-instance registry so [`boxes`](VirtualizationBackend::boxes) reports live
 /// state without a direct supervisor read (INV-3), mirroring the seam contract in
-/// [`sandy::VmBackend`]. Construct with [`QemuBackend::new`].
+/// [`sandy::VirtualizationBackend`]. Construct with [`QemuBackend::new`].
 #[derive(Debug, Default)]
 pub struct QemuBackend {
     /// Called once per run with `(box_id, cid)` after the agent link connects (#587).
@@ -265,7 +265,7 @@ pub struct QemuBackend {
     /// Gets a copy of the console as it is read, so a failed provision can show it (#727).
     console_sink: SinkCell,
     /// The boxes this backend has launched and not yet reaped, read by
-    /// [`boxes`](VmBackend::boxes) and pruned by [`kill`](VmBackend::kill).
+    /// [`boxes`](VirtualizationBackend::boxes) and pruned by [`kill`](VirtualizationBackend::kill).
     instances: Mutex<Vec<BoxState>>,
     /// When set, the job runs as the child of the image's sandbox agent (#238).
     agent: Option<AgentLaunch>,
@@ -298,8 +298,8 @@ impl QemuBackend {
     ///
     /// The hook runs on the console thread (inside the boot read loop) or the connector thread, so it must hand off
     /// and not block: a blocked hook stalls the run's deadline, cancel and serial reads, or the agent link. The
-    /// consumer must stop using the CID when [`run`](VmBackend::run) returns: qemu is gone by then, and a later VM
-    /// can take the same CID.
+    /// consumer must stop using the CID when [`run`](VirtualizationBackend::run) returns: qemu is gone by then, and a
+    /// later VM can take the same CID.
     #[must_use]
     pub fn with_guest_cid_hook(mut self, hook: impl Fn(&str, u32) + Send + Sync + 'static) -> Self {
         self.guest_cid_hook = HookCell(Some(Arc::new(hook)));
@@ -901,7 +901,7 @@ fn drive_console(
     run_console(&mut transport, spec, &markers)
 }
 
-impl VmBackend for QemuBackend {
+impl VirtualizationBackend for QemuBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         require_proxy_host(spec, cfg!(target_os = "linux"))?;
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {

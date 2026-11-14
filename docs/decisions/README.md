@@ -35,6 +35,6 @@ acceptance matrix, [`../architecture/kpi.md`](../architecture/kpi.md).
 | [t3-guest-image](t3-guest-image.md)               | history: the T3 guest image, removed from core 2026-11-11                      |
 
 Invariants referenced across these records: **INV-1** secrets never reach
-argv/env/the store; **INV-3** liveness only through `VmBackend::boxes`; **INV-6** a `Running` record is written before boot; **INV-7** fail-closed;
+argv/env/the store; **INV-3** liveness only through `VirtualizationBackend::boxes`; **INV-6** a `Running` record is written before boot; **INV-7** fail-closed;
 **INV-11** `status` ⇔ `retryable` ⇔ exit band never disagree; **INV-S9** a live
 scenario is never counted green from a fake.

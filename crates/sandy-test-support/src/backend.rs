@@ -1,13 +1,13 @@
-//! [`FakeBackend`]: an in-memory [`VmBackend`] test double.
+//! [`FakeBackend`]: an in-memory [`VirtualizationBackend`] test double.
 
 use std::sync::{Mutex, PoisonError};
 
 use sandy_api::{
-    backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend},
+    backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VirtualizationBackend},
     egress::AllowList,
 };
 
-/// An in-memory [`VmBackend`] test double.
+/// An in-memory [`VirtualizationBackend`] test double.
 ///
 /// Script a run outcome with [`FakeBackend::with_outcome`] /
 /// [`FakeBackend::with_error`], the running-box set with
@@ -16,18 +16,18 @@ use sandy_api::{
 /// [`FakeBackend::killed`].
 #[derive(Debug)]
 pub struct FakeBackend {
-    /// The scripted result of the next [`VmBackend::run`] call. Set once by the
+    /// The scripted result of the next [`VirtualizationBackend::run`] call. Set once by the
     /// by-value builders, then only read, so it needs no interior mutability.
     run_result: Option<Result<Outcome, BackendError>>,
-    /// The boxes [`VmBackend::boxes`] should report.
+    /// The boxes [`VirtualizationBackend::boxes`] should report.
     boxes: Vec<BoxState>,
-    /// The [`SandboxKind`] [`VmBackend::kind`] reports; `Vm` by default, matching
+    /// The [`SandboxKind`] [`VirtualizationBackend::kind`] reports; `Vm` by default, matching
     /// the trait's own default for every real backend but the process one.
     kind: SandboxKind,
-    /// Box ids passed to [`VmBackend::kill`], in call order — the one field
+    /// Box ids passed to [`VirtualizationBackend::kill`], in call order — the one field
     /// mutated through `&self`, so the only one behind a lock.
     killed: Mutex<Vec<String>>,
-    /// The egress policy each [`VmBackend::run`] call carried, in call order; its
+    /// The egress policy each [`VirtualizationBackend::run`] call carried, in call order; its
     /// length is the number of runs, so an empty list proves nothing booted.
     run_egress: Mutex<Vec<Option<AllowList>>>,
 }
@@ -51,49 +51,49 @@ impl FakeBackend {
         Self::default()
     }
 
-    /// Script the [`Outcome`] the next [`VmBackend::run`] returns.
+    /// Script the [`Outcome`] the next [`VirtualizationBackend::run`] returns.
     #[must_use]
     pub fn with_outcome(mut self, outcome: Outcome) -> Self {
         self.run_result = Some(Ok(outcome));
         self
     }
 
-    /// Script a [`BackendError`] for the next [`VmBackend::run`] call.
+    /// Script a [`BackendError`] for the next [`VirtualizationBackend::run`] call.
     #[must_use]
     pub fn with_error(mut self, error: BackendError) -> Self {
         self.run_result = Some(Err(error));
         self
     }
 
-    /// Script the boxes [`VmBackend::boxes`] reports.
+    /// Script the boxes [`VirtualizationBackend::boxes`] reports.
     #[must_use]
     pub fn with_boxes(mut self, boxes: Vec<BoxState>) -> Self {
         self.boxes = boxes;
         self
     }
 
-    /// Script the [`SandboxKind`] [`VmBackend::kind`] reports.
+    /// Script the [`SandboxKind`] [`VirtualizationBackend::kind`] reports.
     #[must_use]
     pub fn with_kind(mut self, kind: SandboxKind) -> Self {
         self.kind = kind;
         self
     }
 
-    /// The [`RunSpec::egress`] of each [`VmBackend::run`] call, in order. Empty
+    /// The [`RunSpec::egress`] of each [`VirtualizationBackend::run`] call, in order. Empty
     /// when `run` was never reached.
     #[must_use]
     pub fn run_egress(&self) -> Vec<Option<AllowList>> {
         self.run_egress.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// The box ids [`VmBackend::kill`] has been called with, in order.
+    /// The box ids [`VirtualizationBackend::kill`] has been called with, in order.
     #[must_use]
     pub fn killed(&self) -> Vec<String> {
         self.killed.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 }
 
-impl VmBackend for FakeBackend {
+impl VirtualizationBackend for FakeBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         self.run_egress
             .lock()

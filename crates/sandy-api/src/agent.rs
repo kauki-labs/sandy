@@ -22,7 +22,7 @@ use std::{
 /// to report the run's verdict on, right after the agent is launched.
 ///
 /// It runs on a thread the backend owns (the one that called
-/// [`VmBackend::run`](crate::backend::VmBackend::run), or a VM backend's link
+/// [`VirtualizationBackend::run`](crate::backend::VirtualizationBackend::run), or a VM backend's link
 /// connector), with no async runtime guaranteed. It must not block (start the relay
 /// elsewhere and return) and should not panic; a panic fails the run as an
 /// infra fault.

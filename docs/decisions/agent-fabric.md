@@ -87,7 +87,7 @@ message lands between the two and is missed.
 **Status:** accepted.
 
 **Context.** The fabric targets store-and-forward over links nobody can assume are
-live (spec §1). The existing `VmBackend` is sync.
+live (spec §1). The existing `VirtualizationBackend` is sync.
 
 **Decision.** The I/O seams (`Executor`, `ChannelBackend`, `Transport`,
 `Discovery`, `Capacity`, `Lifecycle`, `TelemetrySink`) and `Minter` are async and
@@ -105,20 +105,20 @@ stream fails instead of hanging and an I/O-backed one gets time to deliver.
 rewrite. Static dispatch by default; a composition root that needs `dyn` boxes at
 its own boundary.
 
-**Set aside.** All-sync traits matching `VmBackend`: they would be rewritten when
+**Set aside.** All-sync traits matching `VirtualizationBackend`: they would be rewritten when
 the first remote transport lands. An async `CapAuthority`: it would add a poll to
 every message for impls that never wait.
 
-## 5. `Executor` is additive over `VmBackend`
+## 5. `Executor` is additive over `VirtualizationBackend`
 
 **Status:** accepted.
 
-**Context.** The executor generalizes `VmBackend` to the fleet (spec §3.1), but
-reconcile, the supervisor, and the CLI use `VmBackend` directly.
+**Context.** The executor generalizes `VirtualizationBackend` to the fleet (spec §3.1), but
+reconcile, the supervisor, and the CLI use `VirtualizationBackend` directly.
 
 **Decision.** `Executor` (`run`/`kill`/`observe` plus a sync `capabilities()`) is
 a new seam reusing `sandy-api`'s `RunSpec`, `Outcome`, `BoxState`, and
-`SandboxKind`. An adapter (#108) wraps any `VmBackend`. `capabilities_satisfy`
+`SandboxKind`. An adapter (#108) wraps any `VirtualizationBackend`. `capabilities_satisfy`
 matches kind exactly, so a VM-only job never lands on the process executor, and
 matches arch only when one is required. The suite fails an executor whose
 capabilities differ from the caller's truth, or that reports a non-zero exit as an
@@ -127,11 +127,11 @@ infra fault.
 **Consequences.** No caller migration now; unifying the two seams stays a
 separate, deliberate step.
 
-`run` borrows `&RunSpec<'_>`, so the `VmBackend` adapter runs the blocking call
+`run` borrows `&RunSpec<'_>`, so the `VirtualizationBackend` adapter runs the blocking call
 with `block_in_place`: one async worker is held per run (as on today's sync path),
 and the composition root needs a multi-thread runtime.
 
-**Set aside.** Renaming `VmBackend` to `Executor`: it forces every caller to
+**Set aside.** Renaming `VirtualizationBackend` to `Executor`: it forces every caller to
 migrate before the fabric needs it. An owned `RunSpec` for `spawn_blocking`: it
 would dup the `SecretSource::Fd` into a new fd lifetime, against the secret-channel
 discipline (INV-1), and make a deliberately borrowed, non-`Clone` type owned.
