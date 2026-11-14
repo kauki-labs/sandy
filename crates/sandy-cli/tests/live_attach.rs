@@ -162,6 +162,7 @@ fn trusted_process_capabilities() -> Capabilities {
         shares_submitter_filesystem: false,
         transfer: false,
         egress_proxy: false,
+        path_root: false,
     }
 }
 

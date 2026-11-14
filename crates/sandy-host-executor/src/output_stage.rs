@@ -141,6 +141,7 @@ mod tests {
 
     fn declared(name: Option<&str>, dest: &str) -> sandy_executor_proto::Output {
         sandy_executor_proto::Output {
+            root: None,
             name: name.map(str::to_owned),
             dest: dest.to_owned(),
         }

@@ -1165,6 +1165,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             };
             inputs.push(sandy_control_proto::Input {
+                root: None,
                 host: host.display().to_string(),
                 name: i.name,
                 guest_path: i.guest_path.map(|p| p.display().to_string()),
@@ -1180,6 +1181,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             };
             outputs.push(sandy_control_proto::Output {
+                root: None,
                 name: o.name,
                 dest: dest.display().to_string(),
             });
@@ -1197,6 +1199,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 }
             };
             secrets.push(sandy_control_proto::SecretRef {
+                root: None,
                 name: s.name,
                 host_path: path.display().to_string(),
             });

@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 
 use crate::{
     Client, IsolationClass, attach, auth::authenticate, body::Body, environments, output, output::Outputs,
-    owners::Owners, paths::within_roots,
+    owners::Owners, paths::root_for,
 };
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -253,15 +253,17 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
     if body.required_isolation_class > client.max_isolation_class {
         return Err(FORBIDDEN);
     }
-    let paths = body
-        .inputs
-        .iter()
-        .map(|i| &i.host)
-        .chain(body.outputs.iter().map(|o| &o.dest))
-        .chain(body.secrets.iter().map(|s| &s.host_path));
-    if !paths.into_iter().all(|p| within_roots(p, &client.roots)) {
-        return Err(FORBIDDEN);
-    }
+    // Every path must lie beneath one of the client's roots. The configured, canonical root goes to sandyd with the
+    // path rewritten onto it (#618), never the client's own spelling: sandyd follows the root and then opens the path
+    // beneath it without following a link, so neither a parent directory swapped after this check nor an alias the
+    // client retargets can redirect the open.
+    let root_of = |path: &str| {
+        root_for(path, &client.roots)
+            // The wire carries text. Startup refuses a root that is not UTF-8, so this never fails for a canonical
+            // root; a lossy conversion would name a different directory than the one authorised.
+            .and_then(|rooted| Some((rooted.root.to_str()?.to_owned(), rooted.path.to_str()?.to_owned())))
+            .ok_or(FORBIDDEN)
+    };
     let class = match body.required_isolation_class {
         IsolationClass::Trusted => WireClass::Trusted,
         IsolationClass::Untrusted => WireClass::Untrusted,
@@ -275,28 +277,40 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         inputs: body
             .inputs
             .into_iter()
-            .map(|i| Input {
-                host: i.host,
-                name: i.name,
-                guest_path: i.guest_path,
+            .map(|i| {
+                let (root, host) = root_of(&i.host)?;
+                Ok(Input {
+                    root: Some(root),
+                    host,
+                    name: i.name,
+                    guest_path: i.guest_path,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         outputs: body
             .outputs
             .into_iter()
-            .map(|o| Output {
-                name: o.name,
-                dest: o.dest,
+            .map(|o| {
+                let (root, dest) = root_of(&o.dest)?;
+                Ok(Output {
+                    root: Some(root),
+                    name: o.name,
+                    dest,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         secrets: body
             .secrets
             .into_iter()
-            .map(|s| SecretRef {
-                name: s.name,
-                host_path: s.host_path,
+            .map(|s| {
+                let (root, host_path) = root_of(&s.host_path)?;
+                Ok(SecretRef {
+                    root: Some(root),
+                    name: s.name,
+                    host_path,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         credential: None,
         cred_capabilities: Vec::new(),
         egress: None,

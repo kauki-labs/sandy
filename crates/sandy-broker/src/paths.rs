@@ -12,53 +12,114 @@ use std::{
 /// (an output destination) is allowed, since there is nothing to follow. An
 /// empty `roots` allows nothing.
 ///
-/// This is a check at one moment. It cannot stop a client that swaps a
-/// directory for a link after the check; that needs an fd-based open in sandyd
-/// (decision 4, residual risk).
-pub(crate) fn within_roots(path: &str, roots: &[PathBuf]) -> bool {
-    let path = Path::new(path);
-    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return false;
-    }
-    roots.iter().any(|root| confined(path, root))
+/// A path confined to one of the operator's roots, in the form `sandyd` opens (#618).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Rooted {
+    /// The operator's configured root, canonical: never a spelling the client chose. `sandyd` follows the root, so a
+    /// root the client controls (a symlink it can retarget after the check below) would let it redirect every open
+    /// beneath it.
+    pub root: PathBuf,
+    /// The path rewritten onto `root`: `root` joined with the components the client named below its own spelling of
+    /// the root.
+    pub path: PathBuf,
 }
 
-fn confined(path: &Path, root: &Path) -> bool {
-    let Ok(real_root) = root.canonicalize() else {
-        return false;
-    };
+/// This is a check at one moment. It cannot stop a client that swaps a directory for a link after the check, so
+/// the root and the rewritten path ([`root_for`]) go to sandyd, which opens the path beneath the root without
+/// following a link (decision 4, #618).
+#[cfg(test)]
+pub(crate) fn within_roots(path: &str, roots: &[PathBuf]) -> bool {
+    root_for(path, roots).is_some()
+}
+
+/// Confine `path` to one of `roots` and return it as sandyd opens it (#618): the same checks as [`within_roots`], then
+/// the canonical root and the path rewritten onto it, so the client's spelling of the root (an alias it controls) is
+/// dropped. When several roots contain the path, the nearest wins, so a nested root confines more.
+pub(crate) fn root_for(path: &str, roots: &[PathBuf]) -> Option<Rooted> {
+    let path = Path::new(path);
+    if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    roots
+        .iter()
+        .filter_map(|root| confined(path, root))
+        .max_by_key(|rooted| rooted.root.components().count())
+}
+
+/// `path` beneath `root` when it reaches its target through no symlink below the root.
+fn confined(path: &Path, root: &Path) -> Option<Rooted> {
+    let real_root = root.canonicalize().ok()?;
     // The caller may name the root through any alias. Take the shortest ancestor
     // that resolves to the root, so every component below it is walked.
-    let Some(rest) = path
+    let spelled = path
         .ancestors()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .find(|a| a.canonicalize().is_ok_and(|c| c == real_root))
-        .and_then(|a| path.strip_prefix(a).ok())
-    else {
-        return false;
-    };
-    let mut at = real_root;
+        .find(|a| a.canonicalize().is_ok_and(|c| c == real_root))?;
+    let rest = path.strip_prefix(spelled).ok()?;
+    let mut names = Vec::new();
     for part in rest.components() {
         match part {
-            Component::Normal(name) => at.push(name),
-            Component::CurDir => continue,
-            _ => return false,
-        }
-        match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => return false,
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
-            Err(_) => return false,
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
+            _ => return None,
         }
     }
-    true
+    let mut at = real_root.clone();
+    for name in &names {
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => {}
+            // A part that does not exist yet (an output destination) has nothing to follow below it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(_) => return None,
+        }
+    }
+    let path = names.iter().fold(real_root.clone(), |path, name| path.join(name));
+    Some(Rooted { root: real_root, path })
+}
+
+/// Resolve every configured root to its canonical path, once, at startup (#618). The broker sends that path to
+/// `sandyd` as the root, so it must be the operator's value and not something a client can retarget.
+///
+/// # Errors
+///
+/// A message naming the root that does not exist or cannot be resolved.
+pub(crate) fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    canonical_roots_with(roots, |root| root.canonicalize())
+}
+
+/// [`canonical_roots`] with the resolver injected, so a test can name a root the file system of the test host cannot
+/// hold (a non-UTF-8 name, which macOS refuses to create).
+fn canonical_roots_with(
+    roots: &[PathBuf],
+    resolve: impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    roots
+        .iter()
+        .map(|root| {
+            let resolved = resolve(root).map_err(|e| format!("root {} cannot be resolved: {e}", root.display()))?;
+            // The root goes on the wire as text: a lossy conversion would name another directory than the one
+            // the broker authorised.
+            if resolved.to_str().is_none() {
+                return Err(format!(
+                    "root {} resolves to {}, which is not valid UTF-8 and cannot be sent exactly",
+                    root.display(),
+                    resolved.display()
+                ));
+            }
+            Ok(resolved)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+
+    use anyhow::Context as _;
 
     use super::*;
 
@@ -123,6 +184,66 @@ mod tests {
             std::slice::from_ref(&root)
         ));
         assert!(!within_roots(&root.join("x").to_string_lossy(), &[]));
+        Ok(())
+    }
+
+    /// #618 (review of #889): the root sent to sandyd is the canonical configured root, never the spelling the client
+    /// chose, and the path is rewritten onto it. A client that names a path through an alias it controls cannot make
+    /// the alias the root. The nearest of several roots wins.
+    #[test]
+    fn the_root_sent_is_the_canonical_configured_root_and_the_path_is_rewritten_onto_it() -> anyhow::Result<()> {
+        let (dir, root, _outside) = root_with_outside()?;
+        let real = root.canonicalize()?;
+        let nested = root.join("deep");
+        std::fs::create_dir(&nested)?;
+        let alias = dir.path().join("alias-root");
+        symlink(&root, &alias)?;
+
+        for spelling in [root.join("a/./f"), alias.join("a/f")] {
+            assert_eq!(
+                root_for(&spelling.to_string_lossy(), std::slice::from_ref(&root)),
+                Some(Rooted {
+                    root: real.clone(),
+                    path: real.join("a/f")
+                }),
+                "{spelling:?}: the configured root and the path below it, not the client's spelling"
+            );
+        }
+        let deep = nested.join("f");
+        let nearest = root_for(&deep.to_string_lossy(), &[root.clone(), nested.clone()]).context("a nested root")?;
+        assert_eq!(nearest.root, nested.canonicalize()?);
+        assert_eq!(nearest.path, nested.canonicalize()?.join("f"));
+        assert_eq!(root_for(&root.join("x").to_string_lossy(), &[]), None);
+        Ok(())
+    }
+
+    /// #618 (review of #889): the canonical root goes on the wire as UTF-8 text. A root whose real name is not valid
+    /// UTF-8 would be sent lossily as another directory (`b"/srv/raw-\xff"` becomes `/srv/raw-\u{fffd}`), so startup
+    /// refuses it, naming the configured root.
+    #[test]
+    fn a_root_whose_canonical_name_is_not_utf8_is_refused_at_startup() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+        let configured = PathBuf::from("/srv/alias");
+        let canonical = PathBuf::from(OsStr::from_bytes(b"/srv/raw-\xff"));
+
+        let err = canonical_roots_with(std::slice::from_ref(&configured), |_| Ok(canonical.clone()))
+            .expect_err("a root that is not UTF-8 must be refused");
+
+        assert!(err.contains("/srv/alias"), "must name the configured root: {err}");
+        assert!(err.contains("UTF-8"), "must say why: {err}");
+    }
+
+    /// #618: a root that does not exist cannot be resolved at startup, and the error names it.
+    #[test]
+    fn a_root_that_cannot_be_resolved_is_named() -> anyhow::Result<()> {
+        let (dir, root, _outside) = root_with_outside()?;
+        let missing = dir.path().join("absent");
+
+        let ok = canonical_roots(std::slice::from_ref(&root)).map_err(anyhow::Error::msg)?;
+        let err = canonical_roots(&[root, missing.clone()]).expect_err("a missing root must be refused");
+
+        assert_eq!(ok, [std::fs::canonicalize(dir.path().join("root"))?]);
+        assert!(err.contains(&missing.display().to_string()), "{err}");
         Ok(())
     }
 

@@ -236,6 +236,38 @@ fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
     })
 }
 
+/// Refuse a Submit whose path has a root it cannot lie beneath (#618): a root that is not absolute, a path that is not
+/// under it, or one with a `..` below it. `sandyd` then opens the path beneath the root without following a link, and
+/// refuses anything this check lets through only by an accident of spelling. The broker sets the root from its client's
+/// roots and already checks the same, but a root is also a public field of the control RPC. Names the field.
+fn path_root_refusal(submit: &SubmitRequest) -> Option<String> {
+    let inputs = submit.inputs.iter().map(|i| ("inputs", &i.host, i.root.as_ref()));
+    let outputs = submit.outputs.iter().map(|o| ("outputs", &o.dest, o.root.as_ref()));
+    let secrets = submit
+        .secrets
+        .iter()
+        .map(|s| ("secrets", &s.host_path, s.root.as_ref()));
+    inputs.chain(outputs).chain(secrets).find_map(|(field, path, root)| {
+        let root = root?;
+        let refused = |why: &str| Some(format!("{field}: path {path:?} {why} (root {root:?})"));
+        // A NUL ends the string in the C call that opens it, so it would open a different path than the one checked.
+        if root.contains('\0') || path.contains('\0') {
+            return refused("or its root has a NUL byte");
+        }
+        let (root_path, path) = (std::path::Path::new(root), std::path::Path::new(path));
+        if !root_path.is_absolute() {
+            return Some(format!("{field}: root {root:?} is not an absolute path"));
+        }
+        let Ok(rest) = path.strip_prefix(root_path) else {
+            return refused("is not under its root");
+        };
+        if rest.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return refused("has a `..` below its root");
+        }
+        None
+    })
+}
+
 /// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
 /// operator knows what to declare and a submitter knows why the job cannot be placed.
 /// The refusal for a Submit that asks for digests with no host to compute them (A2c, #483). It names the capability:
@@ -243,6 +275,15 @@ fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
 fn digests_placement_refusal() -> String {
     "no registered host declares digests together with the required isolation class and sandbox kind; this Submit asks \
      for digests, and an executor that does not know the field would drop it and record none"
+        .to_owned()
+}
+
+/// The refusal for a Submit with a rooted path and no host that can honour the root (#618). It names the capability: an
+/// executor that does not know `root` would drop it and open the path as given, with the parent-swap gap still open.
+fn path_root_placement_refusal() -> String {
+    "no registered host can honour the root of this Submit's paths: a rooted secret, or a rooted input or output on a \
+     host with no transfer, needs a host that declares path_root, because an executor that does not know the field \
+     would drop it and open the path without the boundary"
         .to_owned()
 }
 
@@ -304,6 +345,7 @@ fn to_dispatch_path_fields(
         .inputs
         .iter()
         .map(|i| sandy_executor_proto::Input {
+            root: i.root.clone(),
             host: i.host.clone(),
             name: i.name.clone(),
             guest_path: i.guest_path.clone(),
@@ -313,6 +355,7 @@ fn to_dispatch_path_fields(
         .outputs
         .iter()
         .map(|o| sandy_executor_proto::Output {
+            root: o.root.clone(),
             name: o.name.clone(),
             dest: o.dest.clone(),
         })
@@ -321,6 +364,7 @@ fn to_dispatch_path_fields(
         .secrets
         .iter()
         .map(|s| sandy_executor_proto::SecretRef {
+            root: s.root.clone(),
             name: s.name.clone(),
             host_path: s.host_path.clone(),
         })
@@ -620,6 +664,13 @@ pub async fn handle(
                     result: Some(control_response::Result::Error(ControlError { message })),
                 });
             }
+            // #618: a path that cannot lie beneath its root is refused before placement, with no side effect.
+            if let Some(message) = path_root_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             if let Some(message) = transfer_name_refusal(&submit) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
@@ -651,6 +702,13 @@ pub async fn handle(
             // A2c (#483): a digest job needs an executor that declared `digests`: an older one drops the field
             // silently.
             let wants_digests = submit.digests;
+            // #618: a root on any path. A host that opens the paths itself must declare `path_root`, or it would drop
+            // the root without a word (see `pick_host_egress`).
+            let rooted = crate::host_registry::RootedPaths {
+                inputs_or_outputs: submit.inputs.iter().any(|i| i.root.is_some())
+                    || submit.outputs.iter().any(|o| o.root.is_some()),
+                secrets: submit.secrets.iter().any(|s| s.root.is_some()),
+            };
             let dispatch_egress = to_dispatch_egress(submit.egress.as_ref());
             // `secrets` and a `credential` are files on this machine and need a host that shares the filesystem;
             // `inputs` and `outputs` alone can also go to a host that declared `transfer` (#482, #807).
@@ -676,6 +734,7 @@ pub async fn handle(
                         path_needs,
                         egress_policy,
                         wants_digests,
+                        rooted,
                     )
                     .is_some()
             };
@@ -690,6 +749,8 @@ pub async fn handle(
                 egress_placement_refusal()
             } else if wants_digests {
                 digests_placement_refusal()
+            } else if rooted.any() {
+                path_root_placement_refusal()
             } else if path_needs == crate::host_registry::PathNeeds::SharedFilesystemOrTransfer {
                 format!(
                     "no registered host declares shares_submitter_filesystem or transfer; this Submit names a \
@@ -785,6 +846,7 @@ pub async fn handle(
                     path_needs,
                     egress_policy,
                     wants_digests,
+                    rooted,
                 )?;
                 // The data link exists only for a host that declared `transfer`
                 // and a job that names inputs or outputs (#482 decision 22): an
@@ -953,6 +1015,7 @@ pub async fn handle(
                 // The path only: the token stays in the file (decision 37).
                 if let sandy::SecretSource::File(path) = bracket.secret_ref().source {
                     dispatch.secrets.push(sandy_executor_proto::SecretRef {
+                        root: None,
                         name: CREDENTIAL_SECRET_NAME.to_owned(),
                         host_path: path.display().to_string(),
                     });
@@ -3151,6 +3214,7 @@ mod tests {
 
     fn trusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -3233,6 +3297,7 @@ mod tests {
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 inputs: vec![sandy_control_proto::Input {
+                    root: None,
                     host: "/src".to_owned(),
                     name: "src".to_owned(),
                     guest_path: Some("/work/src".to_owned()),
@@ -3252,6 +3317,7 @@ mod tests {
             submit.inputs = input
                 .map(|name| {
                     vec![sandy_control_proto::Input {
+                        root: None,
                         host: "/src".to_owned(),
                         name: name.to_owned(),
                         guest_path: None,
@@ -3261,6 +3327,7 @@ mod tests {
             submit.outputs = output
                 .map(|name| {
                     vec![sandy_control_proto::Output {
+                        root: None,
                         name: name.map(str::to_owned),
                         dest: "/out".to_owned(),
                     }]
@@ -3317,6 +3384,7 @@ mod tests {
                         submit.inputs = names
                             .iter()
                             .map(|name| sandy_control_proto::Input {
+                                root: None,
                                 host: "/src".to_owned(),
                                 name: (*name).to_owned(),
                                 guest_path: None,
@@ -3327,6 +3395,7 @@ mod tests {
                         submit.outputs = names
                             .iter()
                             .map(|name| sandy_control_proto::Output {
+                                root: None,
                                 name: Some((*name).to_owned()),
                                 dest: "/out".to_owned(),
                             })
@@ -3387,6 +3456,7 @@ mod tests {
                 if field == "inputs" {
                     submit.inputs = (0..count)
                         .map(|i| sandy_control_proto::Input {
+                            root: None,
                             host: "/src".to_owned(),
                             name: format!("in{i}"),
                             guest_path: None,
@@ -3395,6 +3465,7 @@ mod tests {
                 } else {
                     submit.outputs = (0..count)
                         .map(|i| sandy_control_proto::Output {
+                            root: None,
                             name: Some(format!("out{i}")),
                             dest: "/out".to_owned(),
                         })
@@ -3508,6 +3579,7 @@ mod tests {
         let mut request = submit_req_with_input(1);
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.secrets = vec![sandy_control_proto::SecretRef {
+                root: None,
                 name: "token".to_owned(),
                 host_path: "/etc/secret".to_owned(),
             }];
@@ -3570,6 +3642,7 @@ mod tests {
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 inputs: Vec::new(),
                 outputs: vec![sandy_control_proto::Output {
+                    root: None,
                     name: Some("result".to_owned()),
                     dest: "/out".to_owned(),
                 }],
@@ -3685,6 +3758,295 @@ mod tests {
         Ok(())
     }
 
+    /// A Submit with one input, one output and one secret, each carrying `root` and a path under `base`.
+    fn submit_with_roots(root: &str, base: &str) -> ControlRequest {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.inputs = vec![sandy_control_proto::Input {
+                root: Some(root.to_owned()),
+                host: format!("{base}/in"),
+                name: "in".to_owned(),
+                guest_path: None,
+            }];
+            submit.outputs = vec![sandy_control_proto::Output {
+                root: Some(root.to_owned()),
+                name: Some("out".to_owned()),
+                dest: format!("{base}/out"),
+            }];
+            submit.secrets = vec![sandy_control_proto::SecretRef {
+                root: Some(root.to_owned()),
+                name: "TOKEN".to_owned(),
+                host_path: format!("{base}/token"),
+            }];
+        }
+        request
+    }
+
+    /// #618: a rooted path the daemon could not open beneath its root is refused at Submit naming the field, and
+    /// nothing is dispatched: a root that is not absolute, a path outside the root, a `..` below it. One field at a
+    /// time, so each of the three path fields is covered.
+    #[tokio::test]
+    async fn a_path_that_cannot_lie_beneath_its_root_is_refused_at_submit() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let bad: [(&str, &str, &str); 5] = [
+            ("relative root", "data", "data"),
+            ("outside the root", "/srv/a", "/srv/b"),
+            ("dot-dot below the root", "/srv/a", "/srv/a/x/.."),
+            ("NUL in the root", "/srv/a\0", "/srv/a\0"),
+            ("NUL below the root", "/srv/a", "/srv/a/x\0y"),
+        ];
+        for (name, root, base) in bad {
+            for field in ["inputs", "outputs", "secrets"] {
+                let mut request = submit_with_roots(root, base);
+                // Keep the bad root on one field only: the others are valid.
+                if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                    submit.inputs[0].host = "/srv/ok/in".to_owned();
+                    submit.outputs[0].dest = "/srv/ok/out".to_owned();
+                    submit.secrets[0].host_path = "/srv/ok/token".to_owned();
+                    submit.inputs[0].root = Some("/srv/ok".to_owned());
+                    submit.outputs[0].root = Some("/srv/ok".to_owned());
+                    submit.secrets[0].root = Some("/srv/ok".to_owned());
+                    match field {
+                        "inputs" => {
+                            submit.inputs[0].root = Some(root.to_owned());
+                            submit.inputs[0].host = format!("{base}/in");
+                        }
+                        "outputs" => {
+                            submit.outputs[0].root = Some(root.to_owned());
+                            submit.outputs[0].dest = format!("{base}/out");
+                        }
+                        _ => {
+                            submit.secrets[0].root = Some(root.to_owned());
+                            submit.secrets[0].host_path = format!("{base}/token");
+                        }
+                    }
+                }
+                let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+                let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, capabilities.clone());
+                let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back")?;
+                let response = handle(
+                    &store,
+                    &registry,
+                    &host_registry,
+                    Some(forward_back),
+                    test_session(),
+                    request,
+                )
+                .await?;
+                match response.result {
+                    Some(control_response::Result::Error(e)) => {
+                        assert!(
+                            e.message.contains(field),
+                            "{name}/{field}: must name the field: {}",
+                            e.message
+                        );
+                    }
+                    other => anyhow::bail!("{name}/{field}: expected a refusal, got {other:?}"),
+                }
+                assert!(
+                    dispatch_rx.try_recv().is_err(),
+                    "{name}/{field}: nothing was dispatched"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #618: a valid rooted Submit is placed, and the host's `Dispatch` carries each root unchanged, so a host that
+    /// opens the path itself can open it beneath the root. A path with no root has none on the wire.
+    #[tokio::test]
+    async fn a_rooted_submit_reaches_the_dispatch_with_its_roots() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            path_root: true,
+            ..trusted_host_capabilities()
+        };
+
+        let (dispatch, _job, _registry) =
+            place_and_read(submit_with_roots("/srv/a", "/srv/a/job"), capabilities.clone(), peer_ip).await?;
+        assert_eq!(dispatch.inputs[0].root.as_deref(), Some("/srv/a"));
+        assert_eq!(dispatch.outputs[0].root.as_deref(), Some("/srv/a"));
+        assert_eq!(dispatch.secrets[0].root.as_deref(), Some("/srv/a"));
+
+        let (unrooted, _job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        assert_eq!(unrooted.inputs[0].root, None, "no root in, no root out");
+        Ok(())
+    }
+
+    /// A Submit on one host of `capabilities` through `handle`: the response, and whether a `Dispatch` reached the
+    /// host.
+    async fn submit_on_host(
+        request: ControlRequest,
+        capabilities: sandy_executor_proto::Capabilities,
+    ) -> anyhow::Result<(ControlResponse, bool)> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, capabilities);
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        Ok((response, dispatch_rx.try_recv().is_ok()))
+    }
+
+    /// The refusal text of `response`, or an error when the Submit was not refused.
+    fn refusal_of(response: ControlResponse) -> anyhow::Result<String> {
+        match response.result {
+            Some(control_response::Result::Error(e)) => Ok(e.message),
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A rooted Submit with no secret: only inputs and outputs, which a host with `transfer` takes over the data link.
+    fn rooted_paths_without_a_secret() -> ControlRequest {
+        let mut request = submit_with_roots("/srv/a", "/srv/a/job");
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.secrets.clear();
+        }
+        request
+    }
+
+    /// A Submit with an input, an output and a secret, each rooted or not as asked.
+    fn submit_with_mixed_roots(root_inputs_and_outputs: bool, root_secret: bool) -> ControlRequest {
+        let mut request = submit_with_roots("/srv/a", "/srv/a/job");
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            if !root_inputs_and_outputs {
+                submit.inputs[0].root = None;
+                submit.outputs[0].root = None;
+            }
+            if !root_secret {
+                submit.secrets[0].root = None;
+            }
+        }
+        request
+    }
+
+    /// #618 (review of #889): the `path_root` requirement is per path field. A rooted input beside an unrooted secret
+    /// on a host with `transfer` and a shared filesystem but no `path_root` is placed: `sandyd` opens the input over
+    /// the data link, and the executor opens only the secret, which has no root. With no `transfer` the executor
+    /// opens the rooted input, so that host needs `path_root`. A rooted secret needs it on any host.
+    #[tokio::test]
+    async fn the_path_root_requirement_is_decided_per_path_field() -> anyhow::Result<()> {
+        let shared_and_transfer = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let shared_only = sandy_executor_proto::Capabilities {
+            transfer: false,
+            ..shared_and_transfer.clone()
+        };
+        // (name, rooted inputs and outputs, rooted secret, host, placed)
+        let cases = [
+            (
+                "rooted input, plain secret, transfer host",
+                true,
+                false,
+                shared_and_transfer.clone(),
+                true,
+            ),
+            (
+                "rooted input, plain secret, no transfer",
+                true,
+                false,
+                shared_only,
+                false,
+            ),
+            (
+                "plain input, rooted secret, transfer host",
+                false,
+                true,
+                shared_and_transfer,
+                false,
+            ),
+        ];
+        for (name, io_rooted, secret_rooted, host, placed) in cases {
+            let (response, dispatched) =
+                submit_on_host(submit_with_mixed_roots(io_rooted, secret_rooted), host).await?;
+            assert_eq!(dispatched, placed, "{name}: dispatched? response {:?}", response.result);
+            if !placed {
+                let message = refusal_of(response)?;
+                assert!(
+                    message.contains("path_root"),
+                    "{name}: must name the capability: {message}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #618: an executor drops a `Dispatch` field it does not know without a word, so a root a host cannot honour would
+    /// be ignored and the parent-swap gap would stay open unannounced. A rooted secret is opened by the executor
+    /// only, so it is placed only on a host that declared `path_root`: without one the Submit is refused naming the
+    /// capability, with nothing dispatched.
+    #[tokio::test]
+    async fn a_rooted_secret_is_placed_only_on_a_host_that_declares_path_root() -> anyhow::Result<()> {
+        let without = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (response, dispatched) = submit_on_host(submit_with_roots("/srv/a", "/srv/a/job"), without.clone()).await?;
+        let message = refusal_of(response)?;
+        assert!(message.contains("path_root"), "must name the capability: {message}");
+        assert!(!dispatched, "nothing was dispatched");
+
+        let with = sandy_executor_proto::Capabilities {
+            path_root: true,
+            ..without
+        };
+        let (response, dispatched) = submit_on_host(submit_with_roots("/srv/a", "/srv/a/job"), with).await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "a host that declared path_root takes it, got {:?}",
+            response.result
+        );
+        assert!(dispatched, "the job was dispatched");
+        Ok(())
+    }
+
+    /// #618: a rooted input or output on a host with no `transfer` is opened by the executor, so that host needs
+    /// `path_root` too. A host with `transfer` takes it with no `path_root`: `sandyd` opens the paths itself.
+    #[tokio::test]
+    async fn rooted_inputs_and_outputs_need_transfer_or_path_root() -> anyhow::Result<()> {
+        let shared_only = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            ..trusted_host_capabilities()
+        };
+        let (response, dispatched) = submit_on_host(rooted_paths_without_a_secret(), shared_only.clone()).await?;
+        let message = refusal_of(response)?;
+        assert!(message.contains("path_root"), "must name the capability: {message}");
+        assert!(!dispatched, "nothing was dispatched");
+
+        let shared_with_root = sandy_executor_proto::Capabilities {
+            path_root: true,
+            ..shared_only
+        };
+        let (_, dispatched) = submit_on_host(rooted_paths_without_a_secret(), shared_with_root).await?;
+        assert!(dispatched, "a shared-filesystem host that declared path_root takes it");
+
+        let transfer_only = sandy_executor_proto::Capabilities {
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (_, dispatched) = submit_on_host(rooted_paths_without_a_secret(), transfer_only).await?;
+        assert!(dispatched, "a transfer host takes it: sandyd opens the paths");
+        Ok(())
+    }
+
     /// A2c (#483): the job's channel keeps the outputs the Submit declared, for every placement, so the envelope can
     /// list what they hold.
     #[tokio::test]
@@ -3694,10 +4056,12 @@ mod tests {
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.outputs = vec![
                 sandy_control_proto::Output {
+                    root: None,
                     name: Some("report".to_owned()),
                     dest: "/out/report".to_owned(),
                 },
                 sandy_control_proto::Output {
+                    root: None,
                     name: None,
                     dest: "/out/rest".to_owned(),
                 },
@@ -4343,6 +4707,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let untrusted_only = sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -4550,6 +4915,7 @@ mod tests {
 
     fn vm_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -4915,6 +5281,7 @@ mod tests {
 
     fn vm_untrusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),

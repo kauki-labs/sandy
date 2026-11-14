@@ -144,9 +144,15 @@ pub async fn send_inputs(
     inputs: &[sandy_executor_proto::Input],
     limits: SendLimits,
 ) -> Result<Sent, SendError> {
-    let inputs: Vec<(String, PathBuf)> = inputs
+    let inputs: Vec<(String, PathBuf, Option<PathBuf>)> = inputs
         .iter()
-        .map(|input| (input.name.clone(), PathBuf::from(&input.host)))
+        .map(|input| {
+            (
+                input.name.clone(),
+                PathBuf::from(&input.host),
+                input.root.as_ref().map(PathBuf::from),
+            )
+        })
         .collect();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<InputChunk>(QUEUE_DEPTH);
     let reader = tokio::task::spawn_blocking(move || read_inputs(&inputs, limits, &tx));
@@ -230,9 +236,10 @@ struct Walk<'a> {
     dirs: HashSet<String>,
 }
 
-/// Read every input on this thread and hand its chunks to the writer.
+/// Read every input on this thread and hand its chunks to the writer. An input with a root (#618) is opened beneath
+/// it, each component below the root without following a link; one without is opened by its path.
 fn read_inputs(
-    inputs: &[(String, PathBuf)],
+    inputs: &[(String, PathBuf, Option<PathBuf>)],
     limits: SendLimits,
     tx: &tokio::sync::mpsc::Sender<InputChunk>,
 ) -> Result<Sent, SendError> {
@@ -244,7 +251,7 @@ fn read_inputs(
         dirs: HashSet::new(),
     };
     let mut declared = HashSet::new();
-    for (name, _) in inputs {
+    for (name, ..) in inputs {
         if name.is_empty() {
             return Err(SendError::UnnamedInput);
         }
@@ -256,7 +263,7 @@ fn read_inputs(
     }
     // A name inside another declared name (`a` and `a/b`) is a file and a directory at once: the receiver ends with
     // `Clash` after bytes moved.
-    for (name, _) in inputs {
+    for (name, ..) in inputs {
         let mut at = 0;
         while let Some(i) = name[at..].find('/') {
             at += i;
@@ -266,11 +273,17 @@ fn read_inputs(
             at += 1;
         }
     }
-    for (name, path) in inputs {
+    for (name, path, root) in inputs {
         let before = walk.sent.files;
-        match beneath::open_file(path) {
-            Ok(file) => walk.file(name, file)?,
-            Err(_) => walk.tree(name, &Beneath::open_dir(path)?)?,
+        match root {
+            Some(root) => match beneath::open_file_beneath(root, path) {
+                Ok(file) => walk.file(name, file)?,
+                Err(_) => walk.tree(name, &Beneath::open_dir_beneath(root, path)?)?,
+            },
+            None => match beneath::open_file(path) {
+                Ok(file) => walk.file(name, file)?,
+                Err(_) => walk.tree(name, &Beneath::open_dir(path)?)?,
+            },
         }
         if walk.sent.files == before {
             return Err(SendError::EmptyInput);
@@ -360,6 +373,7 @@ mod tests {
 
     fn input(dir: &Path, name: &str) -> sandy_executor_proto::Input {
         sandy_executor_proto::Input {
+            root: None,
             host: dir.join(name).to_string_lossy().into_owned(),
             name: name.to_owned(),
             guest_path: None,
@@ -433,6 +447,37 @@ mod tests {
             "the peer was not told"
         );
         Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the daemon follows it and sends the outside file. With a root it walks `sub` without following a link
+    /// and refuses, before any chunk goes out.
+    #[tokio::test]
+    async fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let outside = tempfile::tempdir().context("outside")?;
+        write(&outside.path().join("secret"), b"outside bytes")?;
+        let root = tempfile::tempdir().context("root")?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).context("swap the parent for a link")?;
+        let under_link = root.path().join("sub");
+
+        let escaped = sandy_executor_proto::Input {
+            name: "secret".to_owned(),
+            ..input(&under_link, "secret")
+        };
+        let (sent, messages) = frames(std::slice::from_ref(&escaped), SendLimits::default()).await?;
+        assert!(sent.is_ok(), "without a root the link is followed today, got {sent:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(&m.op, Some(Op::InputChunk(c)) if c.bytes == b"outside bytes")),
+            "the outside file must have been sent, to prove the setup escapes"
+        );
+
+        let rooted = sandy_executor_proto::Input {
+            root: Some(root.path().to_string_lossy().into_owned()),
+            ..escaped
+        };
+        assert_refused_before_any_chunk(&[rooted]).await
     }
 
     /// A name the receiver would refuse is refused at the source (#770): too long, a `..` or `.` component, an absolute
@@ -594,7 +639,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<InputChunk>(1);
         drop(rx);
         let result = read_inputs(
-            &[("tree".to_owned(), source.path().join("tree"))],
+            &[("tree".to_owned(), source.path().join("tree"), None)],
             SendLimits::default(),
             &tx,
         );

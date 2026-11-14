@@ -203,6 +203,12 @@ message Capabilities {
   // (`Dispatch.digests`, A2c of #483). A host that predates this field decodes false, and an executor drops an unknown
   // field silently, so the orchestrator places a job that wants digests only on a host that declared this.
   bool digests = 8;
+  // Whether this host-executor opens each `Dispatch` input, output and secret path beneath its `root` without following
+  // a link (#618). A host that predates this field decodes false, and an executor drops an unknown field silently, so a
+  // root would be ignored: the orchestrator places a Submit whose secrets, or whose paths the executor itself opens
+  // (a host with no `transfer`), carry a root only on a host that declared this. Declared by an executor that
+  // implements it, never an operator flag.
+  bool path_root = 9;
 }
 
 // Declares this host's identity and what it can run.
@@ -309,18 +315,27 @@ message Input {
   string host = 1;
   string name = 2;
   optional string guest_path = 3;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 4;
 }
 
 // Mirrors `sandy.control.v1.Output`.
 message Output {
   optional string name = 1;
   string dest = 2;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 3;
 }
 
 // Mirrors `sandy.control.v1.SecretRef`.
 message SecretRef {
   string name = 1;
   string host_path = 2;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 3;
 }
 
 // Orchestrator -> host-executor (#340): the orchestrator's own attach-relay

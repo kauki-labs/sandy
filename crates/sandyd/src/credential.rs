@@ -716,6 +716,7 @@ mod tests {
 
     fn capabilities(shares_submitter_filesystem: bool) -> Capabilities {
         Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -1023,6 +1024,7 @@ mod tests {
         let mut request = submit_req(Some("gh-test"), Vec::new());
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.outputs = vec![sandy_control_proto::Output {
+                root: None,
                 name: Some("result".to_owned()),
                 dest: "/out".to_owned(),
             }];
@@ -1082,6 +1084,7 @@ mod tests {
         let mut request = submit_req(Some("gh-test"), Vec::new());
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.outputs = vec![sandy_control_proto::Output {
+                root: None,
                 name: Some("result".to_owned()),
                 dest: "/out".to_owned(),
             }];

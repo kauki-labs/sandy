@@ -228,6 +228,13 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         return Err(BrokerError::NonLoopback { addr: config.bind });
     }
     validate_clients(&config.clients)?;
+    // Each root is resolved once, here: the canonical path is what the broker sends to sandyd as the root (#618), so a
+    // client never controls it.
+    let mut config = config;
+    for client in &mut config.clients {
+        client.roots = paths::canonical_roots(&client.roots)
+            .map_err(|e| BrokerError::InvalidClients(format!("client {:?}: {e}", client.id)))?;
+    }
     let env_create = config
         .clients
         .iter()

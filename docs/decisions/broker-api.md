@@ -95,6 +95,18 @@ cannot leave a job without an owner.
 **Consequence.** The contract is unchanged on the wire. These are new refusals, so `sandy-mcp`
 tests keep passing.
 
+**Root sent to sandyd (#618).** The broker also sends the root that contains each path in the optional `root` of the
+control `Submit` input, output and secret messages, and rewrites the path onto it. The root is the operator's
+configured root in canonical form, resolved once at startup (a root that cannot be resolved, or whose real name is not valid UTF-8, refuses startup naming it: the wire carries text, and a lossy conversion would name another directory), never a spelling the client chose: `sandyd` follows the root, so a client that named its path through a symlink it
+controls would otherwise make that alias the root and retarget it after the check. When several of the client's roots
+contain the path, the nearest wins. The path a client sees back (an output destination in the result envelope) is the
+canonical one. The HTTP contract does not change. `root` is not a boundary on the local control RPC: only the broker
+sets it, per client, and a caller of the control socket can send any root. `sandyd` opens an input or output beneath that root without following
+a link, which closes the parent-swap gap for the transfer path. A path an executor opens itself (a secret, or an
+input or output on a host with no `transfer`) is placed only on a host that declared `path_root`, so a root is never
+dropped without notice: with no such host the submit is refused naming the capability. No executor declares it until
+slice 2 of #618, so until then a broker client's secrets are refused.
+
 **Residual risk (_owner_).** The check is a point in time. sandyd now opens the leaf of each input, output and
 secret path without following a link and works below it through that handle (guest-shares decision 14, #618), and no
 longer copies a link inside an input tree by value. That does not stop a hostile client: the client picks the path

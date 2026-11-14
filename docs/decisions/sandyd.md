@@ -1516,6 +1516,13 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   (`normalise_name`: 253 bytes after one trailing dot is stripped, labels of at most 63), measured the same way, so a
   host the proxy accepts is never refused here. The proxy has no rule-count bound, so 256 is new. The direct
   `sandy run --allow` stays unbounded.
+- Path roots (#618): a Submit path may carry an optional `root`, the trusted absolute directory it lies beneath (the
+  broker sets it from the client's `roots`, canonical and never client-spelled; a root is no boundary on the local
+  control RPC). `sandyd` refuses a root that is not absolute, a path not under it, a `..` below it and a NUL byte in
+  either, copies it into the `Dispatch`, and opens a rooted input or output it handles itself (the data link)
+  beneath the root without following a link. A root an executor would have to honour is placed only on a host that
+  declared `path_root` (secrets always, inputs and outputs when the host has no `transfer`), because an executor drops
+  a field it does not know without a word. See guest-shares decision 14.
 - A2 (#483): `sandyd` builds the result envelope with `sandy::build_envelope` and `classify_outcome`, stores it in
   `jobs.envelope` in the statement that makes the job terminal, and serves its JSON in `StatusResponse.result_envelope`.
   `who` is the local-uid fallback with `authenticated: false` (verified caps are #413). A run that carried an egress
@@ -2109,9 +2116,11 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   and symlinks in the guest output are not carried (local creates empty directories and skips symlinks). A reader
   never sees a partial file at the final name, but the `.sandy-recv-*` temp is listable while the file is in flight
   and a crash leaves it (#782).
-- The receiver trusts `Dispatch.outputs[].dest`: `Beneath::create_dir_at` resolves and creates the ancestors of a
-  destination by path, as local collection does (#607). The caller must pass only Submit-validated destinations. A
-  symlink in an ancestor is followed, and one test pins it (#784).
+- The receiver trusts `Dispatch.outputs[].dest`: with no `root`, `Beneath::create_dir_at` resolves and creates the
+  ancestors of a destination by path, as local collection does (#607). The caller must pass only Submit-validated
+  destinations. A symlink in an ancestor is followed, and one test pins it (#784). With a `root` (#618) the receiver
+  uses `Beneath::create_dir_beneath` and refuses a link at any component below the root; `sandyd` has already refused,
+  at Submit, a root that is not absolute, a destination not under it and a `..` below it (guest-shares decision 14).
 - A failed flush discards the file before the error returns, so the unlink is done before the peer hears of it. The temp
   name is `.sandy-recv-<pid>-<n>` with `n` running across the receive; a collision with a stale name tries the next one,
   at most 1,000 name attempts per file, so a long receive is not failed by one stale name (#793).

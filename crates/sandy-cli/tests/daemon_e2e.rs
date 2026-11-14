@@ -211,6 +211,7 @@ fn spawn_mesh_daemon(tmp: &std::path::Path, register_host: bool) -> anyhow::Resu
                 op: Some(host_executor_message::Op::Register(Register {
                     host_id: "stand-in-host".to_owned(),
                     capabilities: Some(Capabilities {
+                        path_root: false,
                         digests: false,
                         supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                         arch: Arch::X8664.into(),
