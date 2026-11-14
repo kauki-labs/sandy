@@ -2969,6 +2969,11 @@ cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other pro
   restart found open. A cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to
   name; its client id stays on the row.
 
+**Upgrade.** The broker now puts a client id in every submission, so a broker still pointed at the main socket is
+refused on every Submit (`unavailable` over HTTP): set `SANDYD_BROKER_SOCK`, restart `sandyd`, and point the broker at
+that socket (`docs/design/broker/runbook.md`). An older `sandyd` ignores the unknown field and records the uid, so
+upgrade `sandyd` first.
+
 **Residual.** A hostile process of the daemon's own uid can connect to the broker socket and set any client id. Nothing
 in a one-uid daemon can prevent that: that process can already submit, read and cancel every job as the daemon user. The
 broker socket separates the broker from the CLI and other tools by construction, so none of them writes a client id into

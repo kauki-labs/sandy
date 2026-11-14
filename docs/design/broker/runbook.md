@@ -55,20 +55,28 @@ broker and stores jobs and environments.
    | `max_environment_records` | Environments ever created, deleted ones included.          | 64           |
    | `roots`                   | Directories a job's inputs, outputs and secrets may name.  | none allowed |
 
-4. Start sandyd: `SANDY_SOCK=/path/sandyd.sock SANDY_DB=/path/sandyd.db sandyd`. Without
-   the variables it uses a `0700` directory it creates under the OS temp base.
+4. Start sandyd: `SANDY_SOCK=/path/sandyd.sock SANDYD_BROKER_SOCK=/path/broker.sock SANDY_DB=/path/sandyd.db sandyd`.
+   Without the variables it uses a `0700` directory it creates under the OS temp base. `SANDYD_BROKER_SOCK` is the
+   broker's own socket: `sandyd` accepts the client id the broker puts in each submission only there, so a job's receipt
+   names the API client (`who.identity` is `broker:<client id>`). It must be an absolute path in the same directory as
+   `SANDY_SOCK` (the attach socket is a sibling of both), and `sandyd` refuses to start otherwise, naming both paths.
    sandyd appends an audit line for each environment create, stop, cancel and delete to
    `/path/sandyd.db.audit.jsonl` (or `SANDY_AUDIT_LOG`), mode `0600`. It does not start if it cannot open
    that file, and it refuses an environment operation it cannot audit. No rotation yet.
 5. Start the broker:
 
    ```bash
-   sandy-broker --control-socket /path/sandyd.sock --state-dir /path/broker-state \
+   sandy-broker --control-socket /path/broker.sock --state-dir /path/broker-state \
      --clients-file /path/clients.json --bind 127.0.0.1:8787
    ```
 
    The bind address must be loopback. There is no TLS yet. Run one broker per state
    directory.
+
+   Point `--control-socket` at the broker socket, not the main one. The broker puts a client id in every
+   submission, and `sandyd` refuses a client id on the main socket, so a broker on the main socket cannot submit
+   (its jobs answer `unavailable`). A client id the broker's clients file holds must be 1 to 128 bytes with no
+   control character, or the broker does not start.
 
 6. Point `sandy-mcp` at it:
 
