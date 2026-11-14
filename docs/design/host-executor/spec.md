@@ -213,8 +213,13 @@ every knob below from environment variables — there is no CLI flag form.
    `SANDY_HOST_TRANSFER=1` (or `true`/`yes`) makes the executor declare `transfer` at registration, so the
    orchestrator places a job with `inputs` or `outputs` on it and moves them over the per-job data link
    (decision 22). It is the operator's statement that the host has disk headroom and a temp-staging path, never
-   auto-detected. Unset, empty, `0`, `false` or `no` leaves it undeclared; any other value stops the executor at
-   start with an error naming the variable.
+   auto-detected.
+
+   The three operator flags, `SANDY_HOST_SHARES_SUBMITTER_FS`, `SANDY_HOST_EGRESS_PROXY` and `SANDY_HOST_TRANSFER`,
+   share one parser. `1`, `true` or `yes` (case-insensitive, trimmed) declares the capability; unset, empty, `0`,
+   `false` or `no` leaves it undeclared; any other value stops the executor at start with an error naming the
+   variable and the value. A stray `SANDY_NETWORK` or `SANDY_TAP` (removed with the guest NIC profile) is ignored,
+   with one warning at start.
 
 3. **Submit and attach** (from the orchestrator host):
 
