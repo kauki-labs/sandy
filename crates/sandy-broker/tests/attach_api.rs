@@ -53,6 +53,34 @@ async fn the_owner_streams_agent_output_as_ndjson_then_an_exit_line() -> Result<
     Ok(())
 }
 
+/// #888: `sandyd` derives the attach socket from its main control path, and the broker's control path is now the broker
+/// socket, so the broker takes the attach path from its config when one is given.
+#[tokio::test]
+async fn an_explicit_attach_socket_path_is_the_one_the_broker_attaches_through() -> Result<()> {
+    let f = fixture_with_opts(Opts {
+        explicit_attach: true,
+        ..Opts::default()
+    })
+    .await?;
+    let id = f.submit(TOKEN_A).await?;
+    f.agent(&id)?.stdout(b"hello\n").await?;
+
+    let (status, body) = f
+        .call("POST", &format!("/v1/jobs/{id}/attach"), Some(TOKEN_A), Some(json!({})))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["stream_url"].as_str().context("stream_url")?;
+    let mut lines = Lines::new(f.open_stream(url, Some(TOKEN_A)).await?);
+    let first = tokio::time::timeout(WAIT, lines.next())
+        .await
+        .context("the stream was silent")??;
+    assert!(
+        first.is_some(),
+        "the stream must deliver output through the explicit attach path"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_attach_to_a_job_that_ends_with_no_output_exits_with_its_terminal_status() -> Result<()> {
     let f = fixture().await?;

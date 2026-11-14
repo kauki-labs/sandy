@@ -410,10 +410,66 @@ async fn an_unknown_job_id_is_not_found_for_get_and_cancel() -> Result<()> {
     Ok(())
 }
 
+/// #888: the receipt names the API client, so the broker puts the id of the client its bearer token identified into the
+/// Submit. Two clients are told apart. The job row holds the id `sandyd` writes into the receipt.
+#[tokio::test]
+async fn the_broker_names_the_authenticated_client_in_the_submission() -> Result<()> {
+    let f = fixture().await?;
+    let a = f.submit(TOKEN_A).await?;
+    let c = f.submit(common::TOKEN_C).await?;
+
+    assert_eq!(f.store.client_id(&a)?.as_deref(), Some("a"));
+    assert_eq!(f.store.client_id(&c)?.as_deref(), Some("c"));
+    Ok(())
+}
+
+/// #888: a client cannot name another client. The submit body has no `client_id` field, so one is refused, and no job
+/// is created.
+#[tokio::test]
+async fn a_submit_body_cannot_carry_a_client_id() -> Result<()> {
+    let f = fixture().await?;
+    let mut body = submit_body();
+    body["client_id"] = json!("c");
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+
+    assert_eq!(
+        (status, &resp["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_request")),
+        "{resp}"
+    );
+    assert!(f.store.list()?.is_empty(), "no job may be created");
+    Ok(())
+}
+
+/// #888: a client id `sandyd` would refuse (empty, over 128 bytes, a control character) is refused at startup, naming
+/// the id, so every submit of that client does not fail later.
+#[tokio::test]
+async fn a_client_id_sandyd_would_refuse_is_refused_at_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mk = |clients| BrokerConfig {
+        attach_socket: None,
+        control_socket: Path::new("/nonexistent").to_path_buf(),
+        rpc_deadline: std::time::Duration::from_secs(30),
+        state_dir: dir.path().join("state"),
+        bind: "127.0.0.1:0".parse().expect("literal"),
+        clients,
+    };
+    for id in ["x".repeat(129), "bad\nid".to_owned(), "bad\0id".to_owned()] {
+        let r = serve(mk(vec![client(&id, "tok", IsolationClass::Trusted, vec![])])).await;
+        match r {
+            Err(BrokerError::InvalidClients(m)) => assert!(m.contains("client id"), "must name the problem: {m}"),
+            other => anyhow::bail!("{id:?}: expected InvalidClients, got {other:?}"),
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mk = |clients| BrokerConfig {
+        attach_socket: None,
         control_socket: Path::new("/nonexistent").to_path_buf(),
         rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
@@ -447,6 +503,7 @@ async fn a_non_loopback_bind_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let bind: SocketAddr = "0.0.0.0:0".parse()?;
     let result = serve(BrokerConfig {
+        attach_socket: None,
         control_socket: Path::new("/nonexistent").to_path_buf(),
         rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
@@ -471,6 +528,7 @@ async fn a_sandyd_that_never_answers_gives_unavailable_within_the_deadline() -> 
         }
     });
     let broker = serve(BrokerConfig {
+        attach_socket: None,
         control_socket: socket,
         rpc_deadline: std::time::Duration::from_millis(200),
         state_dir: dir.path().join("state"),

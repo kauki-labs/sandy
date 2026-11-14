@@ -504,7 +504,7 @@ async fn main() {
                         let host_registry = Arc::clone(&host_registry);
                         connections.spawn(async move {
                             let _permit = permit; // held for the connection's lifetime, released on drop
-                            sandyd::serve_connection(stream, store, environments, registry, host_registry, forward_back_addr).await;
+                            sandyd::serve_connection(stream, store, environments, registry, host_registry, forward_back_addr, sandyd::Caller::Main).await;
                         });
                     }
                     Err(e) => {

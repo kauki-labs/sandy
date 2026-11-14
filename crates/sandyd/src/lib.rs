@@ -111,6 +111,15 @@ pub fn spawn_gated_accept(
     tokio::spawn(async move { gate_spawn(&semaphore, async move { listener.accept_raw().await }).await })
 }
 
+/// Which socket accepted a control connection (#888). Only the broker socket may carry a client id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// The main control socket (`SANDY_SOCK`): the CLI, `sandy-mcp` and every other local tool.
+    Main,
+    /// The broker socket (`SANDYD_BROKER_SOCK`): the broker, which names the API client of a Submit.
+    Broker,
+}
+
 /// Serve one client connection: read [`ControlRequest`] frames, dispatch each
 /// against `store`, and write the matching
 /// [`ControlResponse`](sandy_control_proto::ControlResponse), until the peer
@@ -127,6 +136,7 @@ pub async fn serve_connection(
     registry: Arc<JobRegistry>,
     host_registry: Arc<HostRegistry>,
     forward_back_addr: Option<SocketAddr>,
+    _caller: Caller,
 ) {
     // CF-H-1: one session id per connection, not per request — minted once
     // here and compared, never trusted as access control, against the
@@ -198,6 +208,7 @@ mod tests {
             Arc::new(JobRegistry::new()?),
             Arc::new(HostRegistry::default()),
             None,
+            Caller::Main,
         ));
         let mut client = client;
 
@@ -266,6 +277,138 @@ mod tests {
         Ok(())
     }
 
+    /// One Submit over a connection accepted as `caller`, with a trusted process host registered so a valid Submit is
+    /// placed. Returns the response and the store.
+    async fn submit_as(caller: Caller, client_id: Option<&str>) -> anyhow::Result<(ControlResponse, Arc<JobStore>)> {
+        let store = Arc::new(JobStore::open_in_memory()?);
+        let (mut client, server) = UnixStream::pair()?;
+        let registry = Arc::new(JobRegistry::new()?);
+        let host_registry = Arc::new(HostRegistry::default());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let fingerprint = sandy_conn::Fingerprint::from_hex(&"aa".repeat(32)).context("fingerprint literal")?;
+        let _registration = host_registry
+            .register(
+                &host_registry::ExecutorAllowlist::new([(peer_ip, fingerprint)]),
+                peer_ip,
+                fingerprint,
+                "test-host".to_owned(),
+                sandy_executor_proto::Capabilities {
+                    supported_sandbox_kinds: vec![sandy_executor_proto::SandboxKind::Process.into()],
+                    arch: sandy_executor_proto::Arch::X8664.into(),
+                    supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+                    ..sandy_executor_proto::Capabilities::default()
+                },
+            )
+            .context("register a test host")?;
+        let serving = tokio::spawn(serve_connection(
+            server,
+            Arc::clone(&store),
+            Arc::new(EnvironmentStore::open_in_memory()?),
+            registry,
+            host_registry,
+            Some("100.64.0.1:9000".parse().context("forward_back literal")?),
+            caller,
+        ));
+        write_frame(
+            &mut client,
+            &ControlRequest {
+                request_id: 1,
+                op: Some(control_request::Op::Submit(SubmitRequest {
+                    client_id: client_id.map(str::to_owned),
+                    digests: false,
+                    manifest: b"m".to_vec(),
+                    manifest_encoding: "test/v1".to_owned(),
+                    submitter_caps: Vec::new(),
+                    required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    secrets: Vec::new(),
+                    credential: None,
+                    cred_capabilities: Vec::new(),
+                    egress: None,
+                })),
+            },
+        )
+        .await?;
+        let response: ControlResponse = read_frame(&mut client).await?.context("expected a Submit response")?;
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await??;
+        Ok((response, store))
+    }
+
+    fn submitted_job(response: ControlResponse) -> anyhow::Result<String> {
+        match response.result {
+            Some(control_response::Result::Submit(sandy_control_proto::SubmitResponse { job_id, .. })) => Ok(job_id),
+            other => anyhow::bail!("expected a Submit response, got {other:?}"),
+        }
+    }
+
+    fn refusal(response: &ControlResponse) -> anyhow::Result<&str> {
+        match &response.result {
+            Some(control_response::Result::Error(e)) => Ok(&e.message),
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// #888: a Submit that carries a client id on the main socket (the CLI, `sandy-mcp`, any local tool) is refused
+    /// naming the field, never ignored, and no job is created.
+    #[tokio::test]
+    async fn a_client_id_is_refused_on_the_main_socket() -> anyhow::Result<()> {
+        let (response, store) = submit_as(Caller::Main, Some("alice")).await?;
+
+        let message = refusal(&response)?;
+        assert!(message.contains("client_id"), "must name the field: {message}");
+        assert!(store.list()?.is_empty(), "no job may be created");
+        Ok(())
+    }
+
+    /// #888: on the broker socket the client id is accepted and stored on the job row.
+    #[tokio::test]
+    async fn a_client_id_is_stored_on_the_broker_socket() -> anyhow::Result<()> {
+        let (response, store) = submit_as(Caller::Broker, Some("alice")).await?;
+
+        let job = submitted_job(response)?;
+        assert_eq!(store.client_id(&job)?.as_deref(), Some("alice"));
+        Ok(())
+    }
+
+    /// #888: a client id that is empty, longer than 128 bytes, or holds a control character is refused naming the
+    /// field, before placement, with no job created. 128 bytes is the longest valid id.
+    #[tokio::test]
+    async fn an_invalid_client_id_is_refused_on_the_broker_socket() -> anyhow::Result<()> {
+        for bad in [
+            String::new(),
+            "x".repeat(129),
+            "a\nb".to_owned(),
+            "a\0b".to_owned(),
+            "tab\there".to_owned(),
+        ] {
+            let (response, store) = submit_as(Caller::Broker, Some(&bad)).await?;
+            let message = refusal(&response).with_context(|| format!("{bad:?}"))?;
+            assert!(message.contains("client_id"), "{bad:?}: must name the field: {message}");
+            assert!(store.list()?.is_empty(), "{bad:?}: no job may be created");
+        }
+        let (response, store) = submit_as(Caller::Broker, Some(&"x".repeat(128))).await?;
+        let job = submitted_job(response)?;
+        assert_eq!(
+            store.client_id(&job)?.map(|id| id.len()),
+            Some(128),
+            "the bound is inclusive"
+        );
+        Ok(())
+    }
+
+    /// #888: with no client id nothing changes, on either socket: the Submit is placed and the job has no client id.
+    #[tokio::test]
+    async fn a_submit_without_a_client_id_is_unchanged_on_both_sockets() -> anyhow::Result<()> {
+        for caller in [Caller::Main, Caller::Broker] {
+            let (response, store) = submit_as(caller, None).await?;
+            let job = submitted_job(response).with_context(|| format!("{caller:?}"))?;
+            assert_eq!(store.client_id(&job)?, None, "{caller:?}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_client_can_submit_and_then_read_back_status() -> anyhow::Result<()> {
         let store = Arc::new(JobStore::open_in_memory()?);
@@ -296,6 +439,7 @@ mod tests {
             registry,
             host_registry,
             Some("100.64.0.1:9000".parse().context("forward_back literal")?),
+            Caller::Main,
         ));
 
         let mut client = client;
@@ -304,6 +448,7 @@ mod tests {
             &ControlRequest {
                 request_id: 1,
                 op: Some(control_request::Op::Submit(SubmitRequest {
+                    client_id: None,
                     digests: false,
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
@@ -370,6 +515,7 @@ mod tests {
             registry,
             host_registry,
             None,
+            Caller::Main,
         ));
 
         let mut client = client;
@@ -378,6 +524,7 @@ mod tests {
             &ControlRequest {
                 request_id: 1,
                 op: Some(control_request::Op::Submit(SubmitRequest {
+                    client_id: None,
                     digests: false,
                     manifest: b"m".to_vec(),
                     manifest_encoding: "test/v1".to_owned(),
@@ -442,6 +589,7 @@ mod tests {
             registry,
             host_registry,
             None,
+            Caller::Main,
         ));
 
         use tokio::io::AsyncWriteExt;

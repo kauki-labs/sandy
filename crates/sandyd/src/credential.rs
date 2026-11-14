@@ -808,6 +808,7 @@ mod tests {
         ControlRequest {
             request_id: 1,
             op: Some(control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),

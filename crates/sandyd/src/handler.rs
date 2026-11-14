@@ -1588,6 +1588,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest,
                 manifest_encoding: MANIFEST_ENCODING_JSON.to_owned(),
@@ -1678,6 +1679,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -3085,6 +3087,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"opaque".to_vec(),
                 manifest_encoding: "application/octet-stream".to_owned(),
@@ -3138,6 +3141,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: oversized,
                 manifest_encoding: "test/v1".to_owned(),
@@ -3187,6 +3191,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: at_cap,
                 manifest_encoding: "test/v1".to_owned(),
@@ -3291,6 +3296,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -3635,6 +3641,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -4898,6 +4905,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest,
                 manifest_encoding: "flake/v1".to_owned(),
@@ -5226,6 +5234,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: flake_manifest_bytes(None),
                 manifest_encoding: "flake/v1".to_owned(),
@@ -5245,6 +5254,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -5264,6 +5274,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -5477,6 +5488,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: serde_json::to_vec(argv).expect("encode argv manifest"),
                 manifest_encoding: "argv/v1".to_owned(),

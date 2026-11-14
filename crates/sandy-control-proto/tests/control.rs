@@ -17,7 +17,7 @@ use sandy_control_proto::{
 /// Every `ControlRequest.op` variant survives an encode/decode round-trip with
 /// the envelope's own fields (`request_id`) intact.
 #[rstest]
-#[case(control_request::Op::Submit(SubmitRequest {
+#[case(control_request::Op::Submit(SubmitRequest { client_id: None,
     digests: false,
     manifest: b"manifest-bytes".to_vec(),
     manifest_encoding: "sandy.orchestrator.v1.JobManifest".to_owned(),

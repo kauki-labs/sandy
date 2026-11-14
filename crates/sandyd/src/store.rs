@@ -346,6 +346,22 @@ impl JobStore {
         Ok(InsertOutcome::Inserted)
     }
 
+    /// Record the API client the broker submitted `job_id` for (#888).
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write faults.
+    pub fn set_client_id(&self, _job_id: &str, _client_id: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// The API client the broker submitted `job_id` for (#888), or `None` for a job with no client id.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read faults.
+    pub fn client_id(&self, _job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+
     /// Record `token` as `job_id`'s durable attach credential (#327): a
     /// bearer value a LATER `Attach` call can present to prove "I'm the one
     /// who submitted this job" even from a fresh connection — unlike CF-H-1's
@@ -1228,6 +1244,80 @@ mod tests {
                 console: "hi\n".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    /// #888: the API client the broker submitted for round-trips on its job row, and a row with none (also one from
+    /// before the column existed) has none.
+    #[test]
+    fn a_client_id_round_trips_and_an_old_row_has_none() -> Result<(), StoreError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE jobs (
+                job_id             TEXT PRIMARY KEY,
+                status             TEXT NOT NULL,
+                manifest           BLOB NOT NULL,
+                manifest_encoding  TEXT NOT NULL,
+                created_at         INTEGER NOT NULL,
+                updated_at         INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        conn.execute(
+            "INSERT INTO jobs VALUES ('job-1', 'JOB_STATUS_PENDING', X'6d', 'argv/v1', 0, 0)",
+            (),
+        )?;
+        let store = JobStore::from_connection(conn)?;
+
+        assert_eq!(store.client_id("job-1")?, None, "a row from before the column");
+        store.set_client_id("job-1", "alice")?;
+        assert_eq!(store.client_id("job-1")?.as_deref(), Some("alice"));
+        assert_eq!(store.client_id("ghost")?, None);
+        Ok(())
+    }
+
+    /// The `who.identity` of the receipt in `job_id`'s stored envelope.
+    fn receipt_identity(store: &JobStore, job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(store
+            .envelope(job_id)?
+            .and_then(|envelope| envelope.receipt)
+            .map(|receipt| receipt.host_observed.who.identity))
+    }
+
+    /// #888: a cancelled job's receipt names its client (`broker:<id>`), and a job with no client id keeps the uid.
+    #[test]
+    fn a_cancelled_job_names_its_client_in_the_receipt() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("with-client", b"m", "argv/v1")?;
+        store.set_client_id("with-client", "alice")?;
+        store.insert_pending("no-client", b"m", "argv/v1")?;
+
+        store.cancel("with-client")?;
+        store.cancel("no-client")?;
+
+        assert_eq!(
+            receipt_identity(&store, "with-client")?.as_deref(),
+            Some("broker:alice")
+        );
+        assert_eq!(
+            receipt_identity(&store, "no-client")?,
+            Some(sandy_fsutil::current_uid().to_string())
+        );
+        Ok(())
+    }
+
+    /// #888: a job a restarted daemon found open and failed (recovery) names its client in the receipt too.
+    #[test]
+    fn a_recovered_job_names_its_client_in_the_receipt() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.mark_running("job-1")?;
+        store.set_client_id("job-1", "alice")?;
+
+        let recovered = store.recover_unfinished("the daemon restarted")?;
+
+        assert_eq!(recovered, ["job-1"]);
+        assert_eq!(receipt_identity(&store, "job-1")?.as_deref(), Some("broker:alice"));
         Ok(())
     }
 

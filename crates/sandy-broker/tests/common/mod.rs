@@ -61,6 +61,9 @@ pub struct Opts {
     /// Declare `transfer` and `shares_submitter_filesystem` on the stand-in host, so a submit with host paths of
     /// every kind (a secret path needs the shared filesystem) can be placed.
     pub path_host: bool,
+    /// Bind the attach proxy at its own path and give the broker that path (`BrokerConfig::attach_socket`) instead of
+    /// the one derived from the control socket.
+    pub explicit_attach: bool,
 }
 
 impl Default for Opts {
@@ -77,6 +80,7 @@ impl Default for Opts {
             output_join_backoff: Tuning::default().output_join_backoff,
             trusted_only_backend: false,
             path_host: false,
+            explicit_attach: false,
         }
     }
 }
@@ -220,6 +224,11 @@ async fn build(
     };
     let listener = UnixListener::bind(&socket)?;
     let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let attach_path = if opts.explicit_attach {
+        dir.path().join("explicit-attach.sock")
+    } else {
+        sandy_control_proto::attach_socket_path(&socket)
+    };
     if opts.attach_socket {
         // sandyd's accept loop listens on a private path. The canonical attach path holds a
         // recording proxy, so a test can see which cap the broker presented.
@@ -227,7 +236,7 @@ async fn build(
         let real = UnixListener::bind(&real_path)?;
         let (r, h) = (Arc::clone(&registry), Arc::clone(&hosts));
         tokio::spawn(async move { sandyd::attach_relay::serve_attach_accept_loop(&real, &r, &h).await });
-        let proxy = UnixListener::bind(sandy_control_proto::attach_socket_path(&socket))?;
+        let proxy = UnixListener::bind(attach_path.as_path())?;
         let seen = Arc::clone(&caps);
         tokio::spawn(async move {
             while let Ok((client, _)) = proxy.accept().await {
@@ -251,6 +260,7 @@ async fn build(
                 Arc::clone(&r),
                 Arc::clone(&h),
                 Some(forward_back),
+                sandyd::Caller::Broker,
             ));
         }
     });
@@ -258,6 +268,7 @@ async fn build(
     std::fs::create_dir(&root_a)?;
     let broker = serve_with_tuning(
         BrokerConfig {
+            attach_socket: opts.explicit_attach.then(|| attach_path.clone()),
             control_socket: socket,
             rpc_deadline: std::time::Duration::from_secs(30),
             state_dir: dir.path().join("state"),

@@ -1295,6 +1295,7 @@ async fn dispatch_daemon_async(op: DaemonOp, output: OutputFormat) -> i32 {
                 (bytes, encoding)
             };
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests,
                 manifest: bytes,
                 manifest_encoding: encoding,
