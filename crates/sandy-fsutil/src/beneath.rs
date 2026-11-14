@@ -371,9 +371,11 @@ pub fn create_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
             reason: "is the root, not a file below it".to_owned(),
         });
     };
-    let mut dir = Beneath::open_root(root)?;
+    // Only searched on the way, as in `open_file_beneath` and `create_dir_beneath`: the root and every directory above
+    // the leaf may lack read permission.
+    let mut dir = Beneath::open_root_search(root)?;
     for part in parts {
-        dir = dir.create_dir(part)?;
+        dir = dir.create_search_subdir(part)?;
     }
     dir.create_file(leaf)
 }
