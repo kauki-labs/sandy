@@ -207,9 +207,25 @@ fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) ->
 
 /// Refuse a Submit whose egress policy has a rule that is not a destination (A1, #483): an empty host, or a port
 /// outside 1..=65535 (the wire carries a `u32`). The CLI parses `--allow` already, but the broker and MCP submit too,
-/// and the executor re-checks, so a bad rule never reaches a host. Names the field.
+/// and the executor re-checks, so a bad rule never reaches a host. A policy is also bounded (#819): at most
+/// `MAX_EGRESS_RULES` rules, each host at most `MAX_EGRESS_HOST_LEN` bytes. Names the field.
 fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
-    submit.egress.as_ref()?.rules.iter().find_map(|rule| {
+    let policy = submit.egress.as_ref()?;
+    if policy.rules.len() > sandy_api::egress::MAX_EGRESS_RULES {
+        return Some(format!(
+            "egress has {} rules: a policy takes at most {}",
+            policy.rules.len(),
+            sandy_api::egress::MAX_EGRESS_RULES
+        ));
+    }
+    policy.rules.iter().find_map(|rule| {
+        let host_len = rule.host.strip_suffix('.').unwrap_or(&rule.host).len();
+        if host_len > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+            return Some(format!(
+                "egress has a rule whose host is {host_len} bytes: a host takes at most {}",
+                sandy_api::egress::MAX_EGRESS_HOST_LEN
+            ));
+        }
         let bad_port = !u16::try_from(rule.port).is_ok_and(|port| port != 0);
         (rule.host.is_empty() || bad_port).then(|| {
             format!(
@@ -3814,6 +3830,94 @@ mod tests {
             assert!(dispatch_rx.try_recv().is_err(), "{name}: nothing was dispatched");
         }
         Ok(())
+    }
+
+    /// A Submit carrying `rules` as its egress policy, through `handle` on a host that declares `egress_proxy`.
+    /// Returns the response and whether a `Dispatch` reached the host.
+    async fn submit_egress_rules(rules: &[(&str, u32)]) -> anyhow::Result<(ControlResponse, bool)> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, egress_host(true));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_with_egress(1, Some(rules)),
+        )
+        .await?;
+        Ok((response, dispatch_rx.try_recv().is_ok()))
+    }
+
+    /// A refusal that names the `egress` field, with nothing dispatched.
+    fn assert_egress_refused(name: &str, (response, dispatched): (ControlResponse, bool)) -> anyhow::Result<()> {
+        match response.result {
+            Some(control_response::Result::Error(e)) => {
+                assert!(
+                    e.message.contains("egress"),
+                    "{name}: must name the field: {}",
+                    e.message
+                );
+            }
+            other => anyhow::bail!("{name}: expected a refusal, got {other:?}"),
+        }
+        assert!(!dispatched, "{name}: nothing was dispatched");
+        Ok(())
+    }
+
+    /// #819: the daemon caps a policy at 256 rules, whatever the proxy would make of them.
+    #[tokio::test]
+    async fn an_egress_policy_over_the_rule_count_is_refused_at_submit() -> anyhow::Result<()> {
+        let rules = vec![("example.com", 443); 257];
+        assert_egress_refused("257 rules", submit_egress_rules(&rules).await?)
+    }
+
+    /// #819: the daemon caps a rule's host at 253 bytes, the proxy's own name limit, so a 254-byte host is refused.
+    #[tokio::test]
+    async fn an_egress_host_over_the_length_bound_is_refused_at_submit() -> anyhow::Result<()> {
+        let host = "a".repeat(254);
+        assert_egress_refused("254-byte host", submit_egress_rules(&[(host.as_str(), 443)]).await?)
+    }
+
+    /// #819: a 253-byte name with one trailing dot is 254 bytes as submitted. The proxy strips that dot before it
+    /// measures, so the daemon must accept it.
+    #[tokio::test]
+    async fn an_egress_host_with_a_trailing_dot_is_measured_without_it() -> anyhow::Result<()> {
+        let host = format!("{}.", valid_host_of_len(253));
+        let (response, dispatched) = submit_egress_rules(&[(host.as_str(), 443)]).await?;
+        assert!(
+            !matches!(response.result, Some(control_response::Result::Error(_))),
+            "a 253-byte name plus a trailing dot must be accepted, got {:?}",
+            response.result
+        );
+        assert!(dispatched, "the job was dispatched");
+        Ok(())
+    }
+
+    /// #819: the bounds are inclusive. 256 rules with a valid 253-byte multi-label host (labels of at most 63 bytes, as
+    /// the proxy requires) are placed and dispatched.
+    #[tokio::test]
+    async fn an_egress_policy_at_the_bounds_is_dispatched() -> anyhow::Result<()> {
+        let host = valid_host_of_len(253);
+        let rules = vec![(host.as_str(), 443); 256];
+        let (response, dispatched) = submit_egress_rules(&rules).await?;
+        assert!(
+            !matches!(response.result, Some(control_response::Result::Error(_))),
+            "a policy at the bounds must be accepted, got {:?}",
+            response.result
+        );
+        assert!(dispatched, "the job was dispatched");
+        Ok(())
+    }
+
+    /// A DNS name of exactly `len` bytes whose labels the proxy accepts: three 63-byte labels and a last one that makes
+    /// up the rest (only `len` of 253 is used, so the last label is 61 bytes).
+    fn valid_host_of_len(len: usize) -> String {
+        let label = "a".repeat(63);
+        let last = "a".repeat(len - 3 * 63 - 3);
+        format!("{label}.{label}.{label}.{last}")
     }
 
     /// #482: the handler-minted data link is bound to the placed host's IP,

@@ -176,10 +176,24 @@ fn allow_list_from_policy(
     let Some(policy) = policy else {
         return Ok(None);
     };
+    if policy.rules.len() > sandy_api::egress::MAX_EGRESS_RULES {
+        return Err(DispatchError::EgressPolicyInvalid(format!(
+            "{} rules: a policy takes at most {}",
+            policy.rules.len(),
+            sandy_api::egress::MAX_EGRESS_RULES
+        )));
+    }
     let rules = policy
         .rules
         .iter()
         .map(|rule| {
+            let host_len = rule.host.strip_suffix('.').unwrap_or(&rule.host).len();
+            if host_len > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+                return Err(DispatchError::EgressPolicyInvalid(format!(
+                    "a host of {host_len} bytes: a host takes at most {}",
+                    sandy_api::egress::MAX_EGRESS_HOST_LEN
+                )));
+            }
             let port = u16::try_from(rule.port).ok().filter(|port| *port != 0).ok_or_else(|| {
                 DispatchError::EgressPolicyInvalid(format!(
                     "port {} of `{}` is not a TCP port in 1..=65535",
@@ -1798,6 +1812,44 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A DNS name of 253 bytes whose labels the proxy accepts: three 63-byte labels and one of 61 bytes.
+    fn valid_253_byte_host() -> String {
+        let label = "a".repeat(63);
+        format!("{label}.{label}.{label}.{}", "a".repeat(61))
+    }
+
+    /// #819: the executor re-checks the rule-count bound `sandyd` applies at Submit (256 rules), inclusive.
+    #[test]
+    fn an_egress_policy_over_the_rule_count_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let over = vec![("example.com", 443u32); 257];
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&over))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![("example.com", 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        Ok(())
+    }
+
+    /// #819: the executor re-checks the host bound (253 bytes, as the proxy measures: one trailing dot is stripped).
+    #[test]
+    fn an_egress_host_over_the_length_bound_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let host = valid_253_byte_host();
+        let over = format!("a{host}");
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&[(over.as_str(), 443u32)]))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![(host.as_str(), 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        let dotted = format!("{host}.");
+        assert!(
+            allow_list_from_policy(Some(&policy(&[(dotted.as_str(), 443u32)])))?.is_some(),
+            "a trailing dot is not counted, as in the proxy"
+        );
+        Ok(())
     }
 
     /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.
