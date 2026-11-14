@@ -135,6 +135,15 @@ nix develop -c cargo shear --fix              # Prune unused dependencies
 5. Reindex the code graph (graph MCP is `codebase-memory-mcp`): `index_repository` with this
    repo's path.
 
+## Generated architecture docs
+
+Mandatory. `docs/generated/architecture.md` and `docs/generated/index.html` are built from
+the mermaid blocks in `docs/**/*.md` by `scripts/render_docs.py`. Whenever a `docs/**/*.md`
+changes, run `python3 scripts/render_docs.py` and commit `docs/generated/*` in the same
+push. The `docs-render` pre-push hook and the `docs-render` flake check run
+`render_docs.py --check` and fail on drift. Never hand-edit `docs/generated/`. After a
+merge conflict there, rerun the script instead of resolving by hand.
+
 ## Swarm
 
 Multi-agent runs follow [`.agents/charter.md`](.agents/charter.md), which mirrors the run

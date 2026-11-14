@@ -4,7 +4,10 @@ The orientation map: what sandy does, the seams it is built on, and how one
 `sandy run` flows through them. For a subsystem's decisions and its KPI (the
 tests that verify it), read [`spec.md`](spec.md). This page is the index into it.
 [`components.md`](components.md) shows every component and seam in one picture,
-then one schematic per component. The full decision records are in [`../decisions/`](../decisions); the live
+then one schematic per component. Every diagram in `docs/` is also collected into one
+generated page, [`../generated/architecture.md`](../generated/architecture.md), and a
+single-page [`../generated/index.html`](../generated/index.html) (do not edit them; see
+AGENTS.md, "Generated architecture docs"). The full decision records are in [`../decisions/`](../decisions); the live
 acceptance matrix (what must pass to ship) is in [`kpi.md`](kpi.md).
 
 ## What sandy is

@@ -183,7 +183,7 @@ jobs:
       - name: Supply-chain audit
         run: nix build -L .#checks.x86_64-linux.audit
       - name: Build and docs
-        run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit .#checks.x86_64-linux.project-docs
+        run: nix build -L .#checks.x86_64-linux.sandy .#checks.x86_64-linux.doc .#checks.x86_64-linux.pre-commit .#checks.x86_64-linux.project-docs .#checks.x86_64-linux.docs-render
       - name: Guest-wrapper composition (eval-only)
         run: nix build -L .#checks.x86_64-linux.guest-wrapper-module-eval .#checks.x86_64-linux.guest-wrapper-configuration-eval .#checks.x86_64-linux.guest-wrapper-ships-guest
       - name: sandy-executor vm.enable additivity (eval-only)
