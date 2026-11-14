@@ -268,6 +268,18 @@ fn path_root_refusal(submit: &SubmitRequest) -> Option<String> {
     })
 }
 
+/// Refuse a Submit whose `client_id` is not valid (#888): empty, over 128 bytes, or with a control character. Names the
+/// field. The id is honoured only on the broker socket; `serve_connection` refuses it on the main socket before this.
+fn client_id_refusal(submit: &SubmitRequest) -> Option<String> {
+    let id = submit.client_id.as_deref()?;
+    sandy_control_proto::client_id_problem(id).map(|why| {
+        format!(
+            "client_id {why}: a client id is 1 to {} bytes with no control character",
+            sandy_control_proto::MAX_CLIENT_ID_BYTES
+        )
+    })
+}
+
 /// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
 /// operator knows what to declare and a submitter knows why the job cannot be placed.
 /// The refusal for a Submit that asks for digests with no host to compute them (A2c, #483). It names the capability:
@@ -664,6 +676,13 @@ pub async fn handle(
                     result: Some(control_response::Result::Error(ControlError { message })),
                 });
             }
+            // #888: a client id that is not valid is refused before placement, with no side effect.
+            if let Some(message) = client_id_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             // #618: a path that cannot lie beneath its root is refused before placement, with no side effect.
             if let Some(message) = path_root_refusal(&submit) {
                 return Ok(ControlResponse {
@@ -778,6 +797,8 @@ pub async fn handle(
             }
 
             let job_id = Uuid::new_v4().to_string();
+            // Cloned before `submit.manifest` is moved out below: a partial move makes rustc refuse a later `&submit`.
+            let client_id_for_job = submit.client_id.clone();
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
             let inserted_id = job_id.clone();
@@ -789,6 +810,7 @@ pub async fn handle(
             // job terminally instead of leaving it silently `Pending`.
             let store_for_dispatch_failure = Arc::clone(store);
             let store_for_archive = Arc::clone(store);
+            let store_for_client = Arc::clone(store);
             let store = Arc::clone(store);
 
             // #327: a durable, re-presentable credential — independent of
@@ -1038,6 +1060,12 @@ pub async fn handle(
                         ),
                     })),
                 });
+            }
+            // #888: the API client the broker submitted for, stored before anything can end the job, so every terminal
+            // envelope names it. A store fault is the same class as the insert's: it ends the connection.
+            if let Some(client_id) = client_id_for_job {
+                let (store, job_id) = (Arc::clone(&store_for_client), job_id.clone());
+                tokio::task::spawn_blocking(move || store.set_client_id(&job_id, &client_id)).await??;
             }
             // The job now exists: it owns the credential until a terminal path
             // releases it.

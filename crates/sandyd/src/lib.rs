@@ -45,7 +45,9 @@ use std::{future::Future, net::SocketAddr, sync::Arc};
 use dispatch::JobRegistry;
 use environment_store::EnvironmentStore;
 use host_registry::HostRegistry;
-use sandy_control_proto::{ControlRequest, read_frame, write_frame};
+use sandy_control_proto::{
+    ControlRequest, ControlResponse, control_request, control_response, read_frame, write_frame,
+};
 use store::JobStore;
 use tokio::net::UnixStream;
 
@@ -120,6 +122,24 @@ pub enum Caller {
     Broker,
 }
 
+/// The refusal for a Submit that carries a `client_id` on the main socket (#888), or `None` for anything else.
+fn main_socket_client_id_refusal(caller: Caller, request: &ControlRequest) -> Option<ControlResponse> {
+    let Some(control_request::Op::Submit(submit)) = &request.op else {
+        return None;
+    };
+    if caller != Caller::Main || submit.client_id.is_none() {
+        return None;
+    }
+    Some(ControlResponse {
+        request_id: request.request_id,
+        result: Some(control_response::Result::Error(sandy_control_proto::ControlError {
+            message: "client_id is only accepted on the broker socket (SANDYD_BROKER_SOCK); this is the main control \
+                      socket"
+                .to_owned(),
+        })),
+    })
+}
+
 /// Serve one client connection: read [`ControlRequest`] frames, dispatch each
 /// against `store`, and write the matching
 /// [`ControlResponse`](sandy_control_proto::ControlResponse), until the peer
@@ -136,7 +156,7 @@ pub async fn serve_connection(
     registry: Arc<JobRegistry>,
     host_registry: Arc<HostRegistry>,
     forward_back_addr: Option<SocketAddr>,
-    _caller: Caller,
+    caller: Caller,
 ) {
     // CF-H-1: one session id per connection, not per request — minted once
     // here and compared, never trusted as access control, against the
@@ -156,9 +176,13 @@ pub async fn serve_connection(
         };
 
         let request_id = request.request_id;
+        // #888: a client id is honoured only on the broker socket. On the main socket it is refused, never ignored, so
+        // the CLI, `sandy-mcp` and every other local tool cannot write one into a receipt.
+        let response = if let Some(refused) = main_socket_client_id_refusal(caller, &request) {
+            refused
         // Environment operations have their own handler and store; every other
         // request goes to the job handler unchanged.
-        let response = if environment::is_environment_op(&request.op) {
+        } else if environment::is_environment_op(&request.op) {
             match environment::handle(&environments, request).await {
                 Ok(response) => response,
                 Err(e) => {
