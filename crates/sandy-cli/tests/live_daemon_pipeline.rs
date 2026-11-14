@@ -12,8 +12,12 @@
 //!
 //! The three variables name the packaged executor, agent and guest wrapper (`nix build .#sandy-host-executor
 //! .#sandy-agent .#sandy-guest-wrapper`). `SANDYD_BIN` points at a prebuilt `sandyd`; without it the test builds one.
-//! Every spawned command has a timeout; the harness kills only the processes it started, matched by pid and start
-//! time, and removes its own temp dir on every exit path.
+//! Every spawned command has a timeout. On a normal end, a panic or an `Err`, `Drop` stops the processes the test
+//! started (matched by pid and start time) and removes its temp dir. `Drop` does not run when a signal ends the test
+//! process (a nextest timeout, Ctrl-C, `kill -9`), so each stack also starts a watchdog: a `sh` in its own process
+//! group that waits for the test's pid to go, then kills every process whose environment names this stack's temp dir
+//! (`TMPDIR=<dir>/...`, inherited by `sandyd`, the executor, qemu and virtiofsd) and removes the dir. It reads no
+//! command line and touches nothing from another session.
 #![cfg(feature = "live")]
 #![cfg(target_os = "linux")]
 
@@ -36,6 +40,8 @@ const TEMPLATE: &str = "topologies.x86_64-linux.qemu";
 /// A cold guest build plus a boot, and the longest a single `sandy` call may take.
 const BUILD_SECS: u64 = 1500;
 const CALL_SECS: u64 = 600;
+/// The guest's qemu appears within a minute of the job reading Running (about 20 s on ws01).
+const GUEST_SECS: u64 = 120;
 
 /// `(parent pid, start time)` of a process, from `/proc/<pid>/stat`.
 fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
@@ -144,9 +150,47 @@ fn sandyd_bin() -> anyhow::Result<PathBuf> {
     Ok(sandy.parent().context("sandy's binary has no parent")?.join("sandyd"))
 }
 
-/// A free loopback port. The listener is dropped before the port is used; a collision fails the start, not a result.
-fn free_port() -> anyhow::Result<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+/// Two distinct free loopback ports. Both listeners are held until both ports are known, so the kernel cannot hand
+/// out one port twice; they drop before the ports are used, so a collision with another process fails the start.
+fn two_free_ports() -> anyhow::Result<(u16, u16)> {
+    let (a, b) = (TcpListener::bind("127.0.0.1:0")?, TcpListener::bind("127.0.0.1:0")?);
+    Ok((a.local_addr()?.port(), b.local_addr()?.port()))
+}
+
+/// Waits for this test process to go (pid and start time, so a reused pid does not keep it), then kills every
+/// process whose environment has `TMPDIR=<base>/` and removes `base`. Runs as `sh` in its own process group: a group
+/// signal to the test (a nextest timeout) does not reach it. It never matches by name or command line.
+const WATCHDOG: &str = r#"
+pid=$1; start=$2; base=$3
+case "$base" in /tmp/s?*) ;; *) exit 1 ;; esac
+alive() { [ -r "/proc/$pid/stat" ] && [ "$(sed 's/.*) //' "/proc/$pid/stat" | cut -d' ' -f20)" = "$start" ]; }
+while alive; do sleep 1; done
+for round in 1 2 3; do
+  for p in /proc/[0-9]*; do
+    n=${p#/proc/}
+    [ "$n" = "$$" ] && continue
+    grep -qaF "TMPDIR=$base/" "$p/environ" 2>/dev/null && kill -KILL "$n" 2>/dev/null
+  done
+  sleep 1
+done
+rm -rf "$base"
+"#;
+
+/// Start the [`WATCHDOG`] for `base`. Its own stdio is null and its environment holds no `TMPDIR=<base>/`.
+fn start_watchdog(base: &Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let me = std::process::id();
+    let (_, start) = parent_and_start(me).context("read this process's start time")?;
+    Command::new("sh")
+        .args(["-c", WATCHDOG, "watchdog", &me.to_string(), &start.to_string()])
+        .arg(base)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn the watchdog")?;
+    Ok(())
 }
 
 fn private_dir(path: &Path) -> anyhow::Result<()> {
@@ -157,12 +201,13 @@ fn private_dir(path: &Path) -> anyhow::Result<()> {
 
 /// `sandyd` and `sandy-host-executor`, registered with each other, and the env a `sandy` call needs.
 struct Stack {
-    dir: tempfile::TempDir,
     sock: PathBuf,
     client_tmp: PathBuf,
     executor_pid: u32,
+    // Fields drop in order: the processes stop before the directory they use is removed.
     _executor: Proc,
     _daemon: Proc,
+    dir: tempfile::TempDir,
 }
 
 impl Stack {
@@ -177,6 +222,7 @@ impl Stack {
             .tempdir_in("/tmp")
             .context("temp dir under /tmp")?;
         let base = dir.path();
+        start_watchdog(base)?;
         for sub in ["d", "e", "dt", "et", "ct"] {
             private_dir(&base.join(sub))?;
         }
@@ -200,7 +246,7 @@ impl Stack {
         let (daemon_fp, executor_fp) = (fingerprint("d")?, fingerprint("e")?);
 
         let sock = base.join("d.sock");
-        let (mesh, link) = (free_port()?, free_port()?);
+        let (mesh, link) = two_free_ports()?;
         let daemon = Proc(
             Command::new(sandyd_bin()?)
                 .env("SANDY_SOCK", &sock)
@@ -380,12 +426,20 @@ fn the_lifecycle_verbs_operate_on_a_real_running_job() -> anyhow::Result<()> {
     ensure!(!id.is_empty(), "no job id: {submitted}");
 
     // The job reads Running before the guest boots: wait for the guest's own qemu, which proves a real boot.
-    let deadline = Instant::now() + Duration::from_secs(CALL_SECS);
+    let deadline = Instant::now() + Duration::from_secs(GUEST_SECS);
     let guest = loop {
         if let Some(guest) = stack.guest_qemus().into_iter().next() {
             break guest;
         }
-        ensure!(Instant::now() < deadline, "no guest qemu appeared under the executor");
+        ensure!(
+            Instant::now() < deadline,
+            "no guest qemu (a `qemu-system` child with `-drive`) appeared under the executor within {GUEST_SECS}s; \
+             its children are: {:?}",
+            children_of(stack.executor_pid)
+                .into_iter()
+                .map(|(pid, _, cmd)| format!("{pid}: {}", cmd.chars().take(80).collect::<String>()))
+                .collect::<Vec<_>>()
+        );
         std::thread::sleep(Duration::from_millis(500));
     };
 

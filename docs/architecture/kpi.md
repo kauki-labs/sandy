@@ -33,7 +33,7 @@ are real `SANDY_LIVE=1` process-level tests (a real `sandyd` binary, real TCP/UD
 connections), but run the job itself through `handle_dispatch` against
 `FakeContainment`, not a real container or VM. They count toward the
 control-plane and attach-data-plane floor only, never toward containment or
-VM-boot KPIs, which K15-K19 and KA3-KA4 cover (K1-K10, K14 and K21-K22 await #858).
+VM-boot KPIs, which K15-K19 and KA3-KA4 cover (K4-K10, K14 and K21-K22 await #858; K1-K3 are re-proven on qemu).
 
 ## Required functionality
 

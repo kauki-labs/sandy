@@ -13,3 +13,13 @@
 [[profile.default.overrides]]
 filter = 'package(sandy-agent)'
 threads-required = 2
+
+# #858: each live pipeline test boots a real guest through its own `sandyd` and executor. They share nothing, but
+# three guests at once on a shared host only add CPU contention, so they run one at a time. The live feature is off in
+# CI, so this matches no test there.
+[test-groups]
+live-vm = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(live_daemon_pipeline)'
+test-group = 'live-vm'
