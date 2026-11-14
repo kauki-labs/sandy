@@ -1337,11 +1337,13 @@ mod tests {
     fn to_run_inputs_copies_every_field_including_guest_path() {
         let converted = to_run_inputs(&[
             sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/data".to_owned(),
                 name: "in0".to_owned(),
                 guest_path: Some("/workspace".to_owned()),
             },
             sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/plain".to_owned(),
                 name: "plain".to_owned(),
                 guest_path: None,
@@ -1357,10 +1359,12 @@ mod tests {
     fn to_run_outputs_copies_name_and_dest() {
         let converted = to_run_outputs(&[
             sandy_executor_proto::Output {
+                root: None,
                 name: Some("out0".to_owned()),
                 dest: "/submitter/dest".to_owned(),
             },
             sandy_executor_proto::Output {
+                root: None,
                 name: None,
                 dest: "/submitter/catchall".to_owned(),
             },
@@ -1373,6 +1377,7 @@ mod tests {
     #[test]
     fn to_run_secrets_always_produces_a_file_source() {
         let converted = to_run_secrets(&[sandy_executor_proto::SecretRef {
+            root: None,
             name: "token".to_owned(),
             host_path: "/submitter/secret.txt".to_owned(),
         }]);
@@ -1618,6 +1623,7 @@ mod tests {
             forward_back: forward_back.to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
             inputs: vec![sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/path".to_string(),
                 name: "data".to_string(),
                 guest_path: None,
@@ -1704,6 +1710,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let control = sandy_api::backend::RunControl::with_timeout_secs(60);
         let declared = [sandy_executor_proto::Output {
+            root: None,
             name: None,
             dest: "/submitter/all".to_owned(),
         }];

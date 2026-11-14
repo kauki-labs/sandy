@@ -304,6 +304,7 @@ fn to_dispatch_path_fields(
         .inputs
         .iter()
         .map(|i| sandy_executor_proto::Input {
+            root: None,
             host: i.host.clone(),
             name: i.name.clone(),
             guest_path: i.guest_path.clone(),
@@ -313,6 +314,7 @@ fn to_dispatch_path_fields(
         .outputs
         .iter()
         .map(|o| sandy_executor_proto::Output {
+            root: None,
             name: o.name.clone(),
             dest: o.dest.clone(),
         })
@@ -321,6 +323,7 @@ fn to_dispatch_path_fields(
         .secrets
         .iter()
         .map(|s| sandy_executor_proto::SecretRef {
+            root: None,
             name: s.name.clone(),
             host_path: s.host_path.clone(),
         })
@@ -953,6 +956,7 @@ pub async fn handle(
                 // The path only: the token stays in the file (decision 37).
                 if let sandy::SecretSource::File(path) = bracket.secret_ref().source {
                     dispatch.secrets.push(sandy_executor_proto::SecretRef {
+                        root: None,
                         name: CREDENTIAL_SECRET_NAME.to_owned(),
                         host_path: path.display().to_string(),
                     });
@@ -3153,6 +3157,7 @@ mod tests {
                 submitter_caps: Vec::new(),
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 inputs: vec![sandy_control_proto::Input {
+                    root: None,
                     host: "/src".to_owned(),
                     name: "src".to_owned(),
                     guest_path: Some("/work/src".to_owned()),
@@ -3172,6 +3177,7 @@ mod tests {
             submit.inputs = input
                 .map(|name| {
                     vec![sandy_control_proto::Input {
+                        root: None,
                         host: "/src".to_owned(),
                         name: name.to_owned(),
                         guest_path: None,
@@ -3181,6 +3187,7 @@ mod tests {
             submit.outputs = output
                 .map(|name| {
                     vec![sandy_control_proto::Output {
+                        root: None,
                         name: name.map(str::to_owned),
                         dest: "/out".to_owned(),
                     }]
@@ -3237,6 +3244,7 @@ mod tests {
                         submit.inputs = names
                             .iter()
                             .map(|name| sandy_control_proto::Input {
+                                root: None,
                                 host: "/src".to_owned(),
                                 name: (*name).to_owned(),
                                 guest_path: None,
@@ -3247,6 +3255,7 @@ mod tests {
                         submit.outputs = names
                             .iter()
                             .map(|name| sandy_control_proto::Output {
+                                root: None,
                                 name: Some((*name).to_owned()),
                                 dest: "/out".to_owned(),
                             })
@@ -3307,6 +3316,7 @@ mod tests {
                 if field == "inputs" {
                     submit.inputs = (0..count)
                         .map(|i| sandy_control_proto::Input {
+                            root: None,
                             host: "/src".to_owned(),
                             name: format!("in{i}"),
                             guest_path: None,
@@ -3315,6 +3325,7 @@ mod tests {
                 } else {
                     submit.outputs = (0..count)
                         .map(|i| sandy_control_proto::Output {
+                            root: None,
                             name: Some(format!("out{i}")),
                             dest: "/out".to_owned(),
                         })
@@ -3428,6 +3439,7 @@ mod tests {
         let mut request = submit_req_with_input(1);
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.secrets = vec![sandy_control_proto::SecretRef {
+                root: None,
                 name: "token".to_owned(),
                 host_path: "/etc/secret".to_owned(),
             }];
@@ -3490,6 +3502,7 @@ mod tests {
                 required_isolation_class: sandy_control_proto::IsolationClass::Trusted.into(),
                 inputs: Vec::new(),
                 outputs: vec![sandy_control_proto::Output {
+                    root: None,
                     name: Some("result".to_owned()),
                     dest: "/out".to_owned(),
                 }],
@@ -3614,10 +3627,12 @@ mod tests {
         if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
             submit.outputs = vec![
                 sandy_control_proto::Output {
+                    root: None,
                     name: Some("report".to_owned()),
                     dest: "/out/report".to_owned(),
                 },
                 sandy_control_proto::Output {
+                    root: None,
                     name: None,
                     dest: "/out/rest".to_owned(),
                 },

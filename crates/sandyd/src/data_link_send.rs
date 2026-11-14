@@ -360,6 +360,7 @@ mod tests {
 
     fn input(dir: &Path, name: &str) -> sandy_executor_proto::Input {
         sandy_executor_proto::Input {
+            root: None,
             host: dir.join(name).to_string_lossy().into_owned(),
             name: name.to_owned(),
             guest_path: None,
@@ -433,6 +434,37 @@ mod tests {
             "the peer was not told"
         );
         Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the daemon follows it and sends the outside file. With a root it walks `sub` without following a link
+    /// and refuses, before any chunk goes out.
+    #[tokio::test]
+    async fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let outside = tempfile::tempdir().context("outside")?;
+        write(&outside.path().join("secret"), b"outside bytes")?;
+        let root = tempfile::tempdir().context("root")?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).context("swap the parent for a link")?;
+        let under_link = root.path().join("sub");
+
+        let escaped = sandy_executor_proto::Input {
+            name: "secret".to_owned(),
+            ..input(&under_link, "secret")
+        };
+        let (sent, messages) = frames(&[escaped.clone()], SendLimits::default()).await?;
+        assert!(sent.is_ok(), "without a root the link is followed today, got {sent:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(&m.op, Some(Op::InputChunk(c)) if c.bytes == b"outside bytes")),
+            "the outside file must have been sent, to prove the setup escapes"
+        );
+
+        let rooted = sandy_executor_proto::Input {
+            root: Some(root.path().to_string_lossy().into_owned()),
+            ..escaped
+        };
+        assert_refused_before_any_chunk(&[rooted]).await
     }
 
     /// A name the receiver would refuse is refused at the source (#770): too long, a `..` or `.` component, an absolute

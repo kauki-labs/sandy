@@ -179,6 +179,12 @@ message Input {
   string host = 1;
   string name = 2;
   optional string guest_path = 3;
+  // A trusted absolute directory the path must lie beneath (#618, #607). Absent keeps today's behaviour: the path
+  // is opened as given. Set (the broker sets it from the client's configured roots), `sandyd` opens this directory,
+  // following links, and then walks every component of the path below it without following a link, so a client
+  // that swaps a parent directory for a symlink cannot redirect the open outside it. A submit whose root is not
+  // absolute, or whose path is not under it or holds a `..`, is refused.
+  optional string root = 4;
 }
 
 // Mirrors `sandy_api::backend::Output`. `name` unset is the catch-all: the
@@ -186,6 +192,12 @@ message Input {
 message Output {
   optional string name = 1;
   string dest = 2;
+  // A trusted absolute directory the path must lie beneath (#618, #607). Absent keeps today's behaviour: the path
+  // is opened as given. Set (the broker sets it from the client's configured roots), `sandyd` opens this directory,
+  // following links, and then walks every component of the path below it without following a link, so a client
+  // that swaps a parent directory for a symlink cannot redirect the open outside it. A submit whose root is not
+  // absolute, or whose path is not under it or holds a `..`, is refused.
+  optional string root = 3;
 }
 
 // Mirrors `sandy_api::backend::SecretRef` with a file-backed source only —
@@ -195,6 +207,12 @@ message Output {
 message SecretRef {
   string name = 1;
   string host_path = 2;
+  // A trusted absolute directory the path must lie beneath (#618, #607). Absent keeps today's behaviour: the path
+  // is opened as given. Set (the broker sets it from the client's configured roots), `sandyd` opens this directory,
+  // following links, and then walks every component of the path below it without following a link, so a client
+  // that swaps a parent directory for a symlink cannot redirect the open outside it. A submit whose root is not
+  // absolute, or whose path is not under it or holds a `..`, is refused.
+  optional string root = 3;
 }
 
 message SubmitResponse {

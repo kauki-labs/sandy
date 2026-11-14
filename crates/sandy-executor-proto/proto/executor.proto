@@ -309,18 +309,27 @@ message Input {
   string host = 1;
   string name = 2;
   optional string guest_path = 3;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 4;
 }
 
 // Mirrors `sandy.control.v1.Output`.
 message Output {
   optional string name = 1;
   string dest = 2;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 3;
 }
 
 // Mirrors `sandy.control.v1.SecretRef`.
 message SecretRef {
   string name = 1;
   string host_path = 2;
+  // Mirrors `sandy.control.v1.*.root` (#618): the trusted absolute directory the path lies beneath. Absent keeps
+  // today's behaviour.
+  optional string root = 3;
 }
 
 // Orchestrator -> host-executor (#340): the orchestrator's own attach-relay

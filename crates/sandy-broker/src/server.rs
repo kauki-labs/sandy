@@ -276,6 +276,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .inputs
             .into_iter()
             .map(|i| Input {
+                root: None,
                 host: i.host,
                 name: i.name,
                 guest_path: i.guest_path,
@@ -285,6 +286,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .outputs
             .into_iter()
             .map(|o| Output {
+                root: None,
                 name: o.name,
                 dest: o.dest,
             })
@@ -293,6 +295,7 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .secrets
             .into_iter()
             .map(|s| SecretRef {
+                root: None,
                 name: s.name,
                 host_path: s.host_path,
             })

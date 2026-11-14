@@ -1973,6 +1973,7 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.data_outputs = vec![sandy_executor_proto::Output {
+            root: None,
             name: Some("out".to_owned()),
             dest: "/nowhere".to_owned(),
         }];

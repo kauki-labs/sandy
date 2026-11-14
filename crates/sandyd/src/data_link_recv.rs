@@ -623,6 +623,7 @@ mod tests {
 
     fn out(name: Option<&str>, dest: &Path) -> sandy_executor_proto::Output {
         sandy_executor_proto::Output {
+            root: None,
             name: name.map(str::to_owned),
             dest: dest.to_string_lossy().into_owned(),
         }
@@ -1294,6 +1295,41 @@ mod tests {
         received.context("the receive")?;
 
         assert_eq!(std::fs::read(real.join("out/x.txt")).context("through the link")?, b"X");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the receiver follows it and writes the output outside. With a root it walks `sub` without following a
+    /// link, refuses, and writes nothing outside.
+    #[tokio::test]
+    async fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let outside = tempfile::tempdir().context("outside")?;
+        let root = tempfile::tempdir().context("root")?;
+        symlink(outside.path(), root.path().join("sub")).context("swap the parent for a link")?;
+        let dest = root.path().join("sub/out");
+
+        let unrooted = [out(None, &dest)];
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &unrooted, quick(), false).await?;
+        received.context("without a root the link is followed today")?;
+        assert_eq!(
+            std::fs::read(outside.path().join("out/x.txt")).context("escaped")?,
+            b"X"
+        );
+        std::fs::remove_dir_all(outside.path().join("out")).context("reset")?;
+
+        let rooted = [sandy_executor_proto::Output {
+            root: Some(root.path().to_string_lossy().into_owned()),
+            ..out(None, &dest)
+        }];
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &rooted, quick(), false).await?;
+        assert!(
+            received.is_err(),
+            "a destination through a swapped parent must be refused"
+        );
+        assert!(
+            !outside.path().join("out").exists(),
+            "nothing may be written outside the root"
+        );
         Ok(())
     }
 
