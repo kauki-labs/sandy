@@ -3816,6 +3816,69 @@ mod tests {
         Ok(())
     }
 
+    /// #819: a policy has no bound beyond the frame cap, so the daemon caps the rule count (256) and the host length
+    /// (253, the longest DNS name). A Submit over either bound is refused naming `egress`, with nothing dispatched.
+    #[tokio::test]
+    async fn an_oversized_egress_policy_is_refused_at_submit() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let long_host = "a".repeat(254);
+        let many: Vec<(&str, u32)> = vec![("example.com", 443); 257];
+        let too_long: Vec<(&str, u32)> = vec![(long_host.as_str(), 443)];
+        for (name, rules) in [("257 rules", many), ("254-byte host", too_long)] {
+            let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+            let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, egress_host(true));
+            let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+            let response = handle(
+                &store,
+                &registry,
+                &host_registry,
+                Some(forward_back),
+                test_session(),
+                submit_req_with_egress(1, Some(&rules)),
+            )
+            .await?;
+            match response.result {
+                Some(control_response::Result::Error(e)) => {
+                    assert!(
+                        e.message.contains("egress"),
+                        "{name}: must name the field: {}",
+                        e.message
+                    );
+                }
+                other => anyhow::bail!("{name}: expected a refusal, got {other:?}"),
+            }
+            assert!(dispatch_rx.try_recv().is_err(), "{name}: nothing was dispatched");
+        }
+        Ok(())
+    }
+
+    /// #819: the bounds are inclusive. 256 rules with a 253-byte host are placed and dispatched.
+    #[tokio::test]
+    async fn an_egress_policy_at_the_bounds_is_dispatched() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let host = "a".repeat(253);
+        let rules: Vec<(&str, u32)> = vec![(host.as_str(), 443); 256];
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, egress_host(true));
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req_with_egress(1, Some(&rules)),
+        )
+        .await?;
+        assert!(
+            !matches!(response.result, Some(control_response::Result::Error(_))),
+            "a policy at the bounds must be accepted, got {:?}",
+            response.result
+        );
+        assert!(dispatch_rx.try_recv().is_ok(), "the job was dispatched");
+        Ok(())
+    }
+
     /// #482: the handler-minted data link is bound to the placed host's IP,
     /// carries the token the Dispatch sent, and differs from the agent
     /// link's token; a stream from any other peer is refused.

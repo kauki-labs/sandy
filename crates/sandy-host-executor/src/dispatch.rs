@@ -1800,6 +1800,30 @@ mod tests {
         }
     }
 
+    /// #819: the executor re-checks the bounds `sandyd` applies at Submit (256 rules, 253-byte host), inclusive.
+    #[test]
+    fn an_oversized_egress_policy_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let long_host = "a".repeat(254);
+        let at_limit_host = "a".repeat(253);
+        let many = vec![("example.com", 443u32); 257];
+        let too_long = vec![(long_host.as_str(), 443u32)];
+        for (name, rules) in [("257 rules", many), ("254-byte host", too_long)] {
+            assert!(
+                matches!(
+                    allow_list_from_policy(Some(&policy(&rules))),
+                    Err(DispatchError::EgressPolicyInvalid(_))
+                ),
+                "{name}"
+            );
+        }
+        let at_limit = vec![(at_limit_host.as_str(), 443u32); 256];
+        assert!(
+            allow_list_from_policy(Some(&policy(&at_limit)))?.is_some(),
+            "a policy at the bounds is accepted"
+        );
+        Ok(())
+    }
+
     /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.
     #[test]
     fn the_hypervisor_is_vfkit_on_macos_and_qemu_elsewhere() {
