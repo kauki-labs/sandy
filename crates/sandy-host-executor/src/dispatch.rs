@@ -187,10 +187,10 @@ fn allow_list_from_policy(
         .rules
         .iter()
         .map(|rule| {
-            if rule.host.len() > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+            let host_len = rule.host.strip_suffix('.').unwrap_or(&rule.host).len();
+            if host_len > sandy_api::egress::MAX_EGRESS_HOST_LEN {
                 return Err(DispatchError::EgressPolicyInvalid(format!(
-                    "a host of {} bytes: a host takes at most {}",
-                    rule.host.len(),
+                    "a host of {host_len} bytes: a host takes at most {}",
                     sandy_api::egress::MAX_EGRESS_HOST_LEN
                 )));
             }

@@ -219,10 +219,10 @@ fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
         ));
     }
     policy.rules.iter().find_map(|rule| {
-        if rule.host.len() > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+        let host_len = rule.host.strip_suffix('.').unwrap_or(&rule.host).len();
+        if host_len > sandy_api::egress::MAX_EGRESS_HOST_LEN {
             return Some(format!(
-                "egress has a rule whose host is {} bytes: a host takes at most {}",
-                rule.host.len(),
+                "egress has a rule whose host is {host_len} bytes: a host takes at most {}",
                 sandy_api::egress::MAX_EGRESS_HOST_LEN
             ));
         }
