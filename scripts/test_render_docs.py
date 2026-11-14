@@ -308,6 +308,46 @@ class ReviewFixesTest(Base):
         self.assertRegex(tag.group(0), r'integrity="sha384-[A-Za-z0-9+/]{64}"')
         self.assertIn('crossorigin="anonymous"', tag.group(0))
 
+    def test_css_defines_reference_tokens_for_light_and_dark(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "").replace("\n", "")
+        light, dark = flat.split("@media(prefers-color-scheme:dark)", 1)
+        for token, lval, dval in (
+            ("--bg", "#f6f7f9", "#12161b"),
+            ("--fg", "#1b1f24", "#e6e9ee"),
+            ("--mut", "#5b6572", "#9aa4b0"),
+            ("--card", "#fff", "#1a2027"),
+            ("--line", "#dde1e6", "#2b333c"),
+        ):
+            self.assertIn(f"{token}:{lval};", light)
+            self.assertIn(f"{token}:{dval};", dark)
+        self.assertRegex(light, r":root\{[^}]*--accent:")
+        self.assertRegex(dark, r":root\{[^}]*--accent:")
+
+    def test_body_background_and_layout_come_from_reference_style(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "")
+        self.assertIn("background:var(--bg)", flat)
+        self.assertIn("font:15px/1.5system-ui", flat)
+        self.assertIn("max-width:1040px", flat)
+        self.assertIn("padding:24px16px48px", flat)
+        self.assertIn("border-radius:12px", flat)
+
+    def test_page_has_no_horizontal_scroll_rule_for_wide_content(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "")
+        self.assertIn(".diagram-box{overflow-x:auto", flat.replace("\n", ""))
+        self.assertIn("detailspre{overflow-x:auto", flat.replace("\n", ""))
+        self.assertNotIn("overflow-x:scroll", flat)
+        self.assertNotIn("min-width:720px", flat)
+
+    def test_mermaid_theme_follows_page_and_pin_is_unchanged(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        self.assertIn("mermaid@11.4.1", html)
+        self.assertIn("sha384-rbtjAdnIQE/aQJGEgXrVUlMibdfTSa4PQju4HDhN3sR2PmaKFzhEafuePsl9H/9I", html)
+        self.assertIn("themeVariables", html)
+        self.assertIn("#1a2027", html)
+
     def test_crlf_input_renders_like_lf(self) -> None:
         lf = {"overview.md": FM + "## A\n\ntext\n\n" + MERMAID}
         crlf = {"overview.md": lf["overview.md"].replace("\n", "\r\n")}
