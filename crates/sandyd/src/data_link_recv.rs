@@ -1350,6 +1350,47 @@ mod tests {
         Ok(())
     }
 
+    /// `output` with `root` set to `root`: the destination lies beneath it.
+    fn rooted(output: sandy_executor_proto::Output, root: &Path) -> sandy_executor_proto::Output {
+        sandy_executor_proto::Output {
+            root: Some(root.to_string_lossy().into_owned()),
+            ..output
+        }
+    }
+
+    /// #618 (review of #889): a rooted output that lies beneath its root is received, not refused. A named tree lands
+    /// at the destination, a catch-all lands at the destination, and a bare named chunk is the destination file,
+    /// whose parent opens beneath the root. Each asserts the bytes and the final contents.
+    #[tokio::test]
+    async fn rooted_outputs_beneath_their_root_are_received() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+
+        let named = root.path().join("named/deep");
+        let outputs = [rooted(out(Some("results"), &named), root.path())];
+        let messages = [
+            chunk(0, "results/a.txt", b"A"),
+            chunk(0, "results/sub/b.txt", b"BB"),
+            end(),
+        ];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert_eq!(received.context("a named tree")?, Received { files: 2, bytes: 3 });
+        assert_eq!(tree(&named)?, files(&[("a.txt", b"A"), ("sub/b.txt", b"BB")]));
+
+        let catch_all = root.path().join("all");
+        let outputs = [rooted(out(None, &catch_all), root.path())];
+        let messages = [chunk(0, "x.txt", b"X"), chunk(0, "d/y.txt", b"Y"), end()];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert_eq!(received.context("a catch-all")?, Received { files: 2, bytes: 2 });
+        assert_eq!(tree(&catch_all)?, files(&[("x.txt", b"X"), ("d/y.txt", b"Y")]));
+
+        let file = root.path().join("files/report.bin");
+        let outputs = [rooted(out(Some("report"), &file), root.path())];
+        let (received, _peer) = run(&[chunk(0, "report", b"payload"), end()], &outputs, quick(), false).await?;
+        assert_eq!(received.context("a bare named file")?, Received { files: 1, bytes: 7 });
+        assert_eq!(std::fs::read(&file).context("the file")?, b"payload");
+        Ok(())
+    }
+
     /// The pid of a process that has exited: a short-lived child of this test binary, waited for.
     fn a_dead_pid() -> anyhow::Result<u32> {
         let mut child = std::process::Command::new(std::env::current_exe().context("current exe")?)

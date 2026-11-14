@@ -352,9 +352,9 @@ async fn a_client_controlled_alias_never_becomes_the_root_sandyd_opens() -> Resu
     std::fs::remove_file(&alias)?;
     std::os::unix::fs::symlink(&outside, &alias)?;
     let (mut tx, mut rx) = tokio::io::duplex(1 << 20);
-    let _ =
-        sandyd::data_link_send::send_inputs(&mut tx, &dispatch.inputs, sandyd::data_link_send::SendLimits::default())
-            .await;
+    sandyd::data_link_send::send_inputs(&mut tx, &dispatch.inputs, sandyd::data_link_send::SendLimits::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("the permitted input must be sent: {e}"))?;
     drop(tx);
     let mut sent = Vec::new();
     while let Some(message) = sandy_control_proto::read_frame::<sandy_executor_proto::DataLinkMessage>(&mut rx).await? {
@@ -362,9 +362,9 @@ async fn a_client_controlled_alias_never_becomes_the_root_sandyd_opens() -> Resu
             sent.extend(chunk.bytes);
         }
     }
-    assert!(
-        !String::from_utf8_lossy(&sent).contains("OUTSIDE"),
-        "the retargeted alias must not redirect the read outside the root"
+    assert_eq!(
+        sent, b"inside the root",
+        "the retargeted alias must not redirect the read outside the root, and the permitted read must still happen"
     );
     Ok(())
 }

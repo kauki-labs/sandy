@@ -88,12 +88,18 @@ fn confined(path: &Path, root: &Path) -> Option<Rooted> {
 ///
 /// A message naming the root that does not exist or cannot be resolved.
 pub(crate) fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    canonical_roots_with(roots, |root| root.canonicalize())
+}
+
+/// [`canonical_roots`] with the resolver injected, so a test can name a root the file system of the test host cannot
+/// hold (a non-UTF-8 name, which macOS refuses to create).
+fn canonical_roots_with(
+    roots: &[PathBuf],
+    resolve: impl Fn(&Path) -> io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
     roots
         .iter()
-        .map(|root| {
-            root.canonicalize()
-                .map_err(|e| format!("root {} cannot be resolved: {e}", root.display()))
-        })
+        .map(|root| resolve(root).map_err(|e| format!("root {} cannot be resolved: {e}", root.display())))
         .collect()
 }
 
@@ -197,6 +203,22 @@ mod tests {
         assert_eq!(nearest.path, nested.canonicalize()?.join("f"));
         assert_eq!(root_for(&root.join("x").to_string_lossy(), &[]), None);
         Ok(())
+    }
+
+    /// #618 (review of #889): the canonical root goes on the wire as UTF-8 text. A root whose real name is not valid
+    /// UTF-8 would be sent lossily as another directory (`b"/srv/raw-\xff"` becomes `/srv/raw-\u{fffd}`), so startup
+    /// refuses it, naming the configured root.
+    #[test]
+    fn a_root_whose_canonical_name_is_not_utf8_is_refused_at_startup() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+        let configured = PathBuf::from("/srv/alias");
+        let canonical = PathBuf::from(OsStr::from_bytes(b"/srv/raw-\xff"));
+
+        let err = canonical_roots_with(std::slice::from_ref(&configured), |_| Ok(canonical.clone()))
+            .expect_err("a root that is not UTF-8 must be refused");
+
+        assert!(err.contains("/srv/alias"), "must name the configured root: {err}");
+        assert!(err.contains("UTF-8"), "must say why: {err}");
     }
 
     /// #618: a root that does not exist cannot be resolved at startup, and the error names it.

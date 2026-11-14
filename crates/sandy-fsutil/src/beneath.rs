@@ -565,6 +565,45 @@ mod tests {
         Ok((root, outside))
     }
 
+    /// Restores a directory's mode on drop, so a test that locks a directory down still lets its tempdir clean up.
+    #[cfg(target_os = "linux")]
+    struct RestoreMode(PathBuf, u32);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, std::os::unix::fs::PermissionsExt::from_mode(self.1));
+        }
+    }
+
+    /// #618 (review of #889): the root is only searched on the way to something below it, so a root with search
+    /// (execute) permission and no read permission, which holds a readable file, still works. Linux opens a
+    /// search-only handle (`O_PATH`) for that. The test is Linux-only (macOS has no search-only open) and skipped
+    /// for root, which ignores modes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_search_only_root_still_opens_a_file_and_a_directory_below_it() -> anyhow::Result<()> {
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("sub"))?;
+        fs::write(root.path().join("f"), b"in the root")?;
+        fs::write(root.path().join("sub/g"), b"below")?;
+        let _restore = RestoreMode(root.path().to_owned(), 0o700);
+        fs::set_permissions(root.path(), std::os::unix::fs::PermissionsExt::from_mode(0o100))?;
+
+        let mut file = open_file_beneath(root.path(), &root.path().join("f")).context("a file in a 0100 root")?;
+        let mut text = String::new();
+        io::Read::read_to_string(&mut file, &mut text)?;
+        let dir =
+            Beneath::open_dir_beneath(root.path(), &root.path().join("sub")).context("a directory in a 0100 root")?;
+
+        assert_eq!(text, "in the root");
+        assert_eq!(dir.entries()?.count(), 1);
+        Ok(())
+    }
+
     /// #618: a file under real directories below the root is read.
     #[test]
     fn a_file_beneath_the_root_is_opened() -> anyhow::Result<()> {

@@ -3837,6 +3837,75 @@ mod tests {
         request
     }
 
+    /// A Submit with an input, an output and a secret, each rooted or not as asked.
+    fn submit_with_mixed_roots(root_inputs_and_outputs: bool, root_secret: bool) -> ControlRequest {
+        let mut request = submit_with_roots("/srv/a", "/srv/a/job");
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            if !root_inputs_and_outputs {
+                submit.inputs[0].root = None;
+                submit.outputs[0].root = None;
+            }
+            if !root_secret {
+                submit.secrets[0].root = None;
+            }
+        }
+        request
+    }
+
+    /// #618 (review of #889): the `path_root` requirement is per path field. A rooted input beside an unrooted secret
+    /// on a host with `transfer` and a shared filesystem but no `path_root` is placed: `sandyd` opens the input over
+    /// the data link, and the executor opens only the secret, which has no root. With no `transfer` the executor
+    /// opens the rooted input, so that host needs `path_root`. A rooted secret needs it on any host.
+    #[tokio::test]
+    async fn the_path_root_requirement_is_decided_per_path_field() -> anyhow::Result<()> {
+        let shared_and_transfer = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let shared_only = sandy_executor_proto::Capabilities {
+            transfer: false,
+            ..shared_and_transfer.clone()
+        };
+        // (name, rooted inputs and outputs, rooted secret, host, placed)
+        let cases = [
+            (
+                "rooted input, plain secret, transfer host",
+                true,
+                false,
+                shared_and_transfer.clone(),
+                true,
+            ),
+            (
+                "rooted input, plain secret, no transfer",
+                true,
+                false,
+                shared_only,
+                false,
+            ),
+            (
+                "plain input, rooted secret, transfer host",
+                false,
+                true,
+                shared_and_transfer,
+                false,
+            ),
+        ];
+        for (name, io_rooted, secret_rooted, host, placed) in cases {
+            let (response, dispatched) =
+                submit_on_host(submit_with_mixed_roots(io_rooted, secret_rooted), host).await?;
+            assert_eq!(dispatched, placed, "{name}: dispatched? response {:?}", response.result);
+            if !placed {
+                let message = refusal_of(response)?;
+                assert!(
+                    message.contains("path_root"),
+                    "{name}: must name the capability: {message}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// #618: an executor drops a `Dispatch` field it does not know without a word, so a root a host cannot honour would
     /// be ignored and the parent-swap gap would stay open unannounced. A rooted secret is opened by the executor
     /// only, so it is placed only on a host that declared `path_root`: without one the Submit is refused naming the
