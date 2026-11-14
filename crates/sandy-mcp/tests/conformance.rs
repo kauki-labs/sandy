@@ -70,7 +70,7 @@ fn the_script_fails_against_a_broker_that_breaks_idempotent_spawn() -> Result<()
     let err = run_script(&mut mcp, &serde_json::from_str(SCRIPT)?).expect_err("a broken broker must fail the script");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("step 6 (spawn_environment)") && msg.contains("/environment_id"),
+        msg.contains("step 5 (spawn_environment)") && msg.contains("/environment_id"),
         "the O1 retry step must fail on the environment id: {msg}"
     );
     Ok(())
@@ -92,7 +92,7 @@ fn the_script_fails_against_a_broker_that_never_reaches_ready_and_cleans_up() ->
     let err = run_script(&mut mcp, &quick_script()?).expect_err("never Ready must fail the script");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("step 9 (get_environment)") && msg.contains("never reached"),
+        msg.contains("step 8 (get_environment)") && msg.contains("never reached"),
         "{msg}"
     );
     // The cleanup steps ran: the environment the failed script created is gone.
@@ -133,7 +133,7 @@ fn a_target_without_a_job_host_skips_the_job_steps_and_still_passes_the_environm
     let mut mcp = Mcp::spawn(&url, &credential_file(dir.path(), "c")?)?;
     mcp.initialize()?;
     let mut script: Value = serde_json::from_str(SCRIPT)?;
-    script["fixtures"]["skip_tools"] = json!(["submit", "status", "attach", "cancel"]);
+    script["fixtures"]["skip_tools"] = json!(["submit", "status", "cancel"]);
     run_script(&mut mcp, &script)?;
     let b = state.lock().unwrap();
     assert!(

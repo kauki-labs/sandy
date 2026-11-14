@@ -91,7 +91,7 @@ async fn initialize_and_list_advertise_the_job_tools() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    for n in ["submit", "status", "cancel", "list", "attach"] {
+    for n in ["submit", "status", "cancel", "list"] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
     Ok(())
@@ -145,7 +145,6 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("GET", "/v1/jobs", 200, json!({"jobs":[job.clone()]})),
         ("GET", "/v1/jobs/j1", 200, job.clone()),
         ("POST", "/v1/jobs/j1/cancel", 200, job.clone()),
-        ("POST", "/v1/jobs/j1/attach", 200, json!({"stream_url":"http://x/s"})),
     ])?;
     let server = Server::new(Api::new(&api.url, "cred"));
     let submit = json!({"manifest":"AA==","manifest_encoding":"m.v1",
@@ -155,7 +154,6 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("list", json!({}), "GET", "/v1/jobs"),
         ("status", json!({"job_id":"j1"}), "GET", "/v1/jobs/j1"),
         ("cancel", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/cancel"),
-        ("attach", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/attach"),
     ];
     for (i, (tool, args, method, path)) in cases.iter().enumerate() {
         let resp = call(&server, tool, args.clone()).await?;

@@ -27,11 +27,6 @@
       "expect": { "equals": { "/job_id": "$job" } }
     },
     {
-      "tool": "attach",
-      "args": { "job_id": "$job" },
-      "expect": { "present": ["/stream_url"] }
-    },
-    {
       "tool": "cancel",
       "args": { "job_id": "$job" },
       "expect": { "in": { "/state": ["cancelled", "cancelling"] } }
