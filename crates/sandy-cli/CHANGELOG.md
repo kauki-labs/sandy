@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.4...sandy-cli-v0.2.5) - 2026-11-14
+
+### Fixed
+
+- _(sandyd)_ refuse a Submit with no capable host instead of leaving it Pending (refs #868) ([#882](https://github.com/kauki-labs/sandy/pull/882))
+
+### Other
+
+- _(api)_ rename VmBackend to VirtualizationBackend ([#869](https://github.com/kauki-labs/sandy/pull/869))
+
 ## [0.2.4](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.3...sandy-cli-v0.2.4) - 2026-11-13
 
 ### Added
