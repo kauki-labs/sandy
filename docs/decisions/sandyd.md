@@ -2308,7 +2308,7 @@ so the environment operations need an MCP surface beside the job operations.
 
 **Decision.**
 
-- `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`, `attach`) and environment tools
+- `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`) and environment tools
   (`spawn_environment`, `get_environment`, `link_environment`, `cancel_environment`,
   `delete_environment`, `end_task`, `stop_environment`, `resume_environment`, `list_environments`).
 - **Ending a task (#815, owner decision).** Deleting an environment ends its task, and an ephemeral environment's TTL is

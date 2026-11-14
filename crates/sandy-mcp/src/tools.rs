@@ -122,16 +122,6 @@ pub(crate) static TOOLS: &[Tool] = &[
         properties: none,
     },
     Tool {
-        name: "attach",
-        description: "Open a job's output stream and return its location.",
-        method: "POST",
-        path: "/v1/jobs/{job_id}/attach",
-        path_args: &["job_id"],
-        query: &[],
-        required: &["job_id"],
-        properties: job_id,
-    },
-    Tool {
         name: "spawn_environment",
         description: "Create an environment. Idempotent by request_id.",
         method: "POST",

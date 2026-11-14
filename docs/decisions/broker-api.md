@@ -227,9 +227,8 @@ long as the stream is open, up to the client's four. Closing the stream restores
 ## 8. Output is read by offset from a broker-held buffer (#643)
 
 **Context.** sandyd keeps no job output. Output reaches the broker only on the attach socket, and
-attach ends when the job does. A polling client (the `job_output` MCP tool) needs one request per
-call (`sandy-mcp`, `sandyd.md` decision 25) and needs output after exit. The owner chose a broker
-route over giving `sandy-mcp` a stream reader.
+attach ends when the job does. A polling client needs one request per call and needs output after exit. The owner chose a broker
+route over a stream reader.
 
 **Decision.**
 
@@ -275,8 +274,9 @@ no-store`. A `limit` below 1 is raised to 1.
 - Nothing is written to disk. A broker restart loses every buffer: the route answers
   `not_found` for jobs submitted before it, for good, and finds jobs submitted after it at once. The OpenAPI text says this.
 
-**MCP.** `sandy-mcp` has no output tool. Raw job output returned through a tool would bypass the
-secret guard (O8). Owner decision, still open.
+**MCP.** `sandy-mcp` has no output tool and no attach tool (#643). The attach tool returned a relative stream URL an
+agent cannot open, and raw job output returned through a tool would bypass the secret guard (O8). An agent reads output
+through `GET /v1/jobs/{id}/output`. Owner decision, 2026-11-14; `sandyd.md` decision 25 stays.
 
 **Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
 

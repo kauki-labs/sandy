@@ -74,7 +74,7 @@ paths:
       operationId: attachJob
       summary: Open the job's output stream.
       description: >-
-        Returns a single-use stream location, valid for expires_in_s seconds. The attach token and the channel-join cap stay in the API tier. A client holds at most 4 outstanding tickets plus open streams (quota_exceeded beyond that). A finished job is unavailable.
+        `sandy-mcp` offers no tool for this route: an agent reads output with `readJobOutput`. Returns a single-use stream location, valid for expires_in_s seconds. The attach token and the channel-join cap stay in the API tier. A client holds at most 4 outstanding tickets plus open streams (quota_exceeded beyond that). A finished job is unavailable.
       responses:
         "200":
           description: Stream location.
