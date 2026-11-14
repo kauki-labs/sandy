@@ -4467,6 +4467,69 @@ mod tests {
         Ok(())
     }
 
+    /// Acceptance (#868): a plain Trusted `argv`-style submit with no host registered is refused with a named
+    /// cause and leaves no row, never a `Pending` job nothing can place.
+    #[tokio::test]
+    async fn a_plain_trusted_submit_with_no_host_is_refused_and_creates_no_job() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("no registered host"), "got {message:?}");
+            }
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+        let list = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            req(2, control_request::Op::List(ListRequest {})),
+        )
+        .await?;
+        match list.result {
+            Some(control_response::Result::List(ListResponse { jobs })) => {
+                assert!(jobs.is_empty(), "a refused submit must leave no Pending row: {jobs:?}");
+            }
+            other => anyhow::bail!("expected a List response, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Positive pair of the above (#868): with a capable host registered the same submit is still accepted.
+    #[tokio::test]
+    async fn a_plain_trusted_submit_with_a_capable_host_is_still_accepted() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let _dispatch_rx = register_test_host(&host_registry, "remote-host", peer_ip, trusted_host_capabilities());
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            submit_req(1),
+        )
+        .await?;
+        anyhow::ensure!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "expected an accepted Submit, got {:?}",
+            response.result
+        );
+        Ok(())
+    }
+
     /// Adversarial (#332): a `flake/v1` submit with NO remote-dispatch
     /// address configured at all (`forward_back_addr: None`) is refused the
     /// same way — a Vm-capable host existing somewhere is irrelevant if this
