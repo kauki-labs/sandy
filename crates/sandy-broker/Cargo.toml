@@ -47,6 +47,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 sandy.workspace = true
+sandy-conn.workspace = true
+sandy-executor-proto.workspace = true
 sandy-proto.workspace = true
 sandyd = { path = "../sandyd" }
 tempfile.workspace = true

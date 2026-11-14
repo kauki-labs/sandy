@@ -7,9 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
-use sandy_control_proto::{
-    IsolationClass, JobStatus, StatusRequest, SubmitRequest, client::call, control_request, control_response,
-};
+use sandy_control_proto::{JobStatus, StatusRequest, client::call, control_request, control_response};
 
 /// A running `sandyd`, killed on drop so a failing assertion never leaves an orphan.
 struct Daemon {
@@ -54,18 +52,15 @@ async fn rpc(daemon: &Daemon, op: control_request::Op) -> anyhow::Result<control
     response.result.context("a response carries a result")
 }
 
-/// Submit a job no host can take: it stays `Pending`, a row with no connection that could ever finish it.
-async fn submit_a_job(daemon: &Daemon) -> anyhow::Result<String> {
-    let submit = SubmitRequest {
-        manifest: b"opaque".to_vec(),
-        manifest_encoding: "test/v1".to_owned(),
-        required_isolation_class: IsolationClass::Trusted.into(),
-        ..SubmitRequest::default()
-    };
-    match rpc(daemon, control_request::Op::Submit(submit)).await? {
-        control_response::Result::Submit(ok) => Ok(ok.job_id),
-        other => anyhow::bail!("expected the Submit to succeed, got {other:?}"),
-    }
+/// Leave a `Pending` row in `dir`'s store, as a daemon killed with an open job would. A Submit with no host is
+/// refused (#868), so the row is written through the store directly.
+fn seed_open_job(dir: &Path) -> anyhow::Result<String> {
+    let store = sandyd::store::JobStore::open(&dir.join("sandyd.db")).context("open the job store")?;
+    let job_id = "seeded-open-job".to_owned();
+    store
+        .insert_pending(&job_id, b"opaque", "test/v1")
+        .context("insert the pending row")?;
+    Ok(job_id)
 }
 
 async fn status(daemon: &Daemon, job_id: &str) -> anyhow::Result<sandy_control_proto::StatusResponse> {
@@ -78,15 +73,12 @@ async fn status(daemon: &Daemon, job_id: &str) -> anyhow::Result<sandy_control_p
     }
 }
 
-/// `kill -9` the daemon with a job open: the restarted daemon reports it `Failed`, with a retryable infra-fault
-/// envelope, and a second restart changes nothing.
+/// A daemon killed with a job open leaves a `Pending` row: the restarted daemon reports it `Failed`, with a retryable
+/// infra-fault envelope, and a second restart changes nothing.
 #[tokio::test]
 async fn a_job_open_when_the_daemon_is_killed_is_failed_by_the_next_start() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("tempdir")?;
-    let first = start(tmp.path())?;
-    let job_id = submit_a_job(&first).await?;
-    assert_eq!(status(&first, &job_id).await?.status(), JobStatus::Pending);
-    drop(first);
+    let job_id = seed_open_job(tmp.path())?;
 
     let second = start(tmp.path())?;
     let recovered = status(&second, &job_id).await?;

@@ -31,6 +31,8 @@ pub struct Fixture {
     pub _broker: Running,
     pub _dir: tempfile::TempDir,
     pub root_a: std::path::PathBuf,
+    /// Keeps the stand-in host's dispatch channel open for the fixture's life.
+    pub _host_dispatch: tokio::sync::mpsc::Receiver<sandy_executor_proto::Dispatch>,
 }
 
 /// Knobs for [`fixture_with_opts`].
@@ -186,6 +188,31 @@ async fn build(
     }
     let registry = Arc::new(JobRegistry::new()?);
     let hosts = Arc::new(HostRegistry::default());
+    // A Submit with no capable host is refused (#868): register a stand-in host that declares both classes.
+    let host_dispatch = {
+        use sandy_executor_proto::{Arch, Capabilities, IsolationClass as HostClass, SandboxKind};
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse()?;
+        let fingerprint = sandy_conn::Fingerprint::from_hex(&"aa".repeat(32))?;
+        hosts
+            .register(
+                &sandyd::host_registry::ExecutorAllowlist::new([(peer_ip, fingerprint)]),
+                peer_ip,
+                fingerprint,
+                "stand-in-host".to_owned(),
+                Capabilities {
+                    digests: false,
+                    supported_sandbox_kinds: vec![SandboxKind::Process.into()],
+                    arch: Arch::X8664.into(),
+                    attestation: false,
+                    supported_isolation_classes: vec![HostClass::Trusted.into(), HostClass::Untrusted.into()],
+                    shares_submitter_filesystem: false,
+                    transfer: false,
+                    egress_proxy: false,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("register the stand-in host: {e:?}"))?
+            .dispatch_rx
+    };
     let listener = UnixListener::bind(&socket)?;
     let caps = Arc::new(std::sync::Mutex::new(Vec::new()));
     if opts.attach_socket {
@@ -209,6 +236,7 @@ async fn build(
         Arc::clone(&registry),
         hosts,
     );
+    let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse()?;
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(sandyd::serve_connection(
@@ -217,7 +245,7 @@ async fn build(
                 Arc::clone(&e),
                 Arc::clone(&r),
                 Arc::clone(&h),
-                None,
+                Some(forward_back),
             ));
         }
     });
@@ -261,6 +289,7 @@ async fn build(
         _broker: broker,
         _dir: dir,
         root_a,
+        _host_dispatch: host_dispatch,
     })
 }
 

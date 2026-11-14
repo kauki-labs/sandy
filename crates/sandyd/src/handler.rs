@@ -70,33 +70,15 @@ fn required_sandbox_kind_for(manifest_encoding: &str) -> SandboxKind {
     }
 }
 
-/// Refuses a submit this daemon cannot place when placement is mandatory for
-/// it, with `reason` as the explanation; `None` for anything else (a placed
-/// job, or an `argv/v1`+`Trusted` job, which keeps its existing "falls back
-/// to local" behavior unchanged). Placement is mandatory for a `SandboxKind::Vm`
-/// requirement (a `flake/v1` job has no local execution path at all) and,
-/// independently, for an `IsolationClass::Untrusted` requirement (#381: the
-/// process backend never admits an untrusted job, so an unplaced one has no
-/// local fallback either, whatever sandbox kind it named). Shared by the two
-/// placement checks in `handle`'s `Submit` arm: the early one (before any
-/// side effect) and the one right after `dispatch_plan` is computed, which
-/// closes a narrow TOCTOU the early check alone cannot — a host disconnecting
-/// between the two `pick_host_for` calls, or `RemoteLink::new`'s RNG failing,
-/// can make the second placement attempt come back empty even though the
-/// first one found a host. Leaving either kind of mandatory-placement job
-/// `Pending` forever with no distinct status would be exactly the silent gap
-/// decision 18 rules out.
-fn placement_required_error(
-    required_isolation_class: IsolationClass,
-    required_sandbox_kind: SandboxKind,
-    require_local: bool,
-    placed: bool,
-    reason: &str,
-) -> Option<ControlError> {
-    let placement_mandatory = required_sandbox_kind == SandboxKind::Vm
-        || required_isolation_class == IsolationClass::Untrusted
-        || require_local;
-    (placement_mandatory && !placed).then(|| ControlError {
+/// Refuses a submit this daemon cannot place, with `reason` as the explanation; `None` for a placed one.
+/// Placement is mandatory for every job (#868): `sandyd` has no local execution path, so an unplaced
+/// `argv/v1`+`Trusted` job would sit `Pending` with no distinct status, exactly the silent gap decision 18 rules
+/// out for `Vm` and `Untrusted` jobs. Shared by the two placement checks in `handle`'s `Submit` arm: the early one
+/// (before any side effect) and the one right after `dispatch_plan` is computed, which closes a narrow TOCTOU the
+/// early check alone cannot (a host disconnecting between the two `pick_host_for` calls, or `RemoteLink::new`'s
+/// RNG failing). A job accepted while a host is registered that later loses it is not covered here.
+fn placement_required_error(placed: bool, reason: &str) -> Option<ControlError> {
+    (!placed).then(|| ControlError {
         message: reason.to_owned(),
     })
 }
@@ -538,14 +520,10 @@ pub async fn handle(
                 }
             };
 
-            // #332: a required `SandboxKind` this daemon cannot place at all
-            // must refuse the whole Submit now, before any side effect —
-            // unlike `argv/v1`'s existing "no registered host → silently
-            // stays Pending forever" gap (an already-accepted, pre-#332
-            // honest limitation of the process-backend path, unchanged
-            // here), a `flake/v1` VM job has NO local execution fallback in
-            // this daemon at all: accepting it anyway would create a job
-            // that can never run, with no distinct status a caller could
+            // #332, #868: a job this daemon cannot place at all must refuse
+            // the whole Submit now, before any side effect: this daemon has
+            // no local execution path, so accepting it anyway would create a
+            // job that can never run, with no distinct status a caller could
             // ever notice (item 5's "never silently" bar).
             let required_sandbox_kind = required_sandbox_kind_for(&submit.manifest_encoding);
 
@@ -698,17 +676,13 @@ pub async fn handle(
                      path, which is only ever valid on the submitter's own filesystem"
                 )
             } else {
-                "no registered host declares the required isolation class and sandbox kind; this job cannot be placed \
-                 (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
-                    .to_owned()
+                format!(
+                    "no registered host declares the required isolation class ({required_isolation_class:?}) and \
+                     sandbox kind ({required_sandbox_kind:?}); this job cannot be placed (this daemon has no local \
+                     execution path)"
+                )
             };
-            if let Some(control_error) = placement_required_error(
-                required_isolation_class,
-                required_sandbox_kind,
-                require_local || egress_policy || wants_digests,
-                placeable,
-                &placement_reason,
-            ) {
+            if let Some(control_error) = placement_required_error(placeable, &placement_reason) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(control_error)),
@@ -910,17 +884,13 @@ pub async fn handle(
                     }
                 )
             } else {
-                "no registered host could be bound for this job's required isolation class and sandbox kind; it cannot \
-                 be placed (this daemon has no local fallback for a Vm-backend or Untrusted-class job)"
-                    .to_owned()
+                format!(
+                    "no registered host could be bound for the required isolation class \
+                     ({required_isolation_class:?}) and sandbox kind ({required_sandbox_kind:?}); this job cannot be \
+                     placed (this daemon has no local execution path)"
+                )
             };
-            if let Some(control_error) = placement_required_error(
-                required_isolation_class,
-                required_sandbox_kind,
-                require_local || egress_policy || wants_digests,
-                dispatch_plan.is_some(),
-                &dispatch_plan_reason,
-            ) {
+            if let Some(control_error) = placement_required_error(dispatch_plan.is_some(), &dispatch_plan_reason) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(control_error)),
@@ -1555,6 +1525,28 @@ mod tests {
         Arc::new(HostRegistry::default())
     }
 
+    /// `handle` for a Submit that must be accepted (#868: no capable host, no job). Registers a trusted
+    /// process host once per registry and leaks its dispatch receiver so the channel stays open.
+    async fn submit_to_a_placed_host(
+        store: &Arc<JobStore>,
+        registry: &Arc<JobRegistry>,
+        host_registry: &Arc<HostRegistry>,
+        session: Uuid,
+        request: ControlRequest,
+    ) -> anyhow::Result<ControlResponse> {
+        if host_registry.connected().is_empty() {
+            let peer_ip: std::net::IpAddr = "100.64.0.99".parse().context("peer ip literal")?;
+            std::mem::forget(register_test_host(
+                host_registry,
+                "placement-host",
+                peer_ip,
+                trusted_host_capabilities(),
+            ));
+        }
+        let forward_back: SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        Ok(handle(store, registry, host_registry, Some(forward_back), session, request).await?)
+    }
+
     /// A fresh per-call session id (CF-H-1), standing in for a distinct
     /// connection — most tests here don't care which session an op runs
     /// under, only that it doesn't change `handle`'s outcome, so each one
@@ -1597,7 +1589,8 @@ mod tests {
     #[tokio::test]
     async fn status_serves_the_stored_envelope_of_a_terminal_job_and_none_before() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let response =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1640,7 +1633,8 @@ mod tests {
     #[tokio::test]
     async fn submit_persists_and_returns_a_job_id() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let response =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match response.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1704,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn list_reflects_submitted_jobs() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let response = handle(
             &store,
             &registry,
@@ -1727,7 +1721,8 @@ mod tests {
     #[tokio::test]
     async fn attach_on_a_submitted_job_returns_a_real_channel_and_cap() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1765,7 +1760,7 @@ mod tests {
     async fn attach_from_the_submitting_session_gets_a_post_capable_cap() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let session = Uuid::new_v4();
-        let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
+        let submitted = submit_to_a_placed_host(&store, &registry, &host_registry, session, submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1813,7 +1808,8 @@ mod tests {
     #[tokio::test]
     async fn attach_from_a_different_session_gets_observer_rights_only() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, Uuid::new_v4(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1859,7 +1855,8 @@ mod tests {
     #[tokio::test]
     async fn attach_from_a_different_session_with_the_right_token_is_still_post_capable() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, Uuid::new_v4(), submit_req(1)).await?;
         let (job_id, attach_token) = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, attach_token })) => (job_id, attach_token),
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -1906,7 +1903,8 @@ mod tests {
     #[tokio::test]
     async fn attach_from_a_different_session_with_a_wrong_token_is_still_observer_only() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, Uuid::new_v4(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -2015,7 +2013,7 @@ mod tests {
         host_registry: &Arc<HostRegistry>,
         session: Uuid,
     ) -> anyhow::Result<(String, Vec<u8>)> {
-        let submitted = handle(store, registry, host_registry, None, session, submit_req(1)).await?;
+        let submitted = submit_to_a_placed_host(store, registry, host_registry, session, submit_req(1)).await?;
         match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse {
                 job_id, attach_token, ..
@@ -2096,7 +2094,8 @@ mod tests {
     #[tokio::test]
     async fn attach_refuses_an_expired_observer_cap() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -2162,7 +2161,8 @@ mod tests {
         use crate::link_auth::{LinkAuthError, RemoteLink};
 
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -2290,7 +2290,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_marks_the_job_terminal_for_the_registrys_retention_sweep() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry_with_zero_retention(), new_host_registry());
-        let submitted = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let submitted =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -2312,7 +2313,7 @@ mod tests {
         );
 
         // A second Submit's insert is what the sweep is tied to (#270).
-        handle(&store, &registry, &host_registry, None, test_session(), submit_req(3)).await?;
+        submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(3)).await?;
 
         assert!(
             registry.get(&job_id).is_none(),
@@ -2332,7 +2333,7 @@ mod tests {
     async fn a_same_session_submit_then_cancel_succeeds_and_session_is_recorded() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let session = Uuid::new_v4();
-        let submitted = handle(&store, &registry, &host_registry, None, session, submit_req(1)).await?;
+        let submitted = submit_to_a_placed_host(&store, &registry, &host_registry, session, submit_req(1)).await?;
         let job_id = match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
             other => anyhow::bail!("expected a Submit response, got {other:?}"),
@@ -2391,7 +2392,7 @@ mod tests {
         registry: &Arc<JobRegistry>,
         host_registry: &Arc<HostRegistry>,
     ) -> anyhow::Result<(String, Vec<u8>)> {
-        let submitted = handle(store, registry, host_registry, None, Uuid::new_v4(), submit_req(1)).await?;
+        let submitted = submit_to_a_placed_host(store, registry, host_registry, Uuid::new_v4(), submit_req(1)).await?;
         match submitted.result {
             Some(control_response::Result::Submit(SubmitResponse {
                 job_id, attach_token, ..
@@ -2553,11 +2554,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
@@ -2587,11 +2587,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
@@ -2621,11 +2620,10 @@ mod tests {
             rights: full_rights(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
@@ -2704,11 +2702,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![submitter_cap]),
         )
@@ -2740,11 +2737,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![forged_cap]),
         )
@@ -2774,11 +2770,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![expired_cap]),
         )
@@ -2810,11 +2805,10 @@ mod tests {
             rights: read_only(),
         }]);
 
-        let response = handle(
+        let response = submit_to_a_placed_host(
             &store,
             &registry,
             &host_registry,
-            None,
             test_session(),
             submit_req_with_caps(1, manifest, vec![cap]),
         )
@@ -2875,7 +2869,8 @@ mod tests {
     #[tokio::test]
     async fn a_direct_mint_submit_with_no_submitter_caps_is_unaffected() -> anyhow::Result<()> {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let response = handle(&store, &registry, &host_registry, None, test_session(), submit_req(1)).await?;
+        let response =
+            submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(1)).await?;
         assert!(
             matches!(response.result, Some(control_response::Result::Submit(_))),
             "got {:?}",
@@ -2959,7 +2954,7 @@ mod tests {
             }),
         );
 
-        let response = handle(&store, &registry, &host_registry, None, test_session(), request).await?;
+        let response = submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), request).await?;
         assert!(
             matches!(response.result, Some(control_response::Result::Submit(_))),
             "got {:?}",
@@ -4097,22 +4092,18 @@ mod tests {
             submit_req(1),
         )
         .await?;
-        let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
-            other => {
-                anyhow::bail!("the submit itself must still succeed even when placement finds no match, got {other:?}")
+        match response.result {
+            Some(control_response::Result::Error(ControlError { message })) => {
+                assert!(message.contains("no registered host"), "got {message:?}");
             }
-        };
+            other => anyhow::bail!("a submit with no host of its class must be refused (#868), got {other:?}"),
+        }
 
         assert!(
             dispatch_rx.try_recv().is_err(),
             "a host lacking the required isolation class must never receive a dispatch"
         );
-        let job = registry.get(&job_id).context("the job must be registered")?;
-        assert!(
-            job.remote_link.is_none(),
-            "a job that failed placement must stay local, not carry a remote_link to nowhere"
-        );
+        assert!(store.list()?.is_empty(), "a refused submit must leave no Pending row");
         Ok(())
     }
 
@@ -4219,42 +4210,11 @@ mod tests {
 
         // A second Submit's insert is what the sweep is tied to (#270). No
         // host registered for this one — it just needs to be AN insert.
-        handle(&store, &registry, &host_registry, None, test_session(), submit_req(2)).await?;
+        submit_to_a_placed_host(&store, &registry, &host_registry, test_session(), submit_req(2)).await?;
 
         assert!(
             registry.get(&job_id).is_none(),
             "an undelivered-dispatch job's channel must be reaped once retention elapses"
-        );
-        Ok(())
-    }
-
-    /// Adversarial: with no host registered at all, Submit still succeeds
-    /// and the job simply runs local (today's unchanged behavior) — a
-    /// configured `forward_back_addr` alone must never be mistaken for "a
-    /// host is available."
-    #[tokio::test]
-    async fn a_submit_with_no_registered_host_stays_local() -> anyhow::Result<()> {
-        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
-        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
-
-        let response = handle(
-            &store,
-            &registry,
-            &host_registry,
-            Some(forward_back),
-            test_session(),
-            submit_req(1),
-        )
-        .await?;
-        let job_id = match response.result {
-            Some(control_response::Result::Submit(SubmitResponse { job_id, .. })) => job_id,
-            other => anyhow::bail!("expected a Submit response, got {other:?}"),
-        };
-
-        let job = registry.get(&job_id).context("the job must be registered")?;
-        assert!(
-            job.remote_link.is_none(),
-            "with no registered host, the job must stay local"
         );
         Ok(())
     }
@@ -4341,48 +4301,18 @@ mod tests {
         assert_eq!(required_sandbox_kind_for(""), SandboxKind::Process);
     }
 
-    /// Regression for CodeRabbit's finding on #332's PR, extended by #381:
-    /// `handle`'s early placeability check and its post-`dispatch_plan` check
-    /// call this same function, so proving its cases here proves both call
-    /// sites refuse (or don't) correctly — including the narrow TOCTOU case
-    /// (a `Vm` job, placeable at the early check, unplaceable by the time
-    /// `dispatch_plan` is computed) the full async race itself can't be
-    /// reproduced deterministically in a unit test (it needs a real
-    /// concurrent host disconnect, or `RemoteLink::new`'s RNG failing,
-    /// between two reads of `host_registry`'s internal lock). Placement is
-    /// mandatory along TWO independent dimensions: `SandboxKind::Vm`
-    /// (unchanged since #332) and, as of #381, `IsolationClass::Untrusted` —
-    /// a `Process`+`Untrusted` combination (inexpressible as a real
-    /// dispatch, since the process backend never admits an untrusted job)
-    /// must still be refused on failed placement, not silently kept Pending.
+    /// `handle`'s early placeability check and its post-`dispatch_plan` check call this same function, so proving
+    /// it here proves both call sites. Placement is mandatory for every job (#868): `sandyd` has no local
+    /// execution path.
     #[test]
-    fn placement_required_error_refuses_an_unplaced_vm_or_untrusted_requirement() {
+    fn placement_required_error_refuses_any_unplaced_job() {
         assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, false, "unplaced").is_some(),
-            "a Vm job with no placement must be refused"
+            placement_required_error(false, "unplaced").is_some(),
+            "an unplaced job must be refused"
         );
         assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Vm, false, true, "unplaced").is_none(),
-            "a Vm job that IS placed must not be refused"
-        );
-        assert!(
-            placement_required_error(IsolationClass::Trusted, SandboxKind::Process, false, false, "unplaced").is_none(),
-            "an unplaced Trusted+Process job keeps its existing silent local-fallback behavior"
-        );
-        assert!(
-            placement_required_error(
-                IsolationClass::Untrusted,
-                SandboxKind::Process,
-                false,
-                false,
-                "unplaced"
-            )
-            .is_some(),
-            "an unplaced Untrusted job must be refused even when its sandbox kind alone wouldn't require placement"
-        );
-        assert!(
-            placement_required_error(IsolationClass::Untrusted, SandboxKind::Vm, false, true, "unplaced").is_none(),
-            "an Untrusted job that IS placed must not be refused"
+            placement_required_error(true, "unplaced").is_none(),
+            "a placed job must not be refused"
         );
     }
 

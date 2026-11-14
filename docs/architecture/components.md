@@ -136,8 +136,11 @@ How it should behave:
   background in batches of 8, each under the 45 s daemon call timeout; an
   expired record is cleared with no provider call and a failed revoke keeps the
   record.
-- **A plain trusted process job with no host stays `Pending`.** No local
-  fallback (#292). This is today's behaviour; #868 proposes failing it instead.
+- **A Submit with no capable host is refused.** This holds for a plain trusted
+  process job too: no local fallback (#292), so `Submit` returns a `ControlError`
+  naming the cause and writes no row (#868). A job accepted while a capable host
+  was registered, which then loses it, is not covered: it stays `Pending` until
+  a host returns or the daemon restarts.
 
 ## 4. Host executor
 

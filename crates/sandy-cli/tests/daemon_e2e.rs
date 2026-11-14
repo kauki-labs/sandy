@@ -17,6 +17,8 @@ use anyhow::Context;
 struct Daemon {
     child: Child,
     sock: std::path::PathBuf,
+    /// The stand-in host-executor kept registered with the daemon (and the runtime driving its connection), if any.
+    _stand_in_host: Option<(tokio::runtime::Runtime, Box<dyn sandy_conn::Conn>)>,
 }
 
 impl Drop for Daemon {
@@ -112,7 +114,11 @@ fn spawn_daemon(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
         .context("spawning sandyd")?;
     // Construct the guard immediately: a bail! below now drops `daemon`,
     // killing and waiting on the child, instead of leaking it on a timeout.
-    let daemon = Daemon { child, sock };
+    let daemon = Daemon {
+        child,
+        sock,
+        _stand_in_host: None,
+    };
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -125,6 +131,103 @@ fn spawn_daemon(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    Ok(daemon)
+}
+
+/// Spawn the real `sandyd` with its mesh and agent-link listeners on, and keep a stand-in trusted process host
+/// registered over the real mesh wire. A Submit with no capable host is refused (#868), so a test that needs an
+/// accepted job (which is dispatched and stays `Running`: the stand-in never answers a Dispatch) starts the daemon this
+/// way.
+fn spawn_daemon_with_host(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
+    use sandy_executor_proto::{
+        Arch, Capabilities, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
+        host_executor_message, orchestrator_message,
+    };
+
+    let reserve = || -> anyhow::Result<(std::net::TcpListener, std::net::SocketAddr)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind an ephemeral port")?;
+        let addr = listener.local_addr()?;
+        Ok((listener, addr))
+    };
+    let (mesh_reserved, mesh_addr) = reserve()?;
+    let (link_reserved, link_addr) = reserve()?;
+    let sock = tmp.join("sandyd.sock");
+    // Pre-generate the orchestrator's mesh identity to learn its fingerprint before sandyd starts.
+    let identity_dir = tmp.join("mesh-tls");
+    let orchestrator_fingerprint = sandy_conn::TlsIdentity::load_or_generate(&identity_dir)
+        .context("pre-generating the orchestrator's mesh TLS identity")?
+        .fingerprint();
+    let host_identity = sandy_conn::TlsIdentity::generate().context("generate a stand-in host identity")?;
+    drop((mesh_reserved, link_reserved));
+    let child = Command::new(sandyd_bin()?)
+        .env("SANDY_SOCK", &sock)
+        .env("SANDY_DB", tmp.join("sandyd.db"))
+        .env("SANDY_MESH_LISTEN", mesh_addr.to_string())
+        .env(
+            "SANDY_MESH_ALLOWLIST",
+            format!("127.0.0.1={}", host_identity.fingerprint().to_hex()),
+        )
+        .env("SANDY_MESH_AGENT_LINK_LISTEN", link_addr.to_string())
+        .env("SANDY_MESH_TLS_IDENTITY_DIR", &identity_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning sandyd")?;
+    let mut daemon = Daemon {
+        child,
+        sock,
+        _stand_in_host: None,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(std::net::TcpStream::connect(mesh_addr).is_ok()
+        && std::net::TcpStream::connect(link_addr).is_ok()
+        && std::os::unix::net::UnixStream::connect(&daemon.sock).is_ok())
+    {
+        anyhow::ensure!(Instant::now() < deadline, "sandyd never opened its listeners");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build a runtime for the stand-in host")?;
+    let conn = runtime.block_on(async {
+        let mut conn = sandy_conn::connect_tls(mesh_addr, &host_identity, orchestrator_fingerprint, None)
+            .await
+            .context("dialing the orchestrator's mesh listener over TLS")?;
+        sandy_control_proto::write_frame(
+            &mut conn,
+            &HostExecutorMessage {
+                op: Some(host_executor_message::Op::Register(Register {
+                    host_id: "stand-in-host".to_owned(),
+                    capabilities: Some(Capabilities {
+                        digests: false,
+                        supported_sandbox_kinds: vec![SandboxKind::Process.into()],
+                        arch: Arch::X8664.into(),
+                        attestation: false,
+                        supported_isolation_classes: vec![IsolationClass::Trusted.into()],
+                        shares_submitter_filesystem: false,
+                        transfer: false,
+                        egress_proxy: false,
+                    }),
+                })),
+            },
+        )
+        .await
+        .context("writing Register")?;
+        let registered: OrchestratorMessage = sandy_control_proto::read_frame(&mut conn)
+            .await
+            .context("reading the Register response")?
+            .context("connection closed before a Register response")?;
+        anyhow::ensure!(
+            matches!(registered.op, Some(orchestrator_message::Op::Registered(_))),
+            "expected Registered, got {:?}",
+            registered.op
+        );
+        Ok::<_, anyhow::Error>(conn)
+    })?;
+    daemon._stand_in_host = Some((runtime, conn));
     Ok(daemon)
 }
 
@@ -154,7 +257,7 @@ fn write_cap_file(path: &std::path::Path, contents: &str) -> anyhow::Result<()> 
 #[test]
 fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
 
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
@@ -185,7 +288,7 @@ fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::R
     assert_eq!(status.status.code(), Some(0), "status stderr: {}", stderr_of(&status));
     let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).context("parse status json")?;
     assert_eq!(status_json["job_id"].as_str(), Some(job_id.as_str()));
-    assert_eq!(status_json["status"].as_str(), Some("JOB_STATUS_PENDING"));
+    assert_eq!(status_json["status"].as_str(), Some("JOB_STATUS_RUNNING"));
 
     let list = sandy(&daemon, &["daemon", "list", "-o", "json"])?;
     assert_eq!(list.status.code(), Some(0), "list stderr: {}", stderr_of(&list));
@@ -218,7 +321,7 @@ fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::R
 #[test]
 fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let manifest = manifest.to_str().context("manifest path is utf8")?;
@@ -280,7 +383,7 @@ fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<
 #[test]
 fn submit_reads_the_manifest_from_stdin_when_the_path_is_a_dash() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sandy"))
         .env("SANDY_SOCK", &daemon.sock)
@@ -550,7 +653,7 @@ fn submit_with_a_well_formed_but_unreal_cap_file_reaches_the_daemons_own_decode(
 #[test]
 fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
 
     let seed_manifest = tmp.path().join("seed.bin");
     std::fs::write(&seed_manifest, b"opaque").context("write seed manifest")?;
@@ -650,7 +753,7 @@ fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> an
 #[test]
 fn submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let manifest = manifest.to_str().context("manifest path is utf8")?;
@@ -675,7 +778,7 @@ fn submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon() -> anyh
         "a credentialed Submit with no local host must be refused"
     );
     assert!(
-        stderr_of(&refused).contains("no remote placement is reachable"),
+        stderr_of(&refused).contains("shares_submitter_filesystem"),
         "stderr: {}",
         stderr_of(&refused)
     );
@@ -737,7 +840,43 @@ fn a_cred_capability_without_a_credential_is_a_usage_error() -> anyhow::Result<(
     Ok(())
 }
 
-/// Submit a job no host can take (it stays `Pending`) through the real `sandy`, returning its id.
+/// #868: a plain trusted submit to a daemon with no host is refused with the cause named, and leaves no job behind.
+#[test]
+fn a_plain_trusted_submit_with_no_host_is_refused_and_leaves_no_job() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let submit = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest.to_str().context("manifest path is utf8")?,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+        ],
+    )?;
+    assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
+    assert!(
+        stderr_of(&submit).contains("no remote placement is reachable"),
+        "stderr: {}",
+        stderr_of(&submit)
+    );
+    let list = sandy(&daemon, &["daemon", "list", "-o", "json"])?;
+    assert!(list.status.success(), "stderr: {}", stderr_of(&list));
+    let json: serde_json::Value = serde_json::from_slice(&list.stdout).context("parse list json")?;
+    assert!(
+        json.as_array().is_some_and(Vec::is_empty) || json["jobs"].as_array().is_some_and(Vec::is_empty),
+        "a refused submit must leave no row: {json}"
+    );
+    Ok(())
+}
+
+/// Submit a job through the real `sandy` to a daemon with a stand-in host (it is dispatched and stays `Running`),
+/// returning its id.
 fn submit_a_pending_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Result<String> {
     let manifest = tmp.join("manifest.bin");
     std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
@@ -765,7 +904,7 @@ fn submit_a_pending_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Resul
 #[test]
 fn daemon_wait_on_a_cancelled_job_prints_its_envelope_and_exits_1() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
     let job_id = submit_a_pending_job(&daemon, tmp.path())?;
     let cancel = sandy(&daemon, &["daemon", "cancel", &job_id])?;
     assert_eq!(cancel.status.code(), Some(0), "cancel stderr: {}", stderr_of(&cancel));
@@ -787,13 +926,13 @@ fn daemon_wait_on_a_cancelled_job_prints_its_envelope_and_exits_1() -> anyhow::R
 #[test]
 fn daemon_wait_on_a_job_that_never_ends_times_out_naming_its_state() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
     let job_id = submit_a_pending_job(&daemon, tmp.path())?;
 
     let wait = sandy(&daemon, &["daemon", "wait", &job_id, "--wait-timeout", "1"])?;
     assert_eq!(wait.status.code(), Some(3), "wait stderr: {}", stderr_of(&wait));
     let stderr = stderr_of(&wait);
-    assert!(stderr.contains("JOB_STATUS_PENDING"), "stderr: {stderr}");
+    assert!(stderr.contains("JOB_STATUS_RUNNING"), "stderr: {stderr}");
     Ok(())
 }
 
@@ -813,7 +952,7 @@ fn daemon_wait_on_an_unknown_job_is_refused() -> anyhow::Result<()> {
 #[test]
 fn ctrl_c_during_a_submit_wait_cancels_the_job() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
+    let daemon = spawn_daemon_with_host(tmp.path())?;
     let manifest = tmp.path().join("manifest.bin");
     std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
     let mut client = Command::new(env!("CARGO_BIN_EXE_sandy"))
