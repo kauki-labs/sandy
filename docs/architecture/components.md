@@ -6,8 +6,8 @@ page shows where each seam sits, which process owns what, and how each
 component is meant to behave. Decisions and their tests are in
 [`spec.md`](spec.md) and [`../decisions/`](../decisions).
 
-Every box is a crate or a process. Every `«seam»` is a trait with more than one
-implementation (a real one and a fake for tests). The direct execution path no
+Every box is a crate or a process. Most `«seam»` labels are traits with a real
+implementation and a fake for tests (the table in section 2 says which do not). The direct execution path no
 longer exists (#483): every job goes through `sandyd`.
 
 ## 1. The whole system
@@ -22,7 +22,7 @@ flowchart TB
     jobs["jobs and environments<br/>record, place, recover"]
   end
 
-  ctl -->|"«Discovery» «Capacity» «Lifecycle»<br/>placement"| exec
+  ctl -->|"HostRegistry<br/>placement by isolation class"| exec
   ctl -->|"«ChannelBackend» «CapAuthority»<br/>job channel, attach, history"| agentlink
   ctl -->|"«CredentialProvider»<br/>mint, revoke"| forge[("forge")]
 
@@ -31,7 +31,8 @@ flowchart TB
     hx["host-executor<br/>re-checks isolation"]
   end
 
-  exec -->|"«VirtualizationBackend» «EnvironmentBackend»"| run
+  exec -->|"«VirtualizationBackend»"| run
+  ctl -->|"«EnvironmentBackend»"| run
   exec -->|"«Containment»"| proc["process sandbox"]
 
   subgraph run["Run plane"]
@@ -40,7 +41,7 @@ flowchart TB
   end
 
   run -->|"«GuestShareTransport»<br/>inputs, outputs, secrets"| guest[("sandbox guest<br/>no NIC")]
-  guest -->|"vsock<br/>allow-list only"| proxy["egress proxy"]
+  guest -.->|"vsock, only when --allow is given"| proxy["per-run egress proxy"]
   proc --> guest
   guest ---|agent link| agentlink["sandy-agent"]
   agentlink --> ctl
@@ -48,27 +49,34 @@ flowchart TB
 
 Reading it: a client talks only to `sandyd`. `sandyd` records and places the
 job; an executor runs it through `VirtualizationBackend` or the process sandbox; the guest
-reaches the network only through the egress proxy, and its agent link returns to
-`sandyd`. Sections 3 to 8 open each box.
+has no network unless the run carries an allow-list, and then only through the
+per-run egress proxy; its agent link returns to `sandyd`. Sections 3 to 8 open each box.
 
 ## 2. Seams and their implementations
 
-| Seam                                 | Trait home     | Real impls                                               | Fakes (tests)           |
-| ------------------------------------ | -------------- | -------------------------------------------------------- | ----------------------- |
-| `VirtualizationBackend`              | `sandy-api`    | `QemuBackend`, `VfkitBackend`, process backend           | `FakeBackend`           |
-| `GuestShareTransport`                | `sandy-api`    | virtiofsd (qemu), virtio-fs (vfkit), local dir (process) | in `sandy-test-support` |
-| `CredentialProvider`                 | `sandy-api`    | GitHub adapter                                           | `FakeProvider`          |
-| `EnvironmentBackend`                 | `sandy-api`    | `ProcessEnvironmentBackend`, `VmEnvironmentBackend`      | in-memory               |
-| `Containment`                        | `sandy-api`    | host containment (cgroup reaping)                        | `FakeContainment`       |
-| `Discovery`                          | `sandy-api`    | host registry                                            | in `sandy-test-support` |
-| `Executor`                           | `sandy-fabric` | host-executor client                                     | contract-test harness   |
-| `ChannelBackend`                     | `sandy-fabric` | in-memory local channel                                  | contract-test harness   |
-| `CapAuthority`                       | `sandy-fabric` | `LocalCapAuthority`                                      | contract-test harness   |
-| `Minter`, `Transport`                | `sandy-fabric` | local impls                                              | contract-test harness   |
-| `Discovery`, `Capacity`, `Lifecycle` | `sandy-fabric` | local placement                                          | contract-test harness   |
-| `TelemetrySink`, `EscalationSink`    | `sandy-fabric` | local sink (operator sink pending, #850)                 | contract-test harness   |
-| `Dialer`, `Conn`                     | `sandy-conn`   | `UnixDialer` (vfkit), `VsockDialer` (qemu), UDS          | in-process pair         |
-| `EgressApplier`                      | `sandy-api`    | none in production after the NIC removal (#865)          | `FakeApplier`           |
+| Seam                                 | Trait home     | Real impls                                                              | Fakes (tests)                    |
+| ------------------------------------ | -------------- | ----------------------------------------------------------------------- | -------------------------------- |
+| `VirtualizationBackend`              | `sandy-api`    | `QemuBackend`, `VfkitBackend`, process backend                          | `FakeBackend`                    |
+| `GuestShareTransport`                | `sandy-api`    | virtiofsd (qemu), virtio-fs (vfkit), local dir (process)                | contract fixtures in `sandy-api` |
+| `CredentialProvider`                 | `sandy-api`    | GitHub adapter                                                          | `FakeProvider`                   |
+| `EnvironmentBackend`                 | `sandy-api`    | `ProcessEnvironmentBackend`, `VmEnvironmentBackend`                     | in-memory                        |
+| `Containment`                        | `sandy-api`    | host containment (cgroup reaping)                                       | `FakeContainment`                |
+| `Discovery` (nix builder matrix)     | `sandy-api`    | `sandy::StaticRegistry`                                                 | none                             |
+| `Executor`                           | `sandy-fabric` | `VirtualizationBackendExecutor` (fabric-local, not wired into `sandyd`) | contract-test harness            |
+| `ChannelBackend`                     | `sandy-fabric` | in-memory local channel                                                 | contract-test harness            |
+| `CapAuthority`                       | `sandy-fabric` | `LocalCapAuthority`                                                     | contract-test harness            |
+| `Minter`                             | `sandy-fabric` | `LocalMinter`                                                           | contract-test harness            |
+| `Transport`                          | `sandy-fabric` | none                                                                    | contract-test harness            |
+| `Discovery`, `Capacity`, `Lifecycle` | `sandy-fabric` | fabric-local placement (not used by `sandyd`)                           | contract-test harness            |
+| `TelemetrySink`, `EscalationSink`    | `sandy-fabric` | local sink (operator sink pending, #850)                                | contract-test harness            |
+| `Dialer`, `Conn`                     | `sandy-conn`   | `UnixDialer` (vfkit), `VsockDialer` (qemu), UDS                         | in-process pair                  |
+| `EgressApplier`                      | `sandy-api`    | none in production after the NIC removal (#865)                         | `FakeApplier`                    |
+
+`sandyd` places jobs with its own `HostRegistry`, not the fabric `Executor`,
+`Discovery`, `Capacity` or `Lifecycle` traits. Those fabric traits and their local
+implementations are exercised by the fabric-compose acceptance tests and are not
+on the production dispatch path. `sandyd` does use `ChannelBackend` and
+`CapAuthority` for the job channel.
 
 A seam never grows a second meaning to suit one caller. A change to a trait
 updates its spec section, its decision record and its row in
@@ -77,7 +85,7 @@ updates its spec section, its decision record and its row in
 ## 3. Control plane: `sandyd`
 
 One daemon per machine owns job state. The CLI and the broker are thin: they
-send control RPCs over a Unix socket (mode 0700) and render the reply.
+send control RPCs over a Unix socket (mode 0600, in a 0700 directory) and render the reply.
 
 ```mermaid
 flowchart LR
@@ -90,7 +98,8 @@ flowchart LR
   hexec -->|agent link + bearer token| accept["mesh_accept<br/>token bound to executor IP"]
   accept --> chan["job channel"]
   chan --> relay["attach_relay<br/>durable per-job attach token"]
-  chan --> archive["archive persister<br/>SANDY_HISTORY_LINES"]
+  chan --> archive["archive persister"]
+  hexec -.->|"data link: inputs, outputs"| dlink["data_link_recv, data_link_send"]
   hexec -->|JobResult + outputs| env["envelope builder<br/>(daemon builds the envelope)"]
   env --> store
 ```
@@ -100,8 +109,8 @@ Job lifecycle, as the store records it:
 ```mermaid
 stateDiagram-v2
   [*] --> Pending: Submit accepted
-  Pending --> Running: executor accepts Dispatch
-  Pending --> Failed: restart recovery
+  Pending --> Running: dispatch sent
+  Pending --> Failed: restart recovery, host disconnect, dispatch fault
   Pending --> Cancelled: Cancel
   Running --> Succeeded: exit 0
   Running --> Failed: guest exit, timeout, infra fault
@@ -114,15 +123,21 @@ stateDiagram-v2
 
 How it should behave:
 
-- **Refuse early.** A bad name, a process-kind policy, a field over its cap or an
-  unplaceable manifest is refused at `Submit` and leaves no row.
+- **Refuse early.** A bad name, a process-kind policy or a field over its cap is
+  refused at `Submit` and leaves no row. So is a job that must be placed but
+  cannot be: one that needs a VM, is untrusted, names path or secret fields, a
+  credential, an egress policy or digests, with no capable host.
 - **Write before boot.** The `Pending` row exists before any executor sees the
-  job (INV-6). A crash can strand a row but never lose one.
+  job (INV-6, as `spec.md` section 7 states it; the definition at the top of
+  `spec.md` still says a `Running` record). A crash can strand a row but never lose one.
 - **Recover before serving.** At start, `Pending` and `Running` rows become
   `Failed` with a retryable infra-fault envelope before the socket accepts a
-  call. A recorded credential is revoked under the 45 s daemon call timeout; a
-  failed revoke keeps the record.
-- **A job with no host stays `Pending`.** No local fallback (#292).
+  call. Credential records are read before serving. The revokes then run in the
+  background in batches of 8, each under the 45 s daemon call timeout; an
+  expired record is cleared with no provider call and a failed revoke keeps the
+  record.
+- **A plain trusted process job with no host stays `Pending`.** No local
+  fallback (#292). This is today's behaviour; #868 proposes failing it instead.
 
 ## 4. Host executor
 
@@ -135,12 +150,12 @@ flowchart TD
   chk -- mismatch --> refuse["refuse, report"]
   chk -- ok --> in["input_pull + input_stage<br/>(data link, bounded)"]
   in --> kind{"sandbox kind"}
-  kind -- Process --> bw["bwrap + systemd-run --user + sandy-agent"]
+  kind -- Process --> bw["systemd-run --user, optional bwrap,<br/>sandy-agent"]
   kind -- Vm --> vm["VirtualizationBackend::run"]
   bw --> relay["relay agent link to sandyd"]
   vm --> relay
   relay --> out["output_stage + output_send"]
-  out --> res["JobResult<br/>egress outcome, digests, outputs listing"]
+  out --> res["JobResult<br/>egress outcome, digests, outputs_follow"]
 ```
 
 The executor trusts nothing it is sent. It re-checks the isolation class
@@ -160,22 +175,27 @@ sequenceDiagram
   E->>B: run(plan, shares, egress policy)
   B->>B: nix eval to Topology, stage shares
   B->>T: serve inputs RO, outputs RW, secrets
-  B->>P: start per-run proxy (allow-list)
+  opt run carries an egress policy (--allow)
+    B->>P: start per-run proxy (allow-list)
+  end
   B->>G: boot (no NIC)
   G-->>B: READY marker (sandy login:)
   B->>G: console protocol: run job
-  G->>P: connect over vsock
-  P-->>G: allowed hosts only
+  opt proxy running
+    G->>P: connect over vsock
+    P-->>G: allowed hosts only
+  end
   G-->>B: sentinels, exit=N
   B->>T: collect outputs
-  B-->>E: Outcome (booted, guest_exit, timed_out, console)
+  B-->>E: Outcome (booted, guest_exit, timed_out, console, transport_error, digests)
 ```
 
 How it should behave:
 
-- **No NIC.** The guest has no network device. Its only path out is vsock to
-  the per-run proxy, which allows listed hosts and filters addresses.
-  `--allow` is the only egress input (#483).
+- **No NIC.** The guest has no network device. With no `--allow` it has no
+  network at all. With `--allow`, its only path out is vsock to the per-run
+  proxy, which allows listed hosts and filters addresses. `--allow` is the only
+  egress input (#483).
 - **Secrets stay off the data plane** (INV-1): `$NAME` values come through the
   secrets share, never argv, env or the store.
 - **Read-only means read-only at the host boundary.** Inputs are mounted RO by
@@ -212,11 +232,12 @@ sequenceDiagram
   participant S as CredentialProvider
   participant F as forge
   participant G as guest
-  D->>S: mint_lease(trust root, scope)
+  D->>S: mint(scope, ttl hint)
   S->>F: mint scoped token
   F-->>S: token + expiry
-  D->>D: persist CredentialRecord (never the token)
-  D->>G: stage token 0600 on the secrets share
+  D->>D: stage token 0600 in a private dir
+  D->>D: adopt: persist CredentialRecord (never the token)
+  D->>G: guest sees the token as a secret share file
   G->>F: use token (only via allowed hosts)
   D->>S: revoke at teardown
   Note over D: on restart: revoke recorded handles (cap 8),<br/>clear expired without a provider call
@@ -240,7 +261,7 @@ flowchart LR
   backend --> pe["process-insecure<br/>trusted only, no isolation"]
   backend --> vq["vm-qemu (Linux)"]
   backend --> vv["vm-vfkit (macOS)"]
-  drv --> credb["per-environment credential bracket<br/>mint at start, hourly renewal, revoke at stop"]
+  drv --> credb["per-environment credential bracket<br/>mint at start, renew before expiry, revoke at stop"]
 ```
 
 The driver is level-triggered: it converges the boxes a backend runs to the
