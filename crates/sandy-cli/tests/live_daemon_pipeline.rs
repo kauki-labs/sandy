@@ -16,8 +16,12 @@
 //! started (matched by pid and start time) and removes its temp dir. `Drop` does not run when a signal ends the test
 //! process (a nextest timeout, Ctrl-C, `kill -9`), so each stack also starts a watchdog: a `sh` in its own process
 //! group that waits for the test's pid to go, then kills every process whose environment names this stack's temp dir
-//! (`TMPDIR=<dir>/...`, inherited by `sandyd`, the executor, qemu and virtiofsd) and removes the dir. It reads no
-//! command line and touches nothing from another session.
+//! (an exact `TMPDIR=<dir>` or `TMPDIR=<dir>/...` entry, inherited by `sandyd`, the executor and qemu) and removes
+//! the dir. It reads no command line and touches nothing from another session; a decoy test pins that.
+//!
+//! Not covered here: that virtiofsd inherits `TMPDIR` is unchecked (the signal proof showed no survivor, but did not
+//! name the virtiofsd processes), and the egress proxy clears its environment. A later `--allow` slice that boots a
+//! proxy must re-check that the watchdog still reaches it.
 #![cfg(feature = "live")]
 #![cfg(target_os = "linux")]
 
@@ -157,33 +161,44 @@ fn two_free_ports() -> anyhow::Result<(u16, u16)> {
     Ok((a.local_addr()?.port(), b.local_addr()?.port()))
 }
 
-/// Waits for this test process to go (pid and start time, so a reused pid does not keep it), then kills every
-/// process whose environment has `TMPDIR=<base>/` and removes `base`. Runs as `sh` in its own process group: a group
-/// signal to the test (a nextest timeout) does not reach it. It never matches by name or command line.
+/// Waits for the owner process to go (pid and start time, so a reused pid does not keep it), then kills every process
+/// whose environment has an entry that is exactly `TMPDIR=<base>` or starts with `TMPDIR=<base>/`, and removes
+/// `base`. Runs as `sh` in its own process group: a group signal to the test (a nextest timeout) does not reach it.
+///
+/// Guards, all checked before any kill and again before the removal: `base` must be `/tmp/s` plus six alphanumerics
+/// (the shape of the test's own temp dir), and must still be the directory the test created (a real directory, not a
+/// link, with the inode the test passed). The environment match is per NUL-delimited entry (`grep -z -x`), never a
+/// substring, so `XTMPDIR=<base>/x` and `TMPDIR=<base>x/...` do not match. It reads no command line and matches no
+/// name.
 const WATCHDOG: &str = r#"
-pid=$1; start=$2; base=$3
-case "$base" in /tmp/s?*) ;; *) exit 1 ;; esac
+pid=$1; start=$2; base=$3; ino=$4
+case "$base" in /tmp/s[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 1 ;; esac
+same_dir() { [ -d "$base" ] && [ ! -L "$base" ] && [ "$(stat -c %i "$base")" = "$ino" ]; }
+same_dir || exit 1
 alive() { [ -r "/proc/$pid/stat" ] && [ "$(sed 's/.*) //' "/proc/$pid/stat" | cut -d' ' -f20)" = "$start" ]; }
 while alive; do sleep 1; done
 for round in 1 2 3; do
+  same_dir || exit 1
   for p in /proc/[0-9]*; do
     n=${p#/proc/}
     [ "$n" = "$$" ] && continue
-    grep -qaF "TMPDIR=$base/" "$p/environ" 2>/dev/null && kill -KILL "$n" 2>/dev/null
+    grep -qzxE "TMPDIR=$base(/.*)?" "$p/environ" 2>/dev/null && kill -KILL "$n" 2>/dev/null
   done
   sleep 1
 done
-rm -rf "$base"
+same_dir && rm -rf "$base"
 "#;
 
-/// Start the [`WATCHDOG`] for `base`. Its own stdio is null and its environment holds no `TMPDIR=<base>/`.
-fn start_watchdog(base: &Path) -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt as _;
-    let me = std::process::id();
-    let (_, start) = parent_and_start(me).context("read this process's start time")?;
+/// Start the [`WATCHDOG`] for `base`, to reap once `owner` (a pid of this host) is gone. Its own stdio is null and
+/// its environment holds no `TMPDIR=<base>`.
+fn start_watchdog(owner: u32, base: &Path) -> anyhow::Result<()> {
+    use std::os::unix::{fs::MetadataExt as _, process::CommandExt as _};
+    let (_, start) = parent_and_start(owner).context("read the owner's start time")?;
+    let ino = std::fs::metadata(base).context("stat the temp dir")?.ino();
     Command::new("sh")
-        .args(["-c", WATCHDOG, "watchdog", &me.to_string(), &start.to_string()])
+        .args(["-c", WATCHDOG, "watchdog", &owner.to_string(), &start.to_string()])
         .arg(base)
+        .arg(ino.to_string())
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -222,7 +237,7 @@ impl Stack {
             .tempdir_in("/tmp")
             .context("temp dir under /tmp")?;
         let base = dir.path();
-        start_watchdog(base)?;
+        start_watchdog(std::process::id(), base)?;
         for sub in ["d", "e", "dt", "et", "ct"] {
             private_dir(&base.join(sub))?;
         }
@@ -476,5 +491,71 @@ fn the_lifecycle_verbs_operate_on_a_real_running_job() -> anyhow::Result<()> {
     );
     let (_, after) = stack.sandy("k3-ls-after", &["ls"])?;
     ensure!(after.as_array().is_some_and(Vec::is_empty), "ls after gc: {after}");
+    Ok(())
+}
+
+/// Child processes the test started for the decoy test: killed when this drops, by `Child::kill` on the handle.
+struct Decoys(Vec<Child>);
+
+impl Drop for Decoys {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The watchdog kills a process whose environment is exactly this stack's `TMPDIR=<dir>/...` and nothing else. The
+/// positive control (`TMPDIR=<dir>/dt`) must die. The decoys must live: a dir whose name only starts like this one
+/// (`TMPDIR=<dir>x/dt`), an entry that only ends like it (`XTMPDIR=<dir>/dt`) and an unrelated `TMPDIR`. The owner
+/// is a short-lived child, so no VM is needed.
+#[test]
+fn the_watchdog_kills_only_processes_that_name_its_own_dir() -> anyhow::Result<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("s")
+        .tempdir_in("/tmp")
+        .context("temp dir under /tmp")?;
+    let base = dir.path().to_string_lossy().into_owned();
+    let longer = PathBuf::from(format!("{base}x"));
+    std::fs::create_dir(&longer).context("a dir whose name starts like the stack's")?;
+    let sleeper = |key: &str, value: String| -> anyhow::Result<Child> {
+        Command::new("sleep")
+            .arg("600")
+            .env(key, value)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn a decoy")
+    };
+    let mut target = sleeper("TMPDIR", format!("{base}/dt"))?;
+    let mut decoys = Decoys(vec![
+        sleeper("TMPDIR", format!("{base}x/dt"))?,
+        sleeper("XTMPDIR", format!("{base}/dt"))?,
+        sleeper("TMPDIR", "/tmp/unrelated-858".to_owned())?,
+    ]);
+    let mut owner = Command::new("sleep").arg("1").spawn().context("spawn the owner")?;
+    start_watchdog(owner.id(), dir.path())?;
+    owner.wait().context("the owner ends")?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while target.try_wait()?.is_none() {
+        ensure!(
+            Instant::now() < deadline,
+            "the watchdog never killed the process of its own dir"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    while dir.path().exists() {
+        ensure!(Instant::now() < deadline, "the watchdog never removed its dir");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for (i, decoy) in decoys.0.iter_mut().enumerate() {
+        ensure!(decoy.try_wait()?.is_none(), "decoy {i} was killed");
+    }
+    ensure!(longer.exists(), "the dir that only starts like the stack's was touched");
+    std::fs::remove_dir(&longer).context("remove the decoy dir")?;
+    // `dir` is already gone: its own drop finds nothing to remove and ignores that.
     Ok(())
 }
