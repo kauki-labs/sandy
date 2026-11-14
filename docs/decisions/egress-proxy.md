@@ -394,7 +394,7 @@ nftables boundary on a tap. With the direct path gone, the code that backed it g
 - `to_nftables_forward`, `plan_egress_scoped`, `NftablesApplier` and the guest flake's `networkingModule` (decision 5,
   step 6). The guest has no DHCP client config, no `nft` and no `getent` helper.
 - The host-executor's `refuse_guest_nic`. A stray `SANDY_NETWORK` or `SANDY_TAP` in an executor's environment is
-  ignored, and the guest still has no NIC.
+  ignored with one warning at executor start (#833), and the guest still has no NIC.
 
 **Consequences.** A sandbox that needs a routable guest has no path until the NIC backlog item (#677) is built. That
 needs a `Submit` field, a capability bit and an executor that applies a tap and its boundary: a feature, not a revert.

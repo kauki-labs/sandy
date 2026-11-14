@@ -2192,8 +2192,8 @@ declares `transfer`; it moves its data over the link as slices 5 to 6c describe.
 - **The operator declares it.** `SANDY_HOST_TRANSFER=1` (or `true`, `yes`) on the executor sets
   `Capabilities.transfer`. It is the operator's statement that the host has disk headroom and a temp-staging path,
   never auto-detected, like `SANDY_HOST_SHARES_SUBMITTER_FS`. `0`, `false`, `no`, empty and unset leave it off. Any
-  other value stops the executor at start, naming the variable: a typo is not read as off. (The two older flags still
-  read an unknown value as off.)
+  other value stops the executor at start, naming the variable: a typo is not read as off. The two older flags
+  (`SANDY_HOST_SHARES_SUBMITTER_FS`, `SANDY_HOST_EGRESS_PROXY`) use the same parser (#833).
 - **Submit checks the declaration, the stream checks the bytes.** `sandyd` refuses at Submit what it can know from the
   request alone, before a credential is minted or a host is chosen: at most 256 `inputs` and 256 `outputs`; every
   name a plain relative path by the receiver's own rule (`DataLinkMessage::validate`); and no two names in one field

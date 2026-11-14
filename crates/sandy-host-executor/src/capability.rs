@@ -40,10 +40,15 @@ pub enum DetectError {
     /// not a separate, narrower or broader check.
     #[error("trusted-process containment is not available: {0}")]
     ContainmentUnavailable(String),
-    /// `SANDY_HOST_TRANSFER` is set to something other than a yes or a no spelling. A silent `false` would hide a
-    /// typo that the operator meant as opt-in, so the executor refuses to start.
-    #[error("SANDY_HOST_TRANSFER={0:?} is not one of 1, true, yes, 0, false, no (or empty)")]
-    InvalidTransferFlag(String),
+    /// An operator flag is set to something other than a yes or a no spelling. A silent `false` would hide a typo the
+    /// operator meant as opt-in, so the executor refuses to start.
+    #[error("{name}={value:?} is not one of 1, true, yes, 0, false, no (or empty)")]
+    InvalidFlag {
+        /// The environment variable.
+        name: &'static str,
+        /// The value found.
+        value: String,
+    },
 }
 
 /// Detect this host's architecture from the running process's own build
@@ -182,51 +187,34 @@ fn to_wire_capabilities(
     }
 }
 
-/// Whether this host-executor was deployed sharing the submitter's own
-/// filesystem (sandyd.md decision 21) — an operator-set deployment fact,
-/// never auto-detected: this process cannot know what filesystem a future
-/// submitter's CLI will run on. `SANDY_HOST_SHARES_SUBMITTER_FS=1` (or any of
-/// `true`/`yes`, case-insensitive) declares it; unset or anything else is
-/// `false`, the fail-closed default — an undeclared host never carries path
-/// fields.
-fn shares_submitter_filesystem_from_env() -> bool {
-    shares_submitter_filesystem_from(std::env::var("SANDY_HOST_SHARES_SUBMITTER_FS").ok().as_deref())
-}
+/// The operator-set deployment declarations (never auto-detected, fail-closed). All three read through [`flag_from`].
+const SHARES_SUBMITTER_FS_FLAG: &str = "SANDY_HOST_SHARES_SUBMITTER_FS";
+const EGRESS_PROXY_FLAG: &str = "SANDY_HOST_EGRESS_PROXY";
+const TRANSFER_FLAG: &str = "SANDY_HOST_TRANSFER";
 
-/// Pure decision logic behind [`shares_submitter_filesystem_from_env`],
-/// separated so tests can exercise every input without mutating this
-/// process's real environment (edition 2024 makes `std::env::set_var` unsafe;
-/// this crate's lints forbid `unsafe_code`, so a test never does that here —
-/// see `sandy::nix::topology`'s own doc on the same constraint).
-fn shares_submitter_filesystem_from(value: Option<&str>) -> bool {
-    declared(value)
-}
+/// Knobs that older executors read and this one ignores (the guest NIC profile was removed, #864).
+const REMOVED_KNOBS: [&str; 2] = ["SANDY_NETWORK", "SANDY_TAP"];
 
-/// Whether the operator declared that this host's VM path can run a job behind the egress proxy
-/// (`SANDY_HOST_EGRESS_PROXY=1`, A1 of #483): the proxy binary and its guest agent are deployed. Never
-/// auto-detected, and the fail-closed default is `false`, so no job with an egress policy is placed here.
-fn egress_proxy_from(value: Option<&str>) -> bool {
-    declared(value)
-}
-
-/// Whether the operator declared this host-executor ready to receive and send a job's inputs and outputs over the
-/// data link (`SANDY_HOST_TRANSFER`, #807, sandyd.md §22): the host has disk headroom and a temp-staging path. Never
-/// auto-detected, fail-closed like the other declarations, but a value that is neither a yes nor a no spelling is
-/// refused by name rather than read as `false`.
-fn transfer_from(value: Option<&str>) -> Result<bool, DetectError> {
+/// Parse an operator flag: a yes spelling (`1`, `true`, `yes`) is `true`; a no spelling (`0`, `false`, `no`), empty or
+/// unset is `false`; case-insensitive and trimmed. Anything else is refused by name rather than read as `false`, so a
+/// typo meant as opt-in does not hide.
+fn flag_from(name: &'static str, value: Option<&str>) -> Result<bool, DetectError> {
     match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         None | Some("" | "0" | "false" | "no") => Ok(false),
         Some("1" | "true" | "yes") => Ok(true),
-        Some(_) => Err(DetectError::InvalidTransferFlag(value.unwrap_or_default().to_owned())),
+        Some(_) => Err(DetectError::InvalidFlag {
+            name,
+            value: value.unwrap_or_default().to_owned(),
+        }),
     }
 }
 
-/// An operator declaration: `1`, `true` or `yes`, case-insensitive; anything else, or unset, is not declared.
-fn declared(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "yes"
-    })
+/// The removed knobs that `lookup` finds set, in [`REMOVED_KNOBS`] order.
+fn removed_knobs_from(lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    REMOVED_KNOBS
+        .into_iter()
+        .filter(|knob| lookup(knob).is_some())
+        .collect()
 }
 
 /// Detect this host's real capabilities in the wire shape `Register` carries
@@ -238,6 +226,14 @@ fn declared(value: Option<&str>) -> bool {
 /// # Errors
 /// Same as [`detect_capabilities`].
 pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabilities, DetectError> {
+    let ignored = removed_knobs_from(|k| std::env::var(k).ok());
+    if !ignored.is_empty() {
+        tracing::warn!(knobs = ?ignored, "these environment variables were removed and are ignored");
+    }
+    let env_flag = |name: &'static str| flag_from(name, std::env::var(name).ok().as_deref());
+    let shares_submitter_fs = env_flag(SHARES_SUBMITTER_FS_FLAG)?;
+    let egress_proxy = env_flag(EGRESS_PROXY_FLAG)?;
+    let transfer = env_flag(TRANSFER_FLAG)?;
     let arch = detect_arch()?;
     let status = SystemdRunContainment::detect().status();
     let vm_available = detect_vm_capability();
@@ -251,9 +247,9 @@ pub fn detect_register_capabilities() -> Result<sandy_executor_proto::Capabiliti
         capabilities,
         &status,
         vm_available,
-        shares_submitter_filesystem_from_env(),
-        egress_proxy_from(std::env::var("SANDY_HOST_EGRESS_PROXY").ok().as_deref()),
-        transfer_from(std::env::var("SANDY_HOST_TRANSFER").ok().as_deref())?,
+        shares_submitter_fs,
+        egress_proxy,
+        transfer,
     ))
 }
 
@@ -416,6 +412,8 @@ fn unavailable_reason(status: &ContainmentStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::dispatch::Hypervisor;
 
@@ -589,23 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn shares_submitter_filesystem_from_reads_truthy_values() {
-        for value in ["1", "true", "TRUE", "yes"] {
-            assert!(
-                shares_submitter_filesystem_from(Some(value)),
-                "{value:?} should be read as true"
-            );
-        }
-        for value in ["0", "false", "no", ""] {
-            assert!(
-                !shares_submitter_filesystem_from(Some(value)),
-                "{value:?} should be read as false"
-            );
-        }
-        assert!(!shares_submitter_filesystem_from(None), "unset should be false");
-    }
-
-    #[test]
     fn to_wire_capabilities_declares_shares_submitter_filesystem_when_asked() {
         let status = ContainmentStatus::Available {
             isolates_untrusted: false,
@@ -619,32 +600,41 @@ mod tests {
         assert!(wire.shares_submitter_filesystem);
     }
 
-    /// #807: `transfer` is an operator declaration: the yes spellings declare it, the no spellings and an unset or
-    /// empty value do not, and anything else is refused by name.
+    /// #833: each operator flag refuses a value that is neither a yes nor a no spelling, by variable name and value.
     #[test]
-    fn transfer_from_reads_the_operator_flag() {
-        for value in ["1", "true", "TRUE", "yes"] {
-            assert_eq!(
-                transfer_from(Some(value)),
-                Ok(true),
-                "{value:?} should declare transfer"
-            );
+    fn every_operator_flag_refuses_an_unknown_value_by_name() -> anyhow::Result<()> {
+        for name in FLAG_NAMES {
+            for value in ["junk", "2", "ture", "ye5", "y"] {
+                let err = flag_from(name, Some(value))
+                    .err()
+                    .with_context(|| format!("{name}={value:?} should be refused"))?;
+                assert_eq!(
+                    err,
+                    DetectError::InvalidFlag {
+                        name,
+                        value: value.to_owned()
+                    }
+                );
+                let text = err.to_string();
+                assert!(text.contains(name) && text.contains(value), "{text}");
+            }
+            for value in ["1", "true", "TRUE", "Yes", " yes "] {
+                assert_eq!(flag_from(name, Some(value)), Ok(true), "{name}={value:?}");
+            }
+            for value in ["0", "false", "No", "", "  "] {
+                assert_eq!(flag_from(name, Some(value)), Ok(false), "{name}={value:?}");
+            }
+            assert_eq!(flag_from(name, None), Ok(false), "{name} unset");
         }
-        for value in ["0", "false", "no", ""] {
-            assert_eq!(
-                transfer_from(Some(value)),
-                Ok(false),
-                "{value:?} should not declare transfer"
-            );
-        }
-        assert_eq!(transfer_from(None), Ok(false), "unset should not declare transfer");
-        for value in ["junk", "2", "ye5"] {
-            assert_eq!(
-                transfer_from(Some(value)),
-                Err(DetectError::InvalidTransferFlag(value.to_owned())),
-                "{value:?} should be refused"
-            );
-        }
+        Ok(())
+    }
+
+    /// #833: a removed knob that is still set is reported by name; an unset one is not.
+    #[test]
+    fn removed_knobs_still_set_are_reported() {
+        let set = |k: &str| (k == "SANDY_TAP" || k == "SANDY_NETWORK").then(|| "x".to_owned());
+        assert_eq!(removed_knobs_from(set), vec!["SANDY_NETWORK", "SANDY_TAP"]);
+        assert!(removed_knobs_from(|_| None).is_empty());
     }
 
     /// #807: the registration carries `transfer` only when asked, whatever else the host declares.
@@ -702,12 +692,6 @@ mod tests {
         ] {
             let wire = to_wire_capabilities(capabilities(), &status, vm, false, flag, false);
             assert_eq!(wire.egress_proxy, want, "vm={vm} flag={flag}");
-        }
-        for value in ["1", "true", "YES", " yes "] {
-            assert!(egress_proxy_from(Some(value)), "{value:?} declares it");
-        }
-        for value in [Some("0"), Some("no"), Some(""), Some("enabled"), None] {
-            assert!(!egress_proxy_from(value), "{value:?} does not");
         }
     }
 
@@ -782,6 +766,8 @@ mod tests {
         );
         Ok(())
     }
+
+    const FLAG_NAMES: [&str; 3] = [SHARES_SUBMITTER_FS_FLAG, EGRESS_PROXY_FLAG, TRANSFER_FLAG];
 
     fn unsupported() -> ContainmentStatus {
         ContainmentStatus::Unsupported("process containment needs Linux cgroup v2".to_owned())
