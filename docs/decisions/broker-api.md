@@ -101,10 +101,12 @@ configured root in canonical form, resolved once at startup (a root that cannot 
 controls would otherwise make that alias the root and retarget it after the check. When several of the client's roots
 contain the path, the nearest wins. The path a client sees back (an output destination in the result envelope) is the
 canonical one. The HTTP contract does not change. `root` is not a boundary on the local control RPC: only the broker
-sets it, per client, and a caller of the control socket can send any root. `sandyd` opens an input or output beneath that root without following a link, and an executor opens the paths it handles
-itself (a secret, or an input or output on a host with no `transfer`) the same way (`sandy::stage`). A host that does not
-declare `path_root` (an older executor, which would drop the field) is never given a rooted job: with no such host the
-submit is refused naming the capability.
+sets it, per client, and a caller of the control socket can send any root. `sandyd` opens a rooted input or output beneath that root without following a link when the host has `transfer`, because it
+carries them over the data link. The executor opens every other rooted path the same way (`sandy::stage`): each rooted
+secret, and rooted inputs and outputs on a host with no `transfer`. Only a host that opens a rooted path itself needs
+`path_root`, because an older executor would drop the field. So a rooted secret, or a rooted input or output on a host
+with no `transfer`, is placed only on a host that declared it, and with no such host the submit is refused naming the
+capability. A host with `transfer` and no `path_root` still takes rooted inputs and outputs when no secret is rooted.
 
 **Residual risk (_owner_).** The broker's own check is a point in time. It is closed for the paths the broker sends
 (#618): `sandyd` and the executor open each beneath the client's canonical root without following a link, so a parent
