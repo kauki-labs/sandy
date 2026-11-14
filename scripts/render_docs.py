@@ -315,51 +315,52 @@ def render_markdown(name: str, docs: list[SourceDoc]) -> str:
 
 CSS = """\
 :root {
-  --bg: #ffffff;
-  --fg: #1f2328;
-  --muted: #59636e;
-  --border: #d1d9e0;
-  --card: #f6f8fa;
-  --link: #0969da;
+  --bg: #f6f7f9;
+  --fg: #1b1f24;
+  --mut: #5b6572;
+  --card: #fff;
+  --line: #dde1e6;
+  --accent: #2f6fdb;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0d1117;
-    --fg: #e6edf3;
-    --muted: #9198a1;
-    --border: #3d444d;
-    --card: #151b23;
-    --link: #4493f8;
+    --bg: #12161b;
+    --fg: #e6e9ee;
+    --mut: #9aa4b0;
+    --card: #1a2027;
+    --line: #2b333c;
+    --accent: #6ea8fe;
   }
 }
 * { box-sizing: border-box; }
 html { color-scheme: light dark; }
-body {
-  margin: 0;
-  padding: 0 16px;
-  background: var(--bg);
-  color: var(--fg);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-  overflow-wrap: anywhere;
-}
-main { max-width: 960px; margin: 0 auto; padding: 24px 0 48px; }
-a { color: var(--link); }
-h1, h2, h3 { line-height: 1.25; }
-h2 { margin-top: 2.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
-nav.toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 16px; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; overflow-wrap: anywhere; }
+main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
+a { color: var(--accent); }
+h1 { margin: 0 0 4px; font-size: 24px; line-height: 1.25; }
+h2 { margin: 28px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--mut); }
+h3 { margin: 0 0 4px; font-size: 17px; line-height: 1.25; }
+p { margin: 6px 0 10px; }
+code { font-size: 13px; }
+nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 16px; margin-top: 20px; }
 nav.toc ul { margin: 4px 0; padding-left: 20px; }
-.notice, .source { color: var(--muted); font-size: 0.9rem; }
-section.diagram { margin: 1.5rem 0; }
-.diagram-box { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+.notice { color: var(--mut); margin: 0 0 20px; }
+.source { color: var(--mut); font-size: 12px; margin: 10px 0 0; }
+section.diagram { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }
+.diagram-box { overflow-x: auto; }
 pre.mermaid { margin: 0; text-align: center; }
-details { margin-top: 8px; }
-details pre { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+details { margin-top: 6px; }
+summary { cursor: pointer; color: var(--mut); font-size: 13px; }
+details pre { overflow-x: auto; margin: 8px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 """
 
 INIT_JS = """\
 if (window.mermaid) {
   var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  mermaid.initialize({startOnLoad:true, securityLevel:'strict', theme: dark ? 'dark' : 'default'});
+  var vars = dark
+    ? {background:'#1a2027', primaryColor:'#26303a', primaryTextColor:'#e6e9ee', primaryBorderColor:'#2b333c', lineColor:'#9aa4b0'}
+    : {background:'#ffffff', primaryColor:'#eef1f5', primaryTextColor:'#1b1f24', primaryBorderColor:'#dde1e6', lineColor:'#5b6572'};
+  mermaid.initialize({startOnLoad:true, securityLevel:'strict', theme: dark ? 'dark' : 'default', themeVariables: vars});
 }
 """
 
