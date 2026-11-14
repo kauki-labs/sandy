@@ -786,6 +786,7 @@ mod tests {
         let command = ["true".to_string()];
         let grants = grants();
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(PathBuf::from("/host/secret")),
         }];

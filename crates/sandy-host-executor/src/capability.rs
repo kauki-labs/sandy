@@ -173,7 +173,7 @@ fn to_wire_capabilities(
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
-        path_root: false,
+        path_root: true,
         // Both backends hash a run's inputs and outputs when `RunSpec.digests` is set (#373), so this is an
         // implementation fact, not an operator declaration.
         digests: true,
@@ -670,6 +670,24 @@ mod tests {
         for vm in [false, true] {
             let wire = to_wire_capabilities(capabilities(), &status, vm, false, false, false);
             assert!(wire.digests, "vm={vm}: digests not declared");
+        }
+    }
+
+    /// #618: this executor opens each `Dispatch` path beneath its root, so every registration declares `path_root`,
+    /// whatever else the host has. It is an implementation fact, not an operator flag.
+    #[test]
+    fn to_wire_capabilities_always_declares_path_root() {
+        let status = ContainmentStatus::Available {
+            isolates_untrusted: false,
+        };
+        let capabilities = || Capabilities {
+            kind: SandboxKind::Process,
+            arch: Arch::X86_64,
+            attestation: None,
+        };
+        for vm in [false, true] {
+            let wire = to_wire_capabilities(capabilities(), &status, vm, false, false, false);
+            assert!(wire.path_root, "vm={vm}: path_root not declared");
         }
     }
 

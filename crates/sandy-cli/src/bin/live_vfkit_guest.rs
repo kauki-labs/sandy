@@ -35,6 +35,7 @@ fn run() -> Result<(), String> {
     let template = format!("{}#topologies.aarch64-linux.vfkit-service", guest_flake().display());
     let command = ["bash".to_string(), "/run/sandy/inputs/guest.sh".to_string()];
     let inputs = [Input {
+        root: None,
         host: script,
         name: "guest.sh".to_string(),
         guest_path: None,

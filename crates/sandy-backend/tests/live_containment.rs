@@ -67,6 +67,7 @@ fn live_confining_backend() -> ProcessBackend {
 /// #142 confinement tests terse.
 fn run_with_input(backend: &ProcessBackend, input: &std::path::Path, script: &str) -> anyhow::Result<sandy::Outcome> {
     let inputs = [Input {
+        root: None,
         host: input.to_path_buf(),
         name: "data".to_string(),
         guest_path: None,
@@ -243,6 +244,7 @@ fn a_contained_job_reads_its_input_through_the_scope() -> anyhow::Result<()> {
     let src = tempfile::TempDir::new()?;
     std::fs::write(src.path().join("data"), b"contained-input")?;
     let inputs = [Input {
+        root: None,
         host: src.path().join("data"),
         name: "data".to_string(),
         guest_path: None,

@@ -381,7 +381,7 @@ components:
             properties:
               host:
                 type: string
-                description: Absolute host path under one of the client's roots. The broker sends that root to sandyd, which opens the path beneath it without following a link.
+                description: Absolute host path under one of the client's roots. The broker sends that root to sandyd, which opens the path beneath it without following a link. The broker rewrites it onto the operator's configured root in canonical form.
               name: {type: string}
               guest_path: {type: string}
         outputs:
@@ -394,7 +394,7 @@ components:
               name: {type: string}
               dest:
                 type: string
-                description: Absolute host path under one of the client's roots, opened beneath that root without following a link.
+                description: Absolute host path under one of the client's roots, opened beneath that root without following a link. The broker rewrites it onto the operator's configured root in canonical form, never a spelling the client chose, so the destination a client sees back (in the result) is the canonical path.
         secrets:
           description: File-backed references. The value never travels.
           type: array
@@ -406,7 +406,7 @@ components:
               name: {type: string}
               host_path:
                 type: string
-                description: Absolute host path under one of the client's roots, opened beneath that root without following a link.
+                description: Absolute host path under one of the client's roots, opened beneath that root without following a link. The broker rewrites it onto the operator's configured root in canonical form.
     JobState:
       type: string
       enum: [pending, running, succeeded, failed, cancelled]

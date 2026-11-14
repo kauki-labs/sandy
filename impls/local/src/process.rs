@@ -906,6 +906,7 @@ mod tests {
         let src = tempfile::TempDir::new()?;
         std::fs::write(src.path().join("data"), b"hello-input")?;
         let inputs = [sandy::Input {
+            root: None,
             host: src.path().join("data"),
             name: "data".to_string(),
             guest_path: None,
@@ -943,6 +944,7 @@ mod tests {
         let src = tempfile::TempDir::new()?;
         std::fs::write(src.path().join("data"), b"x")?;
         let inputs = [sandy::Input {
+            root: None,
             host: src.path().join("data"),
             name: "data".to_string(),
             guest_path: None,
@@ -974,6 +976,7 @@ mod tests {
         let src = tempfile::TempDir::new()?;
         std::fs::write(src.path().join("data"), b"x")?;
         let inputs = [sandy::Input {
+            root: None,
             host: src.path().join("data"),
             name: "data".to_string(),
             guest_path: None,
@@ -1010,6 +1013,7 @@ mod tests {
         let dest = tempfile::TempDir::new()?;
         let out_dest = dest.path().join("result");
         let outputs = [sandy::Output {
+            root: None,
             name: Some("result".to_string()),
             dest: out_dest.clone(),
         }];
@@ -1048,6 +1052,7 @@ mod tests {
         // INV-1: the host secret source must be 0600, or stage_secrets refuses it.
         std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
         let secrets = [sandy::SecretRef {
+            root: None,
             name: "TOKEN".to_string(),
             source: sandy::SecretSource::File(secret_file),
         }];
@@ -1091,6 +1096,7 @@ mod tests {
         std::fs::write(&secret_file, b"s3cr3t-value")?;
         std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
         let secrets = [sandy::SecretRef {
+            root: None,
             name: "TOKEN".to_string(),
             source: sandy::SecretSource::File(secret_file),
         }];

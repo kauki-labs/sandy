@@ -337,6 +337,7 @@ mod tests {
         fn lease_of(minted: &sandy::Minted) -> sandy::Lease {
             sandy::Lease {
                 secret_ref: sandy_api::backend::SecretRef {
+                    root: None,
                     name: "GITHUB_TOKEN".to_owned(),
                     source: sandy_api::backend::SecretSource::File(std::path::PathBuf::new()),
                 },

@@ -356,6 +356,30 @@ pub fn open_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
     dir.open_file(leaf)
 }
 
+/// Create (or truncate) the regular file at `path`, which lies beneath `root`, for writing, with the directories above
+/// it that are missing. As [`open_file_beneath`], every component below `root` is created or opened without following
+/// a link, and a symlink at the leaf is refused (#618).
+///
+/// # Errors
+///
+/// As [`open_file_beneath`].
+pub fn create_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
+    let mut parts = below_root(root, path)?;
+    let Some(leaf) = parts.pop() else {
+        return Err(FsError::Unsafe {
+            path: path.to_owned(),
+            reason: "is the root, not a file below it".to_owned(),
+        });
+    };
+    // Only searched on the way, as in `open_file_beneath` and `create_dir_beneath`: the root and every directory above
+    // the leaf may lack read permission.
+    let mut dir = Beneath::open_root_search(root)?;
+    for part in parts {
+        dir = dir.create_search_subdir(part)?;
+    }
+    dir.create_file(leaf)
+}
+
 /// Open the regular file at `path` for reading. The leaf is not followed: a symlink there is refused.
 ///
 /// # Errors
@@ -731,6 +755,47 @@ mod tests {
             let err = open_file_beneath(root, &path).expect_err("must be refused");
             assert!(matches!(err, FsError::Unsafe { .. }), "{path:?}: {err}");
         }
+        Ok(())
+    }
+
+    /// #618: a file created below the root is reached only through search-only handles, as for a directory: a root
+    /// with search permission and no read permission (`0100`), and an existing directory on the way with write and
+    /// search permission and no read permission (`0300`), both work. Linux-only, skipped for root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_is_created_below_search_only_directories() -> anyhow::Result<()> {
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let search = root.path().join("search");
+        fs::create_dir(&search)?;
+        let _restore_root = RestoreMode(root.path().to_owned(), 0o700);
+        let _restore_search = RestoreMode(search.clone(), 0o700);
+        fs::set_permissions(&search, std::os::unix::fs::PermissionsExt::from_mode(0o300))?;
+        fs::set_permissions(root.path(), std::os::unix::fs::PermissionsExt::from_mode(0o100))?;
+
+        let mut file =
+            create_file_beneath(root.path(), &search.join("new/f.txt")).context("create below 0100 and 0300")?;
+        io::Write::write_all(&mut file, b"x")?;
+
+        assert!(search.join("new/f.txt").is_file());
+        Ok(())
+    }
+
+    /// #618: a file beneath the root is created with its parents, and a swapped parent is refused.
+    #[test]
+    fn a_file_beneath_the_root_is_created_with_its_parents() -> anyhow::Result<()> {
+        let (root, outside) = swapped_parent()?;
+        fs::create_dir(root.path().join("have"))?;
+
+        let mut file = create_file_beneath(root.path(), &root.path().join("have/new/f"))?;
+        io::Write::write_all(&mut file, b"x")?;
+        let err = create_file_beneath(root.path(), &root.path().join("sub/new")).expect_err("through a link");
+
+        assert_eq!(fs::read(root.path().join("have/new/f"))?, b"x");
+        assert!(matches!(err, FsError::Unsafe { .. }), "{err}");
+        assert!(!outside.path().join("new").exists(), "nothing may be created outside");
         Ok(())
     }
 

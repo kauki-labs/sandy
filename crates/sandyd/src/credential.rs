@@ -118,6 +118,7 @@ pub fn revoke_recorded(resolver: &dyn CredentialResolver, record: &CredentialRec
     let result = resolver.provider(&record.trust_root).and_then(|provider| {
         let lease = sandy::Lease {
             secret_ref: sandy::SecretRef {
+                root: None,
                 name: CREDENTIAL_SECRET_NAME.to_owned(),
                 source: sandy::SecretSource::File(record.token_path.clone()),
             },

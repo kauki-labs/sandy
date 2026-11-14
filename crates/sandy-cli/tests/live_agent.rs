@@ -168,6 +168,7 @@ async fn run_in_guest_with_secret(
         // INV-1: the host secret source must be 0600, or staging refuses it.
         std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
         let secrets = [SecretRef {
+            root: None,
             name: secret_name,
             source: SecretSource::File(secret_file),
         }];

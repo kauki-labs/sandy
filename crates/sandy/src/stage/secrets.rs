@@ -53,7 +53,7 @@ pub fn stage_secrets(secrets: &[SecretRef], dir: &sandy_fsutil::OwnedDir) -> Res
     let mut staged = Vec::with_capacity(secrets.len());
     for secret in secrets {
         validate_secret_name(&secret.name)?;
-        let bytes = read_source(&secret.source)?;
+        let bytes = read_source(&secret.source, secret.root.as_deref())?;
         // Stage each secret under its own name: the guest mounts this dir read-only
         // and exports each file as `$NAME`, so the file name IS the env var name.
         let guest_path = dir
@@ -91,7 +91,7 @@ fn validate_secret_name(name: &str) -> Result<(), BackendError> {
 /// — must not be followed and exfiltrated into the guest, #175). The `Fd`
 /// channel needs an `unsafe` `File::from_raw_fd`, which this crate forbids
 /// (`unsafe_code = forbid`), so it is rejected rather than read.
-fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
+fn read_source(source: &SecretSource, trusted_root: Option<&Path>) -> Result<Vec<u8>, BackendError> {
     match source {
         SecretSource::File(path) => {
             // O_NOFOLLOW: a symlink final component fails with ELOOP, so a swapped
@@ -99,20 +99,30 @@ fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
             // keeps a FIFO at the path from blocking this open waiting for a writer
             // (the file-type check below then rejects it outright). O_CLOEXEC keeps
             // the fd off forked children.
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|e| {
-                    if e.raw_os_error() == Some(libc::ELOOP) {
-                        BackendError::Spawn(format!(
-                            "secret source {} is a symlink; refusing to follow it (INV-1)",
-                            path.display()
-                        ))
-                    } else {
-                        spawn_err("open secret source", path, &e)
-                    }
-                })?;
+            // With a root (#618) every component below it is opened without following a link, so a swapped parent
+            // directory is refused as well; the checks below still run on the opened fd.
+            let mut file = match trusted_root {
+                Some(trusted) => sandy_fsutil::beneath::open_file_beneath(trusted, path).map_err(|e| {
+                    BackendError::Spawn(format!(
+                        "secret source {} cannot be opened beneath its root; refusing to stage (INV-1): {e}",
+                        path.display()
+                    ))
+                })?,
+                None => fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|e| {
+                        if e.raw_os_error() == Some(libc::ELOOP) {
+                            BackendError::Spawn(format!(
+                                "secret source {} is a symlink; refusing to follow it (INV-1)",
+                                path.display()
+                            ))
+                        } else {
+                            spawn_err("open secret source", path, &e)
+                        }
+                    })?,
+            };
 
             // Validate type, owner and mode on the OPENED fd, never the path: a
             // path-based check races the open (TOCTOU), and following a symlink
@@ -207,6 +217,7 @@ mod tests {
         let inst_dir = tmp.path().join("inst");
         for bad in ["BAD-NAME", "a b", "../escape", "1LEADING", ""] {
             let secrets = [SecretRef {
+                root: None,
                 name: bad.to_string(),
                 source: SecretSource::File(src.clone()),
             }];
@@ -227,6 +238,7 @@ mod tests {
         let src = secret_source(tmp.path(), b"s3cr3t-marker")?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -262,6 +274,7 @@ mod tests {
         std::fs::write(&victim, b"untouched")?;
         std::os::unix::fs::symlink(&victim, inst_dir.join("TOK.tmp"))?;
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -288,6 +301,7 @@ mod tests {
         let src = secret_source(tmp.path(), marker.as_bytes())?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -320,6 +334,7 @@ mod tests {
 
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(link),
         }];
@@ -330,6 +345,52 @@ mod tests {
             "expected a named Spawn error, got {err:?}"
         );
         assert!(!inst_dir.join("TOK").exists(), "a rejected symlink must not be staged");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the stage follows it and stages the outside `0600` file. With a root it walks `sub` without following
+    /// a link and refuses, staging nothing.
+    #[test]
+    fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        let host_file = outside.join("key");
+        std::fs::write(&host_file, b"outside-secret")?;
+        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o600))?;
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::os::unix::fs::symlink(&outside, root.join("sub"))?;
+        let through_link = root.join("sub").join("key");
+        // The same source path either way: only the root differs.
+        let secret = |root: Option<&Path>| {
+            [SecretRef {
+                root: root.map(Path::to_path_buf),
+                name: "TOK".to_string(),
+                source: SecretSource::File(through_link.clone()),
+            }]
+        };
+
+        let unrooted_dir = tmp.path().join("unrooted");
+        stage_secrets(&secret(None), &owned(&unrooted_dir)?)?;
+        assert_eq!(
+            std::fs::read(unrooted_dir.join("TOK"))?,
+            b"outside-secret",
+            "without a root the link is followed today"
+        );
+
+        let rooted_dir = tmp.path().join("rooted");
+        let err = stage_secrets(&secret(Some(&root)), &owned(&rooted_dir)?)
+            .expect_err("a parent directory swapped for a link must be refused");
+        assert!(
+            matches!(err, BackendError::Spawn(_)),
+            "expected a Spawn error, got {err:?}"
+        );
+        assert!(
+            !rooted_dir.join("TOK").exists(),
+            "nothing of the outside file is staged"
+        );
         Ok(())
     }
 
@@ -347,6 +408,7 @@ mod tests {
 
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(fifo),
         }];
@@ -370,6 +432,7 @@ mod tests {
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644))?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -391,6 +454,7 @@ mod tests {
         let src = secret_source(tmp.path(), b"marker")?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
