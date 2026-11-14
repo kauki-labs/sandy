@@ -1511,7 +1511,9 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   that declared `egress_proxy` (operator flag `SANDY_HOST_EGRESS_PROXY=1`, and only with VM capability); with none, or
   with no remote placement at all, the Submit is refused naming the capability, never run unfiltered locally. `sandyd`
   and the executor both check each rule (a host, a port in 1..=65535), and the executor refuses a policy on a process
-  job.
+  job. Both also bound it (#819): at most 256 rules, each host at most 253 bytes (the longest DNS name), the constants
+  `sandy_api::egress::MAX_EGRESS_RULES` and `MAX_EGRESS_HOST_LEN`. The egress proxy had no bound of its own beyond the
+  frame cap, so these are new; the direct `sandy run --allow` stays unbounded.
 - A2 (#483): `sandyd` builds the result envelope with `sandy::build_envelope` and `classify_outcome`, stores it in
   `jobs.envelope` in the statement that makes the job terminal, and serves its JSON in `StatusResponse.result_envelope`.
   `who` is the local-uid fallback with `authenticated: false` (verified caps are #413). A run that carried an egress

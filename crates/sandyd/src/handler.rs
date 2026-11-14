@@ -207,9 +207,25 @@ fn credential_request_refusal(submit: &SubmitRequest, registry: &JobRegistry) ->
 
 /// Refuse a Submit whose egress policy has a rule that is not a destination (A1, #483): an empty host, or a port
 /// outside 1..=65535 (the wire carries a `u32`). The CLI parses `--allow` already, but the broker and MCP submit too,
-/// and the executor re-checks, so a bad rule never reaches a host. Names the field.
+/// and the executor re-checks, so a bad rule never reaches a host. A policy is also bounded (#819): at most
+/// `MAX_EGRESS_RULES` rules, each host at most `MAX_EGRESS_HOST_LEN` bytes. Names the field.
 fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
-    submit.egress.as_ref()?.rules.iter().find_map(|rule| {
+    let policy = submit.egress.as_ref()?;
+    if policy.rules.len() > sandy_api::egress::MAX_EGRESS_RULES {
+        return Some(format!(
+            "egress has {} rules: a policy takes at most {}",
+            policy.rules.len(),
+            sandy_api::egress::MAX_EGRESS_RULES
+        ));
+    }
+    policy.rules.iter().find_map(|rule| {
+        if rule.host.len() > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+            return Some(format!(
+                "egress has a rule whose host is {} bytes: a host takes at most {}",
+                rule.host.len(),
+                sandy_api::egress::MAX_EGRESS_HOST_LEN
+            ));
+        }
         let bad_port = !u16::try_from(rule.port).is_ok_and(|port| port != 0);
         (rule.host.is_empty() || bad_port).then(|| {
             format!(

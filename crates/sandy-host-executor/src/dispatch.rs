@@ -176,10 +176,24 @@ fn allow_list_from_policy(
     let Some(policy) = policy else {
         return Ok(None);
     };
+    if policy.rules.len() > sandy_api::egress::MAX_EGRESS_RULES {
+        return Err(DispatchError::EgressPolicyInvalid(format!(
+            "{} rules: a policy takes at most {}",
+            policy.rules.len(),
+            sandy_api::egress::MAX_EGRESS_RULES
+        )));
+    }
     let rules = policy
         .rules
         .iter()
         .map(|rule| {
+            if rule.host.len() > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+                return Err(DispatchError::EgressPolicyInvalid(format!(
+                    "a host of {} bytes: a host takes at most {}",
+                    rule.host.len(),
+                    sandy_api::egress::MAX_EGRESS_HOST_LEN
+                )));
+            }
             let port = u16::try_from(rule.port).ok().filter(|port| *port != 0).ok_or_else(|| {
                 DispatchError::EgressPolicyInvalid(format!(
                     "port {} of `{}` is not a TCP port in 1..=65535",
