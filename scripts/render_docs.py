@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -313,55 +314,100 @@ def render_markdown(name: str, docs: list[SourceDoc]) -> str:
     return "\n".join(parts).rstrip("\n") + "\n"
 
 
-CSS = """\
-:root {
-  --bg: #ffffff;
-  --fg: #1f2328;
-  --muted: #59636e;
-  --border: #d1d9e0;
-  --card: #f6f8fa;
-  --link: #0969da;
+# One palette feeds the CSS tokens and the mermaid themeVariables, so they cannot drift apart.
+PALETTE = {
+    "light": {
+        "bg": "#f6f7f9", "fg": "#1b1f24", "mut": "#5b6572", "card": "#fff", "line": "#dde1e6",
+        "accent": "#2f6fdb", "edge": "#8a94a0",
+        "done": "#d7f0de", "done-s": "#2f8f4e", "act": "#fdf0cf", "act-s": "#b7860b",
+        "back": "#e8eaee", "back-s": "#6b7480",
+    },
+    "dark": {
+        "bg": "#12161b", "fg": "#e6e9ee", "mut": "#9aa4b0", "card": "#1a2027", "line": "#2b333c",
+        "accent": "#6ea8fe", "edge": "#6b7684",
+        "done": "#1c3a27", "done-s": "#56c27a", "act": "#3b3217", "act-s": "#e0b54a",
+        "back": "#262d35", "back-s": "#8d97a4",
+    },
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117;
-    --fg: #e6edf3;
-    --muted: #9198a1;
-    --border: #3d444d;
-    --card: #151b23;
-    --link: #4493f8;
-  }
-}
-* { box-sizing: border-box; }
-html { color-scheme: light dark; }
-body {
-  margin: 0;
-  padding: 0 16px;
-  background: var(--bg);
-  color: var(--fg);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-  overflow-wrap: anywhere;
-}
-main { max-width: 960px; margin: 0 auto; padding: 24px 0 48px; }
-a { color: var(--link); }
-h1, h2, h3 { line-height: 1.25; }
-h2 { margin-top: 2.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
-nav.toc { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 16px; }
-nav.toc ul { margin: 4px 0; padding-left: 20px; }
-.notice, .source { color: var(--muted); font-size: 0.9rem; }
-section.diagram { margin: 1.5rem 0; }
-.diagram-box { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-pre.mermaid { margin: 0; text-align: center; }
-details { margin-top: 8px; }
-details pre { overflow-x: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-"""
 
-INIT_JS = """\
+
+def _tokens(mode: str, indent: str) -> str:
+    return "".join(f"{indent}--{k}: {v};\n" for k, v in PALETTE[mode].items())
+
+
+def theme_variables(p: dict[str, str]) -> dict[str, str]:
+    """Mermaid 'base' themeVariables built only from palette tokens (plus font and transparent)."""
+    return {
+        "background": "transparent",
+        "fontFamily": "system-ui, sans-serif",
+        "fontSize": "12px",
+        "primaryColor": p["back"], "primaryBorderColor": p["back-s"], "primaryTextColor": p["fg"],
+        "secondaryColor": p["card"], "secondaryBorderColor": p["line"], "secondaryTextColor": p["fg"],
+        "tertiaryColor": p["back"], "tertiaryBorderColor": p["line"], "tertiaryTextColor": p["fg"],
+        "textColor": p["fg"], "nodeTextColor": p["fg"], "mainBkg": p["back"], "nodeBorder": p["back-s"],
+        "lineColor": p["edge"], "edgeLabelBackground": p["card"],
+        "clusterBkg": p["bg"], "clusterBorder": p["line"],
+        "noteBkgColor": p["act"], "noteBorderColor": p["act-s"], "noteTextColor": p["fg"],
+        "actorBkg": p["back"], "actorBorder": p["back-s"], "actorTextColor": p["fg"], "actorLineColor": p["edge"],
+        "signalColor": p["fg"], "signalTextColor": p["fg"],
+        "labelBoxBkgColor": p["card"], "labelBoxBorderColor": p["line"], "labelTextColor": p["fg"],
+        "loopTextColor": p["fg"], "activationBkgColor": p["done"], "activationBorderColor": p["done-s"],
+        "sequenceNumberColor": p["card"],
+        "transitionColor": p["edge"], "transitionLabelColor": p["fg"], "stateLabelColor": p["fg"],
+        "compositeBackground": p["bg"], "compositeBorder": p["line"], "compositeTitleBackground": p["back"],
+        "specialStateColor": p["edge"], "innerEndBackground": p["fg"],
+    }
+
+
+CSS = (
+    ":root {\n" + _tokens("light", "  ") + "}\n"
+    "@media (prefers-color-scheme: dark) {\n  :root {\n" + _tokens("dark", "    ") + "  }\n}\n"
+    "* { box-sizing: border-box; }\n"
+    "html { color-scheme: light dark; }\n"
+    "body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; overflow-wrap: anywhere; }\n"
+    "main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }\n"
+    "a { color: var(--accent); }\n"
+    "h1 { margin: 0 0 4px; font-size: 24px; line-height: 1.25; }\n"
+    "h2 { margin: 28px 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--mut); }\n"
+    "h3 { margin: 0 0 4px; font-size: 17px; line-height: 1.25; }\n"
+    "p { margin: 6px 0 10px; }\n"
+    "code { font-size: 13px; }\n"
+    "nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 16px; margin-top: 20px; }\n"
+    "nav.toc ul { margin: 4px 0; padding-left: 20px; }\n"
+    ".notice { color: var(--mut); margin: 0 0 20px; }\n"
+    ".source { color: var(--mut); font-size: 12px; margin: 10px 0 0; }\n"
+    "section.diagram { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }\n"
+    ".diagram-box { overflow-x: auto; }\n"
+    "pre.mermaid { margin: 0; text-align: center; }\n"
+    "details { margin-top: 6px; }\n"
+    "summary { cursor: pointer; color: var(--mut); font-size: 13px; }\n"
+    "details pre { overflow-x: auto; margin: 8px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }\n"
+)
+
+INIT_JS = (
+    "var THEMES = "
+    + json.dumps({m: theme_variables(PALETTE[m]) for m in PALETTE}, indent=2)
+    + """;
+// Edge width and node rounding are not themeVariables; themeCSS sets them.
+var THEME_CSS = '.flowchart-link, .transition, .messageLine0, .messageLine1 { stroke-width: 1.6px; } .node rect, .cluster rect { rx: 8px; ry: 8px; }';
+var scheme = window.matchMedia('(prefers-color-scheme: dark)');
+function draw() {
+  mermaid.initialize({startOnLoad: false, securityLevel: 'strict', theme: 'base',
+    themeVariables: THEMES[scheme.matches ? 'dark' : 'light'], themeCSS: THEME_CSS});
+  var nodes = document.querySelectorAll('pre.mermaid');
+  nodes.forEach(function (n) {
+    if (!n.hasAttribute('data-src')) { n.setAttribute('data-src', n.textContent); }
+    n.removeAttribute('data-processed');
+    n.textContent = n.getAttribute('data-src');
+  });
+  mermaid.run({nodes: nodes});
+}
 if (window.mermaid) {
-  var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  mermaid.initialize({startOnLoad:true, securityLevel:'strict', theme: dark ? 'dark' : 'default'});
+  draw();
+  scheme.addEventListener('change', draw);
 }
 """
+)
 
 
 def _esc(text: str) -> str:

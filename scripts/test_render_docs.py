@@ -7,6 +7,7 @@ Run: python3 -I scripts/test_render_docs.py
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -307,6 +308,84 @@ class ReviewFixesTest(Base):
         assert tag is not None
         self.assertRegex(tag.group(0), r'integrity="sha384-[A-Za-z0-9+/]{64}"')
         self.assertIn('crossorigin="anonymous"', tag.group(0))
+
+    def test_css_defines_reference_tokens_for_light_and_dark(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "").replace("\n", "")
+        light, dark = flat.split("@media(prefers-color-scheme:dark)", 1)
+        for token, lval, dval in (
+            ("--bg", "#f6f7f9", "#12161b"),
+            ("--fg", "#1b1f24", "#e6e9ee"),
+            ("--mut", "#5b6572", "#9aa4b0"),
+            ("--card", "#fff", "#1a2027"),
+            ("--line", "#dde1e6", "#2b333c"),
+        ):
+            self.assertIn(f"{token}:{lval};", light)
+            self.assertIn(f"{token}:{dval};", dark)
+        self.assertRegex(light, r":root\{[^}]*--accent:")
+        self.assertRegex(dark, r":root\{[^}]*--accent:")
+
+    def test_body_background_and_layout_come_from_reference_style(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "")
+        self.assertIn("background:var(--bg)", flat)
+        self.assertIn("font:15px/1.5system-ui", flat)
+        self.assertIn("max-width:1040px", flat)
+        self.assertIn("padding:24px16px48px", flat)
+        self.assertIn("border-radius:12px", flat)
+
+    def test_page_has_no_horizontal_scroll_rule_for_wide_content(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        flat = html.replace(" ", "")
+        self.assertIn(".diagram-box{overflow-x:auto", flat.replace("\n", ""))
+        self.assertIn("detailspre{overflow-x:auto", flat.replace("\n", ""))
+        self.assertNotIn("overflow-x:scroll", flat)
+        self.assertNotIn("min-width:720px", flat)
+
+    def test_mermaid_theme_follows_page_and_pin_is_unchanged(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        self.assertIn("mermaid@11.4.1", html)
+        self.assertIn("sha384-rbtjAdnIQE/aQJGEgXrVUlMibdfTSa4PQju4HDhN3sR2PmaKFzhEafuePsl9H/9I", html)
+        self.assertIn("themeVariables", html)
+        self.assertIn("#1a2027", html)
+
+    def _tokens_and_themes(self) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]], str]:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        css = html.split("<style>", 1)[1].split("</style>", 1)[0]
+        light_css, dark_css = css.split("@media (prefers-color-scheme: dark)", 1)
+        tok = {
+            mode: dict(re.findall(r"(--[a-z-]+):\s*([^;]+);", block))
+            for mode, block in (("light", light_css), ("dark", dark_css))
+        }
+        themes_src = re.search(r"var THEMES = (\{.*?\n\});", html, re.DOTALL)
+        assert themes_src is not None, "THEMES literal missing"
+        themes = json.loads(themes_src.group(1))
+        return tok, themes, html
+
+    def test_mermaid_theme_variables_derive_from_the_css_tokens(self) -> None:
+        tok, themes, html = self._tokens_and_themes()
+        self.assertIn("theme:'base'", html.replace(" ", ""))
+        for mode in ("light", "dark"):
+            t, v = tok[mode], themes[mode]
+            self.assertEqual(v["background"], "transparent")
+            expected = {
+                "primaryColor": "--back", "primaryBorderColor": "--back-s", "lineColor": "--edge",
+                "primaryTextColor": "--fg", "textColor": "--fg", "secondaryColor": "--card",
+                "tertiaryColor": "--back", "edgeLabelBackground": "--card", "clusterBkg": "--bg",
+                "clusterBorder": "--line", "noteBkgColor": "--act", "noteBorderColor": "--act-s",
+                "actorBkg": "--back", "actorBorder": "--back-s", "signalColor": "--fg",
+            }
+            for key, token in expected.items():
+                self.assertEqual(v[key], t[token], f"{mode} {key}")
+            hexes = {x for x in v.values() if x.startswith("#")}
+            self.assertLessEqual(hexes, set(t.values()), f"{mode}: colour not from a token")
+            self.assertEqual(v["fontSize"], "12px")
+            self.assertTrue(v["fontFamily"].startswith("system-ui"))
+
+    def test_mermaid_rerenders_when_the_page_theme_changes(self) -> None:
+        _, _, html = self._tokens_and_themes()
+        self.assertIn("addEventListener('change'", html)
+        self.assertIn("data-src", html)
 
     def test_crlf_input_renders_like_lf(self) -> None:
         lf = {"overview.md": FM + "## A\n\ntext\n\n" + MERMAID}
