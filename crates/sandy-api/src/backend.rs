@@ -181,6 +181,11 @@ pub struct Input {
     /// guest-side symlink to the staged entry. `None` leaves it only at
     /// `/run/sandy/inputs/<name>`.
     pub guest_path: Option<PathBuf>,
+    /// A trusted absolute directory ``host`` lies beneath (#618, #607). `None` keeps today's behaviour: the path is
+    /// opened as given and its parent directories resolve as the OS resolves them. `Some`: the root opens as the OS
+    /// resolves it, and every component of the path below it is opened without following a link, so a parent
+    /// directory swapped for a symlink is refused. The path must be under the root with no `..` below it.
+    pub root: Option<PathBuf>,
 }
 
 /// A writable output collected from the guest at teardown.
@@ -197,6 +202,11 @@ pub struct Output {
     pub name: Option<String>,
     /// The host path the subtree is collected to at teardown.
     pub dest: PathBuf,
+    /// A trusted absolute directory ``dest`` lies beneath (#618, #607). `None` keeps today's behaviour: the path is
+    /// opened as given and its parent directories resolve as the OS resolves them. `Some`: the root opens as the OS
+    /// resolves it, and every component of the path below it is opened without following a link, so a parent
+    /// directory swapped for a symlink is refused. The path must be under the root with no `..` below it.
+    pub root: Option<PathBuf>,
 }
 
 /// Where a secret's bytes come from. Secrets travel this channel only — never
@@ -216,6 +226,9 @@ pub struct SecretRef {
     pub name: String,
     /// The channel the bytes arrive on.
     pub source: SecretSource,
+    /// A trusted absolute directory a [`SecretSource::File`] path lies beneath (#618, #607), opened as for
+    /// [`Input::root`]. `None` keeps today's behaviour. Ignored for [`SecretSource::Fd`].
+    pub root: Option<PathBuf>,
 }
 
 /// nix-vm trust tokens the run is granted.

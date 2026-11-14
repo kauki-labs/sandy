@@ -831,6 +831,7 @@ mod tests {
         let local_outputs: Vec<sandy::Output> = declared(roots[0].path())
             .into_iter()
             .map(|(name, dest)| sandy::Output {
+                root: None,
                 name: name.map(str::to_owned),
                 dest,
             })
@@ -1283,6 +1284,7 @@ mod tests {
         let remote = tempfile::tempdir().context("remote dest")?;
 
         let local_outputs = [sandy::Output {
+            root: None,
             name: Some("report".to_owned()),
             dest: local.path().join("out.bin"),
         }];

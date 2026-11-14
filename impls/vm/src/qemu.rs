@@ -1415,10 +1415,12 @@ mod tests {
         std::fs::write(&secret_src, b"S")?;
         std::fs::set_permissions(&secret_src, std::fs::Permissions::from_mode(0o600))?;
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(secret_src),
         }];
         let inputs = [Input {
+            root: None,
             host: tmp.path().join("no-such-input"),
             name: "in".to_string(),
             guest_path: None,

@@ -241,6 +241,7 @@ fn to_run_inputs(inputs: &[sandy_executor_proto::Input]) -> Vec<Input> {
     inputs
         .iter()
         .map(|i| Input {
+            root: None,
             host: PathBuf::from(&i.host),
             name: i.name.clone(),
             guest_path: i.guest_path.as_deref().map(PathBuf::from),
@@ -253,6 +254,7 @@ fn to_run_outputs(outputs: &[sandy_executor_proto::Output]) -> Vec<Output> {
     outputs
         .iter()
         .map(|o| Output {
+            root: None,
             name: o.name.clone(),
             dest: PathBuf::from(&o.dest),
         })
@@ -267,6 +269,7 @@ fn to_run_secrets(secrets: &[sandy_executor_proto::SecretRef]) -> Vec<SecretRef>
     secrets
         .iter()
         .map(|s| SecretRef {
+            root: None,
             name: s.name.clone(),
             source: SecretSource::File(PathBuf::from(&s.host_path)),
         })
@@ -1857,6 +1860,42 @@ mod tests {
             "a trailing dot is not counted, as in the proxy"
         );
         Ok(())
+    }
+
+    /// #618: the root of a `Dispatch` path reaches the backend's own `Input`, `Output` and `SecretRef`, where the stage
+    /// opens the path beneath it. A path with no root has none.
+    #[test]
+    fn a_dispatch_root_reaches_the_backends_input_output_and_secret() {
+        let root = Some("/srv/a".to_owned());
+        let inputs = to_run_inputs(&[
+            sandy_executor_proto::Input {
+                root: root.clone(),
+                host: "/srv/a/in".to_owned(),
+                name: "in".to_owned(),
+                guest_path: None,
+            },
+            sandy_executor_proto::Input {
+                root: None,
+                host: "/srv/b/in".to_owned(),
+                name: "other".to_owned(),
+                guest_path: None,
+            },
+        ]);
+        let outputs = to_run_outputs(&[sandy_executor_proto::Output {
+            root: root.clone(),
+            name: None,
+            dest: "/srv/a/out".to_owned(),
+        }]);
+        let secrets = to_run_secrets(&[sandy_executor_proto::SecretRef {
+            root,
+            name: "TOKEN".to_owned(),
+            host_path: "/srv/a/token".to_owned(),
+        }]);
+
+        assert_eq!(inputs[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
+        assert_eq!(inputs[1].root, None);
+        assert_eq!(outputs[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
+        assert_eq!(secrets[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
     }
 
     /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.

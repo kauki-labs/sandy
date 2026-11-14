@@ -308,6 +308,7 @@ mod tests {
         let outputs_dir = run.path().join("outputs");
         let dest = run.path().join("collected");
         let outputs = [Output {
+            root: None,
             name: Some("result".to_string()),
             dest: dest.clone(),
         }];
@@ -338,6 +339,7 @@ mod tests {
         let secret = run.path().join("host-secret");
         fs::write(&secret, b"TOP-SECRET")?;
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest: dest.clone(),
         }];
@@ -367,6 +369,7 @@ mod tests {
         let dest = run.path().join("collected");
         std::os::unix::fs::symlink(&victim, &dest)?;
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest,
         }];
@@ -390,6 +393,7 @@ mod tests {
         let dest = run.path().join("out.txt");
         std::os::unix::fs::symlink(&victim, &dest)?;
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest,
         }];
@@ -416,6 +420,7 @@ mod tests {
         fs::create_dir(&dest)?;
         std::os::unix::fs::symlink(&victim, dest.join("sub"))?;
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest,
         }];
@@ -441,6 +446,7 @@ mod tests {
         let linked = run.path().join("linked");
         std::os::unix::fs::symlink(&real, &linked)?;
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest: linked.join("collected"),
         }];
@@ -450,6 +456,49 @@ mod tests {
         collect_outputs(&outputs, &outputs_dir, false)?;
 
         assert_eq!(fs::read(real.join("collected").join("f"))?, b"produced");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the stage collects into the outside directory. With a root it walks `sub` without following a link,
+    /// refuses, and writes nothing outside.
+    #[test]
+    fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let run = tempfile::TempDir::new()?;
+        let outside = tempfile::TempDir::new()?;
+        let root = tempfile::TempDir::new()?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub"))?;
+        let dest = root.path().join("sub").join("collected");
+        // The same destination either way: only the root differs.
+        let outputs = |root: Option<&Path>| {
+            [Output {
+                root: root.map(Path::to_path_buf),
+                name: Some("o".to_string()),
+                dest: dest.clone(),
+            }]
+        };
+
+        let unrooted_dir = run.path().join("unrooted");
+        prepare_outputs(&outputs(None), &unrooted_dir)?;
+        fs::write(unrooted_dir.join("o").join("f"), b"produced")?;
+        collect_outputs(&outputs(None), &unrooted_dir, false)?;
+        assert_eq!(
+            fs::read(outside.path().join("collected").join("f"))?,
+            b"produced",
+            "without a root the link is followed today"
+        );
+        fs::remove_dir_all(outside.path().join("collected"))?;
+
+        let rooted_dir = run.path().join("rooted");
+        prepare_outputs(&outputs(Some(root.path())), &rooted_dir)?;
+        fs::write(rooted_dir.join("o").join("f"), b"produced")?;
+        let err = collect_outputs(&outputs(Some(root.path())), &rooted_dir, false)
+            .expect_err("a parent directory swapped for a link must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            !outside.path().join("collected").exists(),
+            "nothing may be written outside the root"
+        );
         Ok(())
     }
 
@@ -483,6 +532,7 @@ mod tests {
         let run = tempfile::TempDir::new()?;
         let outputs_dir = run.path().join("outputs");
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest: run.path().join("collected"),
         }];
@@ -505,6 +555,7 @@ mod tests {
         let named_dest = run.path().join("named");
         let loose_dest = run.path().join("loose");
         let named = [Output {
+            root: None,
             name: Some("result".to_string()),
             dest: named_dest.clone(),
         }];
@@ -525,6 +576,7 @@ mod tests {
         assert_eq!(fs::read(named_dest.join("f"))?, b"hello");
 
         let catch_all = [Output {
+            root: None,
             name: None,
             dest: loose_dest,
         }];
@@ -546,6 +598,7 @@ mod tests {
         let outputs_dir = run.path().join("outputs");
         let dest = run.path().join("collected");
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest: dest.clone(),
         }];
@@ -573,6 +626,7 @@ mod tests {
         let run = tempfile::TempDir::new()?;
         let outputs_dir = run.path().join("outputs");
         let outputs = [Output {
+            root: None,
             name: Some("o".to_string()),
             dest: run.path().join("collected"),
         }];
@@ -611,6 +665,7 @@ mod tests {
         let outputs_dir = run.path().join("outputs");
         let dest = run.path().join("collected");
         let outputs = [Output {
+            root: None,
             name: None,
             dest: dest.clone(),
         }];
@@ -635,6 +690,7 @@ mod tests {
         let run = tempfile::TempDir::new().expect("tempdir");
         for bad in ["../escape", "a/b", "..", "."] {
             let outputs = [Output {
+                root: None,
                 name: Some(bad.to_string()),
                 dest: run.path().join("d"),
             }];

@@ -229,11 +229,13 @@ mod tests {
         let inputs_dir = out.path().join("inputs");
         let inputs = [
             Input {
+                root: None,
                 host: src.path().join("f.txt"),
                 name: "file".to_string(),
                 guest_path: None,
             },
             Input {
+                root: None,
                 host: src.path().join("tree"),
                 name: "dir".to_string(),
                 guest_path: None,
@@ -270,6 +272,7 @@ mod tests {
         let out = tempfile::TempDir::new()?;
         let inputs_dir = out.path().join("inputs");
         let inputs = [Input {
+            root: None,
             host: tree,
             name: "dir".to_string(),
             guest_path: None,
@@ -301,6 +304,7 @@ mod tests {
         let out = tempfile::TempDir::new()?;
         let inputs_dir = out.path().join("inputs");
         let inputs = [Input {
+            root: None,
             host: link,
             name: "in".to_string(),
             guest_path: None,
@@ -310,6 +314,41 @@ mod tests {
 
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!inputs_dir.join("in").exists(), "nothing of the target is staged");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the stage follows it and stages the outside file. With a root it walks `sub` without following a link
+    /// and refuses, staging nothing.
+    #[test]
+    fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let outside = tempfile::TempDir::new()?;
+        fs::write(outside.path().join("f"), b"outside bytes")?;
+        let root = tempfile::TempDir::new()?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sub"))?;
+        let host = root.path().join("sub").join("f");
+        // The same host path either way: only the root differs.
+        let input = |root: Option<&Path>| Input {
+            root: root.map(Path::to_path_buf),
+            host: host.clone(),
+            name: "in".to_string(),
+            guest_path: None,
+        };
+
+        let unrooted = tempfile::TempDir::new()?;
+        stage_inputs(&[input(None)], &unrooted.path().join("inputs"))?;
+        assert_eq!(
+            fs::read(unrooted.path().join("inputs").join("in"))?,
+            b"outside bytes",
+            "without a root the link is followed today"
+        );
+
+        let rooted = tempfile::TempDir::new()?;
+        let inputs_dir = rooted.path().join("inputs");
+        let err = stage_inputs(&[input(Some(root.path()))], &inputs_dir)
+            .expect_err("a parent directory swapped for a link must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!inputs_dir.join("in").exists(), "nothing of the outside file is staged");
         Ok(())
     }
 
@@ -330,11 +369,13 @@ mod tests {
         let inputs_dir = out.path().join("inputs");
         let inputs = [
             Input {
+                root: None,
                 host: a,
                 name: "x".to_string(),
                 guest_path: None,
             },
             Input {
+                root: None,
                 host: b,
                 name: "x".to_string(),
                 guest_path: None,
@@ -367,6 +408,7 @@ mod tests {
             let out = tempfile::TempDir::new()?;
             let inputs_dir = out.path().join("inputs");
             let inputs = [Input {
+                root: None,
                 host,
                 name: "in".to_string(),
                 guest_path: None,
@@ -397,11 +439,13 @@ mod tests {
         let inputs_dir = out.path().join("inputs");
         let inputs = [
             Input {
+                root: None,
                 host: src.path().join("d"),
                 name: "in0".to_string(),
                 guest_path: Some(std::path::PathBuf::from("/workspace/data")),
             },
             Input {
+                root: None,
                 host: src.path().join("d"),
                 name: "plain".to_string(),
                 guest_path: None,
@@ -441,11 +485,13 @@ mod tests {
         let inputs_dir = out.path().join("inputs");
         let inputs = [
             Input {
+                root: None,
                 host: src.path().join("f"),
                 name: "file".to_string(),
                 guest_path: Some(std::path::PathBuf::from("/w/f")),
             },
             Input {
+                root: None,
                 host: src.path().join("tree"),
                 name: "dir".to_string(),
                 guest_path: None,
@@ -478,6 +524,7 @@ mod tests {
         fs::create_dir_all(inputs_dir.join("d"))?;
         std::os::unix::fs::symlink("/etc/hostname", inputs_dir.join("d").join("link"))?;
         let inputs = [Input {
+            root: None,
             host: out.path().to_path_buf(),
             name: "d".to_string(),
             guest_path: None,
@@ -504,6 +551,7 @@ mod tests {
         fs::write(&host, b"x")?;
         let out = tempfile::TempDir::new()?;
         let inputs = [Input {
+            root: None,
             host,
             name: INPUT_MANIFEST_NAME.to_string(),
             guest_path: None,
@@ -533,6 +581,7 @@ mod tests {
         let out = tempfile::TempDir::new()?;
         for bad in ["../escape", "a/b", "..", "."] {
             let inputs = [Input {
+                root: None,
                 host: host.clone(),
                 name: bad.to_string(),
                 guest_path: None,

@@ -207,6 +207,7 @@ mod tests {
         let inst_dir = tmp.path().join("inst");
         for bad in ["BAD-NAME", "a b", "../escape", "1LEADING", ""] {
             let secrets = [SecretRef {
+                root: None,
                 name: bad.to_string(),
                 source: SecretSource::File(src.clone()),
             }];
@@ -227,6 +228,7 @@ mod tests {
         let src = secret_source(tmp.path(), b"s3cr3t-marker")?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -262,6 +264,7 @@ mod tests {
         std::fs::write(&victim, b"untouched")?;
         std::os::unix::fs::symlink(&victim, inst_dir.join("TOK.tmp"))?;
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -288,6 +291,7 @@ mod tests {
         let src = secret_source(tmp.path(), marker.as_bytes())?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -320,6 +324,7 @@ mod tests {
 
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(link),
         }];
@@ -330,6 +335,52 @@ mod tests {
             "expected a named Spawn error, got {err:?}"
         );
         assert!(!inst_dir.join("TOK").exists(), "a rejected symlink must not be staged");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the stage follows it and stages the outside `0600` file. With a root it walks `sub` without following
+    /// a link and refuses, staging nothing.
+    #[test]
+    fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new()?;
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        let host_file = outside.join("key");
+        std::fs::write(&host_file, b"outside-secret")?;
+        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o600))?;
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::os::unix::fs::symlink(&outside, root.join("sub"))?;
+        let through_link = root.join("sub").join("key");
+        // The same source path either way: only the root differs.
+        let secret = |root: Option<&Path>| {
+            [SecretRef {
+                root: root.map(Path::to_path_buf),
+                name: "TOK".to_string(),
+                source: SecretSource::File(through_link.clone()),
+            }]
+        };
+
+        let unrooted_dir = tmp.path().join("unrooted");
+        stage_secrets(&secret(None), &owned(&unrooted_dir)?)?;
+        assert_eq!(
+            std::fs::read(unrooted_dir.join("TOK"))?,
+            b"outside-secret",
+            "without a root the link is followed today"
+        );
+
+        let rooted_dir = tmp.path().join("rooted");
+        let err = stage_secrets(&secret(Some(&root)), &owned(&rooted_dir)?)
+            .expect_err("a parent directory swapped for a link must be refused");
+        assert!(
+            matches!(err, BackendError::Spawn(_)),
+            "expected a Spawn error, got {err:?}"
+        );
+        assert!(
+            !rooted_dir.join("TOK").exists(),
+            "nothing of the outside file is staged"
+        );
         Ok(())
     }
 
@@ -347,6 +398,7 @@ mod tests {
 
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(fifo),
         }];
@@ -370,6 +422,7 @@ mod tests {
         std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644))?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];
@@ -391,6 +444,7 @@ mod tests {
         let src = secret_source(tmp.path(), b"marker")?;
         let inst_dir = tmp.path().join("inst");
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(src),
         }];

@@ -404,6 +404,7 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
 
     let executor = VirtualizationBackendExecutor::new(ProcessBackend::new());
     let secrets = [SecretRef {
+        root: None,
         name: "TOKEN".to_owned(),
         source: SecretSource::File(secret_file),
     }];

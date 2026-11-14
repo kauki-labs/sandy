@@ -188,6 +188,7 @@ where
     let inputs = inputs
         .iter()
         .map(|input| Input {
+            root: None,
             host: root.path().join(&input.name),
             name: input.name.clone(),
             guest_path: input.guest_path.as_deref().map(std::path::PathBuf::from),
