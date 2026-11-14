@@ -6,6 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The most rules a daemon-submitted policy may carry (#819). `sandyd` refuses a Submit over it and the executor
+/// refuses a Dispatch over it. The proxy bounds a name's length and labels but not the rule count.
+pub const MAX_EGRESS_RULES: usize = 256;
+
+/// The longest host, in bytes, a daemon-submitted rule may name (#819): the proxy's own limit on a name, measured
+/// after it strips one trailing dot. `sandyd` and the executor measure the same way.
+pub const MAX_EGRESS_HOST_LEN: usize = 253;
+
 /// One permitted egress destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressRule {
