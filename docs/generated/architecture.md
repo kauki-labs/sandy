@@ -174,7 +174,7 @@ flowchart LR
   rpc["control RPC<br/>Submit, Cancel, Attach, Status, List"] --> handler["handler<br/>validate, refuse at Submit"]
   handler -->|"Submit refusals:<br/>name rules, process-kind policy,<br/>caps, placement"| refuse["refused, no row"]
   handler --> store[("JobStore<br/>Pending before boot (INV-6)")]
-  store --> dispatch["dispatch<br/>pick_host_for by isolation class"]
+  store --> dispatch["dispatch<br/>pick_host_egress by isolation class"]
   dispatch --> reg["HostRegistry<br/>declared capabilities"]
   dispatch -->|mesh Dispatch| hexec["host-executor"]
   hexec -->|agent link + bearer token| accept["mesh_accept<br/>token bound to executor IP"]
