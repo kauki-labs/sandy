@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn vm_backend_executor_satisfies_the_executor_contract() -> anyhow::Result<()> {
+    async fn virtualization_backend_executor_satisfies_the_executor_contract() -> anyhow::Result<()> {
         executor_suite(expected_caps(), "contract", || {
             VirtualizationBackendExecutor::new(ProcessBackend::new())
         })
