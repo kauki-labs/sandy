@@ -23,7 +23,7 @@ pub use beneath::{Beneath, Entries, EntryKind, FileId};
 pub use secret::{OwnedDir, private_staging_dir};
 pub use staging::{
     STAGING_DIR_NAME, STALE_STAGING_PREFIXES, ensure_sandy_staging_base, ensure_staging_base_in,
-    sweep_stale_staging_dirs,
+    sweep_stale_staging_dirs, sweep_stale_staging_dirs_except,
 };
 
 /// The current process's real uid, for a receipt's `who.identity` on a direct

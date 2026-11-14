@@ -1536,8 +1536,7 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   with it. The report is `gc`'s (`evicted`, `swept_staging_dirs`), so promoting the verb to `gc` changes no format. Prune
   is an operator verb over the 0700 socket, the same trust as `list`; it needs no attach token because it touches no
   running job. A credential provider configured with another staging base is not swept. A deleted row takes its
-  archive transcript with it. A credentialed job that runs past `MAX_TTL_SECS` can lose its `cred-*` dir to a prune
-  (#834). The sweep creates the staging base if it is absent (`ensure_sandy_staging_base`).
+  archive transcript with it. The sweep keeps the `cred-*` dir of a pending or running job (by the store's credential record) however old it is, and sweeps it once the job is terminal (#834). A dir no job record owns keeps the mtime rule. A store that cannot answer sweeps nothing. The sweep creates the staging base if it is absent (`ensure_sandy_staging_base`).
 
 **Consequences.** `decode_argv_manifest` and `decode_flake_dispatch_manifest`
 both grow a richer return type but stay two functions, not one — P3's

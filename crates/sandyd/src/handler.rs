@@ -1372,10 +1372,11 @@ pub async fn handle(
                 .collect(),
         }),
         Some(control_request::Op::Prune(prune)) => {
-            let store = Arc::clone(store);
             let keep_last = usize::try_from(prune.keep_last).unwrap_or(usize::MAX);
-            let evicted = tokio::task::spawn_blocking(move || store.prune_terminal(keep_last)).await??;
-            let swept_staging_dirs = tokio::task::spawn_blocking(sweep_stale_staging_dirs).await?;
+            let evicting = Arc::clone(store);
+            let evicted = tokio::task::spawn_blocking(move || evicting.prune_terminal(keep_last)).await??;
+            let store = Arc::clone(store);
+            let swept_staging_dirs = tokio::task::spawn_blocking(move || sweep_stale_staging_dirs(&store)).await?;
             tracing::info!(
                 evicted = evicted.len(),
                 swept = swept_staging_dirs.len(),
@@ -1411,19 +1412,35 @@ pub async fn handle(
     })
 }
 
+/// The `cred-*` dirs of jobs that are still live (pending or running), by the credential records in `store` (#834).
+/// Nothing refreshes such a dir's mtime, so the sweep asks the store instead.
+fn live_cred_dirs(store: &JobStore) -> Result<std::collections::HashSet<std::path::PathBuf>, StoreError> {
+    let mut live = std::collections::HashSet::new();
+    for (job_id, record) in store.credential_records()? {
+        if matches!(store.status(&job_id)?, Some(JobStatus::Pending | JobStatus::Running))
+            && let Some(dir) = record.token_path.parent()
+        {
+            live.insert(dir.to_owned());
+        }
+    }
+    Ok(live)
+}
+
 /// Remove the stale `cred-*` and `verify-*` dirs under the sandy staging base, the sweep `sandy gc` runs (#195). A dir
-/// younger than the longest credential TTL is never touched. Best effort: a failure is logged and sweeps nothing.
-fn sweep_stale_staging_dirs() -> Vec<String> {
-    let swept = sandy_fsutil::ensure_sandy_staging_base()
+/// younger than the longest credential TTL is never touched, nor is the dir of a live job whatever its age (#834). A
+/// dir no job record owns keeps the mtime rule. Best effort: a failure is logged and sweeps nothing, and a store that
+/// cannot say which jobs are live sweeps nothing (fail closed).
+fn sweep_stale_staging_dirs(store: &JobStore) -> Vec<String> {
+    let swept = live_cred_dirs(store).map_err(|e| e.to_string()).and_then(|live| {
+        let base = sandy_fsutil::ensure_sandy_staging_base().map_err(|e| e.to_string())?;
+        sandy_fsutil::sweep_stale_staging_dirs_except(
+            &base,
+            sandy_fsutil::STALE_STAGING_PREFIXES,
+            std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
+            |dir| live.contains(dir),
+        )
         .map_err(|e| e.to_string())
-        .and_then(|base| {
-            sandy_fsutil::sweep_stale_staging_dirs(
-                &base,
-                sandy_fsutil::STALE_STAGING_PREFIXES,
-                std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS)),
-            )
-            .map_err(|e| e.to_string())
-        });
+    });
     swept.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "prune: could not sweep stale credential staging dirs");
         Vec::new()
