@@ -1814,26 +1814,40 @@ mod tests {
         }
     }
 
-    /// #819: the executor re-checks the bounds `sandyd` applies at Submit (256 rules, 253-byte host), inclusive.
+    /// A DNS name of 253 bytes whose labels the proxy accepts: three 63-byte labels and one of 61 bytes.
+    fn valid_253_byte_host() -> String {
+        let label = "a".repeat(63);
+        format!("{label}.{label}.{label}.{}", "a".repeat(61))
+    }
+
+    /// #819: the executor re-checks the rule-count bound `sandyd` applies at Submit (256 rules), inclusive.
     #[test]
-    fn an_oversized_egress_policy_is_refused_by_the_executor_too() -> anyhow::Result<()> {
-        let long_host = "a".repeat(254);
-        let at_limit_host = "a".repeat(253);
-        let many = vec![("example.com", 443u32); 257];
-        let too_long = vec![(long_host.as_str(), 443u32)];
-        for (name, rules) in [("257 rules", many), ("254-byte host", too_long)] {
-            assert!(
-                matches!(
-                    allow_list_from_policy(Some(&policy(&rules))),
-                    Err(DispatchError::EgressPolicyInvalid(_))
-                ),
-                "{name}"
-            );
-        }
-        let at_limit = vec![(at_limit_host.as_str(), 443u32); 256];
+    fn an_egress_policy_over_the_rule_count_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let over = vec![("example.com", 443u32); 257];
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&over))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![("example.com", 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        Ok(())
+    }
+
+    /// #819: the executor re-checks the host bound (253 bytes, as the proxy measures: one trailing dot is stripped).
+    #[test]
+    fn an_egress_host_over_the_length_bound_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let host = valid_253_byte_host();
+        let over = format!("a{host}");
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&[(over.as_str(), 443u32)]))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![(host.as_str(), 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        let dotted = format!("{host}.");
         assert!(
-            allow_list_from_policy(Some(&policy(&at_limit)))?.is_some(),
-            "a policy at the bounds is accepted"
+            allow_list_from_policy(Some(&policy(&[(dotted.as_str(), 443u32)])))?.is_some(),
+            "a trailing dot is not counted, as in the proxy"
         );
         Ok(())
     }
