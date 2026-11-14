@@ -272,13 +272,30 @@ mod tests {
         let (client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
         let host_registry = Arc::new(HostRegistry::default());
+        // A Submit with no capable host is refused (#868), so register a trusted process host first.
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let fingerprint = sandy_conn::Fingerprint::from_hex(&"aa".repeat(32)).context("fingerprint literal")?;
+        let _registration = host_registry
+            .register(
+                &host_registry::ExecutorAllowlist::new([(peer_ip, fingerprint)]),
+                peer_ip,
+                fingerprint,
+                "test-host".to_owned(),
+                sandy_executor_proto::Capabilities {
+                    supported_sandbox_kinds: vec![sandy_executor_proto::SandboxKind::Process.into()],
+                    arch: sandy_executor_proto::Arch::X8664.into(),
+                    supported_isolation_classes: vec![sandy_executor_proto::IsolationClass::Trusted.into()],
+                    ..sandy_executor_proto::Capabilities::default()
+                },
+            )
+            .context("register a test host")?;
         let serving = tokio::spawn(serve_connection(
             server,
             store,
             Arc::new(EnvironmentStore::open_in_memory()?),
             registry,
             host_registry,
-            None,
+            Some("100.64.0.1:9000".parse().context("forward_back literal")?),
         ));
 
         let mut client = client;

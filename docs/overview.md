@@ -80,8 +80,8 @@ The macOS orchestrator (`sandyd`) places a job on a registered remote NixOS host
 (the remote host) when an agent-link listener address is configured and
 `HostRegistry::pick_host_for` finds a host whose declared backends satisfy the
 job's required isolation class. For an `argv/v1` (trusted-process) submission,
-absent either condition the job is accepted and stays `Pending` — nothing
-dispatches it, an honest, tracked gap (#292), not a local fallback; a placed
+absent either condition the `Submit` is refused with a named reason and no
+row is written (#868), not a local fallback; a placed
 trusted-process job runs in a `bwrap` sandbox under `systemd-run --user` with
 `sandy-agent` inside, and links the agent back to the orchestrator over the
 mesh.
@@ -93,7 +93,7 @@ a `flake/v1` manifest to a host that declares `SandboxKind::Vm` (#332), and the
 host-executor boots it there via `QemuBackend`, the same guest-boot path `sandy
 run --flake` uses locally. `Capabilities` is a SET of declared sandbox kinds
 per host-executor process, so one host can serve both `Process` and `Vm`
-dispatches at once. Unlike `argv/v1`, a `flake/v1` submission has no local
+dispatches at once. Like `argv/v1`, a `flake/v1` submission has no local
 fallback: if no remote is configured or no registered host declares `Vm`, it
 is refused outright at `Submit` time (named reason, no silent hang), never
 left silently `Pending`. The code path is built and host-executor-side

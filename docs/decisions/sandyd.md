@@ -939,11 +939,10 @@ happy path).
   disconnected in the narrow window between being picked and the send) fails
   the job terminally rather than leaving it silently `Pending` forever (see
   the "Closed" paragraph below for the full history of that fix). No host
-  picked means the job stays local only for a `Process`-required job
-  (including none registered, or none configured — today's unchanged
-  behavior); a `flake/v1` (VM-required) job with no host picked is refused
-  at `Submit` instead (`vm_placement_error`), before the job is ever
-  persisted — it never silently falls back to local.
+  picked (including none registered, or none configured) refuses the
+  `Submit` before the job is ever persisted, for every job since #868
+  (a `Process`-required job used to stay local, then `Pending`); it never
+  silently falls back to local.
 - **Superseded by #381.** Stage-1 originally placed every job against a
   hardcoded `STAGE1_REQUIRED_ISOLATION_CLASS = IsolationClass::Trusted`
   constant, since nothing on the submit path could express an isolation
@@ -1344,12 +1343,16 @@ to_wire_capabilities` is the one place that builds the wire SET, by
   strict subset of.
 - A `flake/v1` submit that cannot be placed (no `forward_back_addr`
   configured, or no registered host declares `Vm`) is refused OUTRIGHT at
-  `Submit` time, before any side effect — unlike `argv/v1`'s pre-existing
-  "no registered host → silently stays `Pending` forever" gap (decision 15's
-  own accepted, honest limitation, left unchanged here), a VM job has NO
-  local execution fallback in this daemon at all, so silently accepting one
-  would create a job that can never run, with no distinct status a caller
-  could ever notice.
+  `Submit` time, before any side effect, because a VM job has NO local
+  execution fallback in this daemon at all, so silently accepting one would
+  create a job that can never run, with no distinct status a caller could
+  ever notice. Since #868 the same refusal covers `argv/v1`: a Submit with no
+  capable host (or no `forward_back_addr`) returns a `ControlError` naming the
+  cause and writes no row. Decision 15's earlier "silently stays `Pending`
+  forever" gap is closed for Submit time. A job accepted while a capable host
+  was registered, which then loses it, still stays `Pending` until a host
+  returns or the daemon restarts (restart recovery fails it); a placement
+  deadline for that case is a follow-up.
 
 **Consequences.** `handle_dispatch` (sandy-host-executor) gained a
 `SandboxKind::Vm` branch decoding a `flake/v1` manifest
@@ -1739,9 +1742,8 @@ check on #496 found this path does not exist: `crates/sandyd` has no
 `ProcessBackend`/`RunSpec`/`backend.run` anywhere. Every job, with or
 without a registered host, dispatches through `HostRegistry::pick_host_for`
 and a host-executor's `Dispatch`; a Submit with no placeable host (decision
-15/#381, `handler.rs`) just leaves the job `Pending` forever (the
-pre-existing, documented "argv/v1 with no registered host" gap) — it is
-never run in-process by `sandyd`. Nothing in the registration data model
+15/#381, `handler.rs`) was left `Pending` forever when this was written and is
+refused at Submit since #868 — it is never run in-process by `sandyd`. Nothing in the registration data model
 (`sandy_executor_proto::Capabilities`, `HostRegistry`) distinguishes a
 host-executor that happens to share the submitter's filesystem from a
 genuinely remote one.
