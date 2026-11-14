@@ -45,7 +45,7 @@ def generated(project: Path) -> tuple[str, str]:
     )
 
 
-class RenderTest(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -60,6 +60,8 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return generated(project)
 
+
+class RenderTest(Base):
     def test_renders_a_diagram_with_title_paragraph_and_source(self) -> None:
         md, html = self.render(
             {"overview.md": FM + "# Overview\n\n## The pipeline\n\nJobs run in a VM.\nSecond line.\n\n" + MERMAID}
@@ -221,6 +223,120 @@ class RenderTest(unittest.TestCase):
         result = run(project, "--check")
         self.assertEqual(result.returncode, 1)
         self.assertIn("render_docs.py", result.stdout + result.stderr)
+
+
+class ReviewFixesTest(Base):
+    """Behaviour pinned after the independent review of the first version."""
+
+    def test_notice_has_no_markdown_emphasis_sequences(self) -> None:
+        md, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        notice = next(line for line in md.split("\n") if line.startswith("> Generated"))
+        self.assertNotIn("**", notice)
+        html_notice = next(line for line in html.split("\n") if 'class="notice"' in line)
+        self.assertNotIn("**", html_notice)
+
+    def test_links_in_paragraph_and_titles_become_plain_text(self) -> None:
+        doc = "## See [the spec](spec.md#x) [b]\n\nRead [the spec](spec.md#x) and `[code](y)` now.\n\n" + MERMAID
+        md, html = self.render({"overview.md": FM + doc})
+        self.assertIn("Read the spec and `[code](y)` now.", md)
+        self.assertNotIn("](spec.md", md)
+        self.assertNotIn("](spec.md", html)
+        self.assertNotIn("[the spec]", html)
+        toc_line = next(line for line in md.split("\n") if line.startswith("  - ["))
+        self.assertNotIn("](spec.md", toc_line)
+        self.assertEqual(toc_line.count("]("), 1)
+
+    def test_tab_or_deep_indented_fence_is_not_a_diagram_outside_lists(self) -> None:
+        doc = "## A\n\n\t```mermaid\n\tTAB --> X\n\t```\n\n    ```mermaid\n    DEEP --> X\n    ```\n\n" + MERMAID
+        md, _ = self.render({"overview.md": FM + doc})
+        self.assertEqual(md.count("```mermaid"), 1)
+        self.assertNotIn("TAB", md)
+        self.assertNotIn("DEEP", md)
+
+    def test_deep_indented_fence_inside_a_list_item_is_a_diagram(self) -> None:
+        doc = "## A\n\n1. step\n\n    ```mermaid\n    LISTED --> X\n    ```\n"
+        md, _ = self.render({"overview.md": FM + doc})
+        self.assertIn("LISTED --> X", md)
+
+    def test_setext_headings_give_title_and_anchor(self) -> None:
+        doc = (
+            "Setext Title\n============\n\nIntro text.\n\n" + MERMAID + "\n"
+            "Sub heading\n-----------\n\n" + MERMAID + "\n"
+            "Sub heading\n---\n\n" + MERMAID + "\n"
+            "para\n\n---\n\n" + MERMAID
+        )
+        md, _ = self.render({"x.md": doc})
+        self.assertIn("### Setext Title", md)
+        self.assertIn("Intro text.", md)
+        self.assertIn("](../x.md#setext-title)", md)
+        self.assertIn("](../x.md#sub-heading)", md)
+        self.assertIn("](../x.md#sub-heading-1)", md)
+        # a rule after a blank line is not a heading: the last diagram stays under "Sub heading"
+        self.assertEqual(md.count("### Sub heading"), 3)
+
+    def test_underscore_emphasis_is_stripped_from_anchor(self) -> None:
+        doc = "## Using _foo_ now\n\n" + MERMAID + "\n## The snake_case_name and **bold**\n\n" + MERMAID
+        md, _ = self.render({"overview.md": FM + doc})
+        self.assertIn("](../overview.md#using-foo-now)", md)
+        self.assertIn("](../overview.md#the-snake_case_name-and-bold)", md)
+
+    def test_invalid_utf8_exits_2_naming_the_file(self) -> None:
+        project = self.project({"overview.md": FM + "## A\n\n" + MERMAID})
+        (project / "docs" / "bad.md").write_bytes(b"## Bad\n\xff\xfe\n")
+        result = run(project)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("docs/bad.md", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_bom_does_not_defeat_front_matter(self) -> None:
+        project = self.project({"overview.md": FM + "## A\n\n" + MERMAID})
+        path = project / "docs" / "overview.md"
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+        self.assertEqual(run(project).returncode, 0)
+        md, _ = generated(project)
+        self.assertIn("# demo architecture", md)
+        self.assertNotIn("### t\n", md)
+
+    def test_fence_info_word_is_case_insensitive(self) -> None:
+        md, _ = self.render({"overview.md": FM + "## A\n\n```Mermaid\nflowchart LR\n  CASE --> X\n```\n"})
+        self.assertIn("CASE --> X", md)
+
+    def test_mermaid_script_carries_integrity_and_crossorigin(self) -> None:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        tag = re.search(r"<script src=[^>]*>", html)
+        assert tag is not None
+        self.assertRegex(tag.group(0), r'integrity="sha384-[A-Za-z0-9+/]{64}"')
+        self.assertIn('crossorigin="anonymous"', tag.group(0))
+
+    def test_crlf_input_renders_like_lf(self) -> None:
+        lf = {"overview.md": FM + "## A\n\ntext\n\n" + MERMAID}
+        crlf = {"overview.md": lf["overview.md"].replace("\n", "\r\n")}
+        self.assertEqual(self.render(lf), generated_after(self, crlf))
+
+    def test_missing_docs_directory_exits_2(self) -> None:
+        empty = self.root / "empty"
+        empty.mkdir()
+        self.assertEqual(run(empty).returncode, 2)
+
+    def test_docs_without_any_mermaid_still_render(self) -> None:
+        md, html = self.render({"overview.md": FM + "## A\n\nno diagram\n"})
+        self.assertIn("No mermaid diagrams", md)
+        self.assertIn("No mermaid diagrams", html)
+        self.assertTrue(html.startswith("<!doctype html>"))
+
+    def test_script_inside_diagram_source_is_escaped_in_details(self) -> None:
+        diagram = MERMAID.replace("A --> B", 'A --> B["<script>alert(3)</script>"]')
+        _, html = self.render({"overview.md": FM + "## A\n\n" + diagram})
+        details = html.split("<details>", 1)[1].split("</details>", 1)[0]
+        self.assertNotIn("<script>", details)
+        self.assertIn("&lt;script&gt;alert(3)", details)
+
+
+def generated_after(case: unittest.TestCase, docs: dict[str, str]) -> tuple[str, str]:
+    project = make_project(case.root / "second", docs)  # type: ignore[attr-defined]
+    result = run(project)
+    case.assertEqual(result.returncode, 0, result.stderr)
+    return generated(project)
 
 
 if __name__ == "__main__":

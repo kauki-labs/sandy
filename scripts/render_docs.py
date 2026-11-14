@@ -40,7 +40,10 @@ from pathlib import Path
 GENERATED_DIR = "generated"
 MD_NAME = "architecture.md"
 HTML_NAME = "index.html"
+# The SRI hash below belongs to exactly this version: update both together
+# (curl the file, then `openssl dgst -sha384 -binary | openssl base64 -A`).
 MERMAID_SRC = "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"
+MERMAID_SRI = "sha384-rbtjAdnIQE/aQJGEgXrVUlMibdfTSa4PQju4HDhN3sR2PmaKFzhEafuePsl9H/9I"
 PARAGRAPH_MAX = 400
 REGEN_HINT = "python3 scripts/render_docs.py"
 
@@ -57,7 +60,11 @@ HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*$")
 HEADING_CLOSE_RE = re.compile(r"\s+#+$")
 SENTENCE_END_RE = re.compile(r"[.!?](?=\s)")
 BLOCK_START_RE = re.compile(r"^(\||[-*+]\s|\d+[.)]\s|>|<)")
-LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+CODE_SPLIT_RE = re.compile(r"(`[^`]*`)")
+SETEXT_RE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+LIST_ITEM_RE = re.compile(r"^\s*([-*+]|\d+[.)])\s")
+UNDERSCORE_EMPH_RE = re.compile(r"(?<!\w)(_{1,3})(?=\S)(.+?)(?<=\S)\1(?!\w)")
 TAG_RE = re.compile(r"<[^>]+>")
 NON_ANCHOR_RE = re.compile(r"[^\w\- ]")
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
@@ -83,8 +90,19 @@ class SourceDoc:
 
 def slug(text: str) -> str:
     """GitHub heading anchor: lowercase, drop punctuation except hyphens, spaces to hyphens."""
-    text = TAG_RE.sub("", LINK_RE.sub(r"\1", text))
+    text = UNDERSCORE_EMPH_RE.sub(r"\2", TAG_RE.sub("", LINK_RE.sub(r"\1", text)))
     return NON_ANCHOR_RE.sub("", text.lower()).replace(" ", "-")
+
+
+def strip_links(text: str) -> str:
+    """Links (and images) become their text; inline code spans stay verbatim.
+
+    Relative link targets would point nowhere from docs/generated/, and a link in
+    a title would nest inside the table-of-contents link.
+    """
+    return "".join(
+        part if i % 2 else LINK_RE.sub(r"\1", part) for i, part in enumerate(CODE_SPLIT_RE.split(text))
+    )
 
 
 class Anchors:
@@ -115,6 +133,9 @@ def parse_doc(rel: str, text: str) -> SourceDoc:
 
     Fences follow CommonMark: a fence closes only on the same character, at least as
     long as the opener, so a mermaid fence inside a longer or different fence is text.
+    An opener may be indented at most 3 spaces (a tab counts as 4), except inside a
+    list item, where deeper indentation is the item's content. Headings are ATX
+    (`## x`) or setext (text over `===` or `---`); a `---` after a blank line is a rule.
     """
     lines = text.split("\n")
     start = 0
@@ -125,16 +146,26 @@ def parse_doc(rel: str, text: str) -> SourceDoc:
                 break
 
     kinds = ["text"] * len(lines)  # text | fence | heading
-    headings: list[tuple[int, str]] = []  # (line index, text)
-    blocks: list[tuple[int, int, str]] = []  # (open line, close line, dedented body)
+    headings: list[tuple[int, int, str]] = []  # (first line, last line, text)
+    blocks: list[tuple[int, str]] = []  # (open line, dedented body)
     fence: tuple[str, int, int, str] | None = None  # char, length, indent, info word
     open_at = 0
+    in_list = False
     for i in range(start, len(lines)):
         line = lines[i]
         if fence is None:
+            if line.strip():
+                if LIST_ITEM_RE.match(line):
+                    in_list = True
+                elif line[0] not in " \t":
+                    in_list = False
             m = FENCE_OPEN_RE.match(line)
-            if m and not (m.group(2)[0] == "`" and "`" in m.group(3)):
-                info = m.group(3).split(None, 1)[0] if m.group(3) else ""
+            if (
+                m
+                and not (m.group(2)[0] == "`" and "`" in m.group(3))
+                and (in_list or len(m.group(1).expandtabs(4)) <= 3)
+            ):
+                info = m.group(3).split(None, 1)[0].lower() if m.group(3) else ""
                 fence = (m.group(2)[0], len(m.group(2)), len(m.group(1)), info)
                 open_at = i
                 kinds[i] = "fence"
@@ -142,26 +173,37 @@ def parse_doc(rel: str, text: str) -> SourceDoc:
             h = HEADING_RE.match(line)
             if h:
                 kinds[i] = "heading"
-                headings.append((i, HEADING_CLOSE_RE.sub("", h.group(2)).strip()))
+                headings.append((i, i, HEADING_CLOSE_RE.sub("", h.group(2)).strip()))
+                continue
+            if SETEXT_RE.match(line) and i > start and kinds[i - 1] == "text" and lines[i - 1].strip():
+                first = i - 1
+                while first - 1 >= start and kinds[first - 1] == "text" and lines[first - 1].strip():
+                    first -= 1
+                if not BLOCK_START_RE.match(lines[first].strip()):
+                    for j in range(first, i + 1):
+                        kinds[j] = "heading"
+                    headings.append((first, i, " ".join(x.strip() for x in lines[first:i])))
             continue
         kinds[i] = "fence"
         char, length, indent, info = fence
         if re.match(rf"^\s*{re.escape(char)}{{{length},}}\s*$", line):
             if info == "mermaid":
                 body = "\n".join(_dedent(b, indent) for b in lines[open_at + 1 : i])
-                blocks.append((open_at, i, body))
+                blocks.append((open_at, body))
             fence = None
     if fence is not None and fence[3] == "mermaid":
         raise RenderError(f"docs/{rel}:{open_at + 1}: unterminated mermaid fence")
 
     anchors = Anchors()
-    heading_anchor = {i: anchors.add(t) for i, t in headings}
+    heading_anchor = {first: anchors.add(t) for first, _last, t in headings}
     diagrams = []
-    for open_line, _close, body in blocks:
-        prior = [(i, t) for i, t in headings if i < open_line]
+    for open_line, body in blocks:
+        prior = [h for h in headings if h[0] < open_line]
         if prior:
-            h_line, title = prior[-1]
-            diagrams.append(Diagram(title, heading_anchor[h_line], _first_paragraph(lines, kinds, h_line), body))
+            first, last, title = prior[-1]
+            diagrams.append(
+                Diagram(strip_links(title), heading_anchor[first], _first_paragraph(lines, kinds, last), body)
+            )
         else:
             diagrams.append(Diagram("Untitled diagram", None, "", body))
     return SourceDoc(rel, tuple(diagrams))
@@ -175,17 +217,19 @@ def _dedent(line: str, indent: int) -> str:
 def _first_paragraph(lines: list[str], kinds: list[str], heading_line: int) -> str:
     """First plain paragraph of the section under a heading, trimmed; "" if none.
 
-    Tables, lists, quotes and raw HTML are not prose and are skipped whole.
+    Tables, lists, quotes, indented code and raw HTML are not prose and are skipped whole.
     """
     i = heading_line + 1
     while i < len(lines) and kinds[i] != "heading":
         if kinds[i] == "text" and lines[i].strip():
+            start_line = lines[i]
             run = []
             while i < len(lines) and kinds[i] == "text" and lines[i].strip():
                 run.append(lines[i].strip())
                 i += 1
-            if not BLOCK_START_RE.match(run[0]):
-                return trim_paragraph(" ".join(run))
+            indented_code = start_line.expandtabs(4).startswith("    ")
+            if not indented_code and not BLOCK_START_RE.match(run[0]):
+                return trim_paragraph(strip_links(" ".join(run)))
             continue
         i += 1
     return ""
@@ -199,6 +243,14 @@ def doc_order(rels: list[str]) -> list[str]:
     ]
 
 
+def read_text(path: Path, label: str) -> str:
+    """UTF-8 (a BOM is dropped) with LF newlines; bad bytes are an input error."""
+    try:
+        return path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+    except UnicodeDecodeError as err:
+        raise RenderError(f"{label}: not valid UTF-8 ({err.reason} at byte {err.start})") from err
+
+
 def collect(project: Path) -> list[SourceDoc]:
     docs = project / "docs"
     if not docs.is_dir():
@@ -210,7 +262,7 @@ def collect(project: Path) -> list[SourceDoc]:
             rels.append(rel)
     out = []
     for rel in doc_order(rels):
-        text = (docs / rel).read_bytes().decode("utf-8").replace("\r\n", "\n")
+        text = read_text(docs / rel, f"docs/{rel}")
         doc = parse_doc(rel, text)
         if doc.diagrams:
             out.append(doc)
@@ -221,7 +273,7 @@ def project_name(project: Path) -> str:
     """`project:` from docs/overview.md frontmatter; else the directory name."""
     overview = project / "docs" / "overview.md"
     if overview.is_file():
-        lines = overview.read_bytes().decode("utf-8").split("\n")
+        lines = read_text(overview, "docs/overview.md").split("\n")
         if lines and lines[0].strip() == "---":
             for line in lines[1:]:
                 if line.strip() == "---":
@@ -243,7 +295,8 @@ def render_markdown(name: str, docs: list[SourceDoc]) -> str:
         toc.append(f"- [{path}](#{anchors.add(path)})")
         body.append(f"## {path}\n")
         for d in doc.diagrams:
-            toc.append(f"  - [{d.title}](#{anchors.add(d.title)})")
+            label = d.title.replace("[", "\\[").replace("]", "\\]")
+            toc.append(f"  - [{label}](#{anchors.add(d.title)})")
             body.append(f"### {d.title}\n")
             if d.paragraph:
                 body.append(f"{d.paragraph}\n")
@@ -252,7 +305,7 @@ def render_markdown(name: str, docs: list[SourceDoc]) -> str:
             body.append(f"Source: [{path}{frag}](../{doc.rel}{frag})\n")
     parts = [
         f"# {name} architecture\n",
-        f"> Generated by `scripts/render_docs.py`, do not edit. After changing a docs/**/*.md, run `{REGEN_HINT}` and commit `docs/generated/`.\n",
+        f"> Generated by `scripts/render_docs.py`, do not edit. After changing any markdown file under docs/, run `{REGEN_HINT}` and commit `docs/generated/`.\n",
         "## Contents\n",
         "\n".join(toc) + "\n" if toc else "No mermaid diagrams found under docs/.\n",
         *body,
@@ -353,7 +406,7 @@ def render_html(name: str, docs: list[SourceDoc]) -> str:
 <body>
 <main>
 <h1>{title}</h1>
-<p class="notice">Generated by <code>scripts/render_docs.py</code>, do not edit. After changing a docs/**/*.md, run <code>{REGEN_HINT}</code> and commit <code>docs/generated/</code>.</p>
+<p class="notice">Generated by <code>scripts/render_docs.py</code>, do not edit. After changing any markdown file under docs/, run <code>{REGEN_HINT}</code> and commit <code>docs/generated/</code>.</p>
 <nav class="toc">
 <ul>
 {nav}
@@ -361,7 +414,7 @@ def render_html(name: str, docs: list[SourceDoc]) -> str:
 </nav>
 {chr(10).join(body)}
 </main>
-<script src="{MERMAID_SRC}"></script>
+<script src="{MERMAID_SRC}" integrity="{MERMAID_SRI}" crossorigin="anonymous"></script>
 <script>
 {INIT_JS}</script>
 </body>
