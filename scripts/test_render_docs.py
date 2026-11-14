@@ -7,6 +7,7 @@ Run: python3 -I scripts/test_render_docs.py
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -347,6 +348,44 @@ class ReviewFixesTest(Base):
         self.assertIn("sha384-rbtjAdnIQE/aQJGEgXrVUlMibdfTSa4PQju4HDhN3sR2PmaKFzhEafuePsl9H/9I", html)
         self.assertIn("themeVariables", html)
         self.assertIn("#1a2027", html)
+
+    def _tokens_and_themes(self) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]], str]:
+        _, html = self.render({"overview.md": FM + "## A\n\n" + MERMAID})
+        css = html.split("<style>", 1)[1].split("</style>", 1)[0]
+        light_css, dark_css = css.split("@media (prefers-color-scheme: dark)", 1)
+        tok = {
+            mode: dict(re.findall(r"(--[a-z-]+):\s*([^;]+);", block))
+            for mode, block in (("light", light_css), ("dark", dark_css))
+        }
+        themes_src = re.search(r"var THEMES = (\{.*?\n\});", html, re.DOTALL)
+        assert themes_src is not None, "THEMES literal missing"
+        themes = json.loads(themes_src.group(1))
+        return tok, themes, html
+
+    def test_mermaid_theme_variables_derive_from_the_css_tokens(self) -> None:
+        tok, themes, html = self._tokens_and_themes()
+        self.assertIn("theme:'base'", html.replace(" ", ""))
+        for mode in ("light", "dark"):
+            t, v = tok[mode], themes[mode]
+            self.assertEqual(v["background"], "transparent")
+            expected = {
+                "primaryColor": "--back", "primaryBorderColor": "--back-s", "lineColor": "--edge",
+                "primaryTextColor": "--fg", "textColor": "--fg", "secondaryColor": "--card",
+                "tertiaryColor": "--back", "edgeLabelBackground": "--card", "clusterBkg": "--bg",
+                "clusterBorder": "--line", "noteBkgColor": "--act", "noteBorderColor": "--act-s",
+                "actorBkg": "--back", "actorBorder": "--back-s", "signalColor": "--fg",
+            }
+            for key, token in expected.items():
+                self.assertEqual(v[key], t[token], f"{mode} {key}")
+            hexes = {x for x in v.values() if x.startswith("#")}
+            self.assertLessEqual(hexes, set(t.values()), f"{mode}: colour not from a token")
+            self.assertEqual(v["fontSize"], "12px")
+            self.assertTrue(v["fontFamily"].startswith("system-ui"))
+
+    def test_mermaid_rerenders_when_the_page_theme_changes(self) -> None:
+        _, _, html = self._tokens_and_themes()
+        self.assertIn("addEventListener('change'", html)
+        self.assertIn("data-src", html)
 
     def test_crlf_input_renders_like_lf(self) -> None:
         lf = {"overview.md": FM + "## A\n\ntext\n\n" + MERMAID}
