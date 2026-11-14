@@ -2928,3 +2928,48 @@ logs a warning at start-up.
 
 **Set aside** (the stub). Overriding the GitHub API base so the real adapter runs against a fake server (#736), and a
 tokenless vm mode, which is a policy change for the owner.
+
+## 39. The broker names its client in the receipt: `client_id` on a dedicated broker socket (#888)
+
+**Status:** accepted. The trust model (option A below) was decided by the coordinator, sandy-63, on 2026-11-15, as a
+decision for the owner to confirm or reverse.
+
+**Context.** `sandyd` sees one submitter. The broker serves several API clients with one uid, so every broker job's
+receipt (`who`, decision 11 and A2) names the daemon's uid, and two clients cannot be told apart. The owner decided on
+#607 not to wait for verified caps (#413, #566): the broker passes the client id in the submission. The control socket
+admits only the daemon's uid (`peer_cred`, #533), and the broker is a process of that uid. Peer credentials therefore
+cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other process of that user.
+
+**Decision.**
+
+- `SubmitRequest.client_id` (field 12, an optional string). A caller that omits it sees no change on the wire or in
+  any receipt.
+- A client id is valid when it is not empty, has at most 128 bytes and has no control character (NUL included).
+  `sandyd` refuses any other value at Submit, before placement and with no side effect, naming `client_id`. The broker
+  refuses a clients file with such an id at startup, naming the id.
+- A dedicated broker socket. `SANDYD_BROKER_SOCK` names a second UDS in the same private directory rules as
+  `SANDY_SOCK` (mode `0600`, the same `peer_cred` check). It is created only when the variable is set. With it unset
+  there is no broker listener and the behaviour is the one before this decision.
+- `sandyd` honours `client_id` only on a connection accepted on the broker socket. On the main socket a Submit that
+  carries the field is refused with an error that names `client_id` and the broker socket. It is never ignored. Every
+  other operation (attach, status, cancel, list, environments, prune) is served the same way on both sockets.
+- The broker is the only writer. The HTTP submit body has no such field (`deny_unknown_fields`), and the broker sets it
+  from the client its bearer token identified, so a client cannot name another client. `BrokerConfig` takes an optional
+  explicit attach socket path. The attach socket stays the one `sandyd` derives from `SANDY_SOCK`, and the broker's
+  control path is now the broker socket, so the broker can no longer derive the attach path from it.
+- The receipt names the client: `who.identity = "broker:<client_id>"`, `who.authenticated = false`. The prefix says who
+  asserted the id and keeps a client id such as `1000` from being read as a uid. The broker asserts the id and nothing
+  verifies it, so `authenticated` stays false until verified caps exist (#413). The `sandy-api` `Who` struct does not
+  change.
+- The id is stored on the job row (`client_id`, an additive column, migrated like `attach_token`). The store writes it
+  into the receipt whenever it writes a terminal envelope: a completed run, a cancel, and the recovery of a job a
+  daemon restart found open. Every terminal path names the client.
+
+**Residual.** A hostile process of the daemon's own uid can connect to the broker socket and set any client id. Nothing
+in a one-uid daemon can prevent that: that process can already submit, read and cancel every job as the daemon user. The
+broker socket separates the broker from the CLI and other tools by construction, so none of them writes a client id into
+a receipt by accident or by habit. It does not separate it from a same-uid adversary.
+
+**Set aside.** Honouring the field from any caller on the one socket: a local CLI or MCP caller could write any id into a
+receipt. A separate uid for the broker with a second allowed uid in `peer_cred`: it changes the deployment model and the
+socket permissions. A shared secret between the broker and `sandyd`: any process of the same uid can read it.
