@@ -634,7 +634,7 @@ details pre { overflow-x: auto; margin: 8px 0 0; background: var(--bg); border: 
   P--&gt;&gt;S: Minted(token, expiry, handle)
   S-&gt;&gt;S: stage token 0600 in cred_dir (secret_dir)
   S-&gt;&gt;B: run (plan + secret_dir)
-  B-&gt;&gt;G: boot; token exported as $GITHUB_TOKEN
+  B-&gt;&gt;G: boot, then token exported as $GITHUB_TOKEN
   S-&gt;&gt;P: revoke(lease) at teardown</pre></div>
 <details>
 <summary>Mermaid source</summary>
@@ -647,7 +647,7 @@ details pre { overflow-x: auto; margin: 8px 0 0; background: var(--bg); border: 
   P--&gt;&gt;S: Minted(token, expiry, handle)
   S-&gt;&gt;S: stage token 0600 in cred_dir (secret_dir)
   S-&gt;&gt;B: run (plan + secret_dir)
-  B-&gt;&gt;G: boot; token exported as $GITHUB_TOKEN
+  B-&gt;&gt;G: boot, then token exported as $GITHUB_TOKEN
   S-&gt;&gt;P: revoke(lease) at teardown</code></pre>
 </details>
 <p class="source">Source: <a href="../architecture/spec.md#4-credential-seam-credentialprovider">docs/architecture/spec.md#4-credential-seam-credentialprovider</a></p>

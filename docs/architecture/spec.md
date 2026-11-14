@@ -261,7 +261,7 @@ sequenceDiagram
   P-->>S: Minted(token, expiry, handle)
   S->>S: stage token 0600 in cred_dir (secret_dir)
   S->>B: run (plan + secret_dir)
-  B->>G: boot; token exported as $GITHUB_TOKEN
+  B->>G: boot, then token exported as $GITHUB_TOKEN
   S->>P: revoke(lease) at teardown
 ```
 
