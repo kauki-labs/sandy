@@ -204,6 +204,7 @@ async fn build(
                 fingerprint,
                 "stand-in-host".to_owned(),
                 Capabilities {
+                    path_root: false,
                     digests: false,
                     supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                     arch: Arch::X8664.into(),

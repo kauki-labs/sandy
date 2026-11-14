@@ -669,6 +669,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -682,6 +683,7 @@ mod tests {
 
     fn vm_capabilities() -> Capabilities {
         Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),

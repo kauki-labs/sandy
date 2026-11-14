@@ -173,6 +173,7 @@ fn to_wire_capabilities(
         kinds.push(i32::from(sandy_executor_proto::SandboxKind::Vm));
     }
     sandy_executor_proto::Capabilities {
+        path_root: false,
         // Both backends hash a run's inputs and outputs when `RunSpec.digests` is set (#373), so this is an
         // implementation fact, not an operator declaration.
         digests: true,

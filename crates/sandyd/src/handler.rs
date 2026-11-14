@@ -3110,6 +3110,7 @@ mod tests {
 
     fn trusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -3758,6 +3759,7 @@ mod tests {
         let capabilities = sandy_executor_proto::Capabilities {
             shares_submitter_filesystem: true,
             transfer: true,
+            path_root: true,
             ..trusted_host_capabilities()
         };
 
@@ -3769,6 +3771,104 @@ mod tests {
 
         let (unrooted, _job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
         assert_eq!(unrooted.inputs[0].root, None, "no root in, no root out");
+        Ok(())
+    }
+
+    /// A Submit on one host of `capabilities` through `handle`: the response, and whether a `Dispatch` reached the
+    /// host.
+    async fn submit_on_host(
+        request: ControlRequest,
+        capabilities: sandy_executor_proto::Capabilities,
+    ) -> anyhow::Result<(ControlResponse, bool)> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, capabilities);
+        let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back literal")?;
+        let response = handle(
+            &store,
+            &registry,
+            &host_registry,
+            Some(forward_back),
+            test_session(),
+            request,
+        )
+        .await?;
+        Ok((response, dispatch_rx.try_recv().is_ok()))
+    }
+
+    /// The refusal text of `response`, or an error when the Submit was not refused.
+    fn refusal_of(response: ControlResponse) -> anyhow::Result<String> {
+        match response.result {
+            Some(control_response::Result::Error(e)) => Ok(e.message),
+            other => anyhow::bail!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A rooted Submit with no secret: only inputs and outputs, which a host with `transfer` takes over the data link.
+    fn rooted_paths_without_a_secret() -> ControlRequest {
+        let mut request = submit_with_roots("/srv/a", "/srv/a/job");
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.secrets.clear();
+        }
+        request
+    }
+
+    /// #618: an executor drops a `Dispatch` field it does not know without a word, so a root a host cannot honour would
+    /// be ignored and the parent-swap gap would stay open unannounced. A rooted secret is opened by the executor
+    /// only, so it is placed only on a host that declared `path_root`: without one the Submit is refused naming the
+    /// capability, with nothing dispatched.
+    #[tokio::test]
+    async fn a_rooted_secret_is_placed_only_on_a_host_that_declares_path_root() -> anyhow::Result<()> {
+        let without = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (response, dispatched) = submit_on_host(submit_with_roots("/srv/a", "/srv/a/job"), without.clone()).await?;
+        let message = refusal_of(response)?;
+        assert!(message.contains("path_root"), "must name the capability: {message}");
+        assert!(!dispatched, "nothing was dispatched");
+
+        let with = sandy_executor_proto::Capabilities {
+            path_root: true,
+            ..without
+        };
+        let (response, dispatched) = submit_on_host(submit_with_roots("/srv/a", "/srv/a/job"), with).await?;
+        assert!(
+            matches!(response.result, Some(control_response::Result::Submit(_))),
+            "a host that declared path_root takes it, got {:?}",
+            response.result
+        );
+        assert!(dispatched, "the job was dispatched");
+        Ok(())
+    }
+
+    /// #618: a rooted input or output on a host with no `transfer` is opened by the executor, so that host needs
+    /// `path_root` too. A host with `transfer` takes it with no `path_root`: `sandyd` opens the paths itself.
+    #[tokio::test]
+    async fn rooted_inputs_and_outputs_need_transfer_or_path_root() -> anyhow::Result<()> {
+        let shared_only = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            ..trusted_host_capabilities()
+        };
+        let (response, dispatched) = submit_on_host(rooted_paths_without_a_secret(), shared_only.clone()).await?;
+        let message = refusal_of(response)?;
+        assert!(message.contains("path_root"), "must name the capability: {message}");
+        assert!(!dispatched, "nothing was dispatched");
+
+        let shared_with_root = sandy_executor_proto::Capabilities {
+            path_root: true,
+            ..shared_only
+        };
+        let (_, dispatched) = submit_on_host(rooted_paths_without_a_secret(), shared_with_root).await?;
+        assert!(dispatched, "a shared-filesystem host that declared path_root takes it");
+
+        let transfer_only = sandy_executor_proto::Capabilities {
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let (_, dispatched) = submit_on_host(rooted_paths_without_a_secret(), transfer_only).await?;
+        assert!(dispatched, "a transfer host takes it: sandyd opens the paths");
         Ok(())
     }
 
@@ -4432,6 +4532,7 @@ mod tests {
         let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
         let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
         let untrusted_only = sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -4639,6 +4740,7 @@ mod tests {
 
     fn vm_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
@@ -5004,6 +5106,7 @@ mod tests {
 
     fn vm_untrusted_host_capabilities() -> sandy_executor_proto::Capabilities {
         sandy_executor_proto::Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into(), SandboxKind::Vm.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),

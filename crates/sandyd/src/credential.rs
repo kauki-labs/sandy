@@ -716,6 +716,7 @@ mod tests {
 
     fn capabilities(shares_submitter_filesystem: bool) -> Capabilities {
         Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: sandy_executor_proto::Arch::X8664.into(),
