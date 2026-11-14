@@ -93,7 +93,7 @@ a `flake/v1` manifest to a host that declares `SandboxKind::Vm` (#332), and the
 host-executor boots it there via `QemuBackend`, the same guest-boot path `sandy
 run --flake` uses locally. `Capabilities` is a SET of declared sandbox kinds
 per host-executor process, so one host can serve both `Process` and `Vm`
-dispatches at once. Unlike `argv/v1`, a `flake/v1` submission has no local
+dispatches at once. Like `argv/v1`, a `flake/v1` submission has no local
 fallback: if no remote is configured or no registered host declares `Vm`, it
 is refused outright at `Submit` time (named reason, no silent hang), never
 left silently `Pending`. The code path is built and host-executor-side

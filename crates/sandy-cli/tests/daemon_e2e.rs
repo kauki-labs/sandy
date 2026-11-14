@@ -139,6 +139,12 @@ fn spawn_daemon(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
 /// accepted job (which is dispatched and stays `Running`: the stand-in never answers a Dispatch) starts the daemon this
 /// way.
 fn spawn_daemon_with_host(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
+    spawn_mesh_daemon(tmp, true)
+}
+
+/// [`spawn_daemon_with_host`] with the mesh and agent-link listeners on, registering the stand-in host only when
+/// `register_host` is set: `false` is a daemon whose placement is reachable but has no host.
+fn spawn_mesh_daemon(tmp: &std::path::Path, register_host: bool) -> anyhow::Result<Daemon> {
     use sandy_executor_proto::{
         Arch, Capabilities, HostExecutorMessage, IsolationClass, OrchestratorMessage, Register, SandboxKind,
         host_executor_message, orchestrator_message,
@@ -186,6 +192,9 @@ fn spawn_daemon_with_host(tmp: &std::path::Path) -> anyhow::Result<Daemon> {
     {
         anyhow::ensure!(Instant::now() < deadline, "sandyd never opened its listeners");
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if !register_host {
+        return Ok(daemon);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -317,9 +326,9 @@ fn submit_status_list_and_cancel_round_trip_through_a_live_sandyd() -> anyhow::R
 }
 
 /// A4 of #483: `daemon prune --keep-last N` deletes the oldest terminal jobs from a live sandyd's store, prints the
-/// `gc` report, and spares a job that is still pending.
+/// `gc` report, and spares a job that is still running.
 #[test]
-fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<()> {
+fn prune_deletes_old_terminal_jobs_and_spares_a_running_one() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let daemon = spawn_daemon_with_host(tmp.path())?;
     let manifest = tmp.path().join("manifest.bin");
@@ -345,7 +354,7 @@ fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<
         let json: serde_json::Value = serde_json::from_slice(&submit.stdout).context("parse submit json")?;
         ids.push(json["job_id"].as_str().context("job_id")?.to_owned());
     }
-    // The first three end Cancelled in submit order; the fourth stays pending.
+    // The first three end Cancelled in submit order; the fourth stays running.
     for id in &ids[..3] {
         let cancel = sandy(&daemon, &["daemon", "cancel", id])?;
         assert_eq!(cancel.status.code(), Some(0), "cancel stderr: {}", stderr_of(&cancel));
@@ -376,7 +385,7 @@ fn prune_deletes_old_terminal_jobs_and_spares_a_pending_one() -> anyhow::Result<
     left.sort_unstable();
     let mut expected = vec![ids[2].as_str(), ids[3].as_str()];
     expected.sort_unstable();
-    assert_eq!(left, expected, "the newest terminal job and the pending one stay");
+    assert_eq!(left, expected, "the newest terminal job and the running one stay");
     Ok(())
 }
 
@@ -747,11 +756,47 @@ fn submit_with_a_cap_file_from_a_real_attach_grants_the_requested_subset() -> an
     Ok(())
 }
 
-/// #481: `--credential` reaches `sandyd`. The same Submit that succeeds without
-/// it is refused with it, since this daemon has no host-executor that shares the
-/// submitter's filesystem to hand a minted token to; nothing is minted first.
+/// #481: `--credential` reaches `sandyd`. On a daemon with no agent-link address nothing can be placed at all, so the
+/// credentialed Submit is refused naming that cause; nothing is minted first.
 #[test]
-fn submit_with_a_credential_and_no_local_host_is_refused_by_the_daemon() -> anyhow::Result<()> {
+fn submit_with_a_credential_and_no_placement_reachable_is_refused_by_the_daemon() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    let manifest = tmp.path().join("manifest.bin");
+    std::fs::write(&manifest, b"opaque").context("write manifest")?;
+    let manifest = manifest.to_str().context("manifest path is utf8")?;
+    let refused = sandy(
+        &daemon,
+        &[
+            "daemon",
+            "submit",
+            manifest,
+            "--manifest-encoding",
+            "test/v1",
+            "--isolation-class",
+            "trusted",
+            "--credential",
+            "gh-test",
+            "--cred-capability",
+            "write-code",
+        ],
+    )?;
+    assert!(
+        !refused.status.success(),
+        "a credentialed Submit with no reachable placement must be refused"
+    );
+    assert!(
+        stderr_of(&refused).contains("no remote placement is reachable"),
+        "stderr: {}",
+        stderr_of(&refused)
+    );
+    Ok(())
+}
+
+/// #481: with a host registered the plain Submit is accepted, but the same Submit with `--credential` is refused,
+/// since no host-executor shares the submitter's filesystem to hand a minted token to; nothing is minted first.
+#[test]
+fn a_credentialed_submit_is_refused_when_no_host_shares_the_filesystem() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let daemon = spawn_daemon_with_host(tmp.path())?;
     let manifest = tmp.path().join("manifest.bin");
@@ -840,15 +885,16 @@ fn a_cred_capability_without_a_credential_is_a_usage_error() -> anyhow::Result<(
     Ok(())
 }
 
-/// #868: a plain trusted submit to a daemon with no host is refused with the cause named, and leaves no job behind.
-#[test]
-fn a_plain_trusted_submit_with_no_host_is_refused_and_leaves_no_job() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir().context("temp dir")?;
-    let daemon = spawn_daemon(tmp.path())?;
-    let manifest = tmp.path().join("manifest.bin");
+/// A plain trusted `daemon submit` on `daemon`: expected to be refused with exit 2, `cause` named, and no job left.
+fn assert_plain_submit_is_refused_leaving_no_job(
+    daemon: &Daemon,
+    tmp: &std::path::Path,
+    cause: &str,
+) -> anyhow::Result<()> {
+    let manifest = tmp.join("manifest.bin");
     std::fs::write(&manifest, b"opaque").context("write manifest")?;
     let submit = sandy(
-        &daemon,
+        daemon,
         &[
             "daemon",
             "submit",
@@ -860,24 +906,35 @@ fn a_plain_trusted_submit_with_no_host_is_refused_and_leaves_no_job() -> anyhow:
         ],
     )?;
     assert_eq!(submit.status.code(), Some(2), "stderr: {}", stderr_of(&submit));
-    assert!(
-        stderr_of(&submit).contains("no remote placement is reachable"),
-        "stderr: {}",
-        stderr_of(&submit)
-    );
-    let list = sandy(&daemon, &["daemon", "list", "-o", "json"])?;
+    assert!(stderr_of(&submit).contains(cause), "stderr: {}", stderr_of(&submit));
+    let list = sandy(daemon, &["daemon", "list", "-o", "json"])?;
     assert!(list.status.success(), "stderr: {}", stderr_of(&list));
     let json: serde_json::Value = serde_json::from_slice(&list.stdout).context("parse list json")?;
-    assert!(
-        json.as_array().is_some_and(Vec::is_empty) || json["jobs"].as_array().is_some_and(Vec::is_empty),
-        "a refused submit must leave no row: {json}"
-    );
+    assert_eq!(json, serde_json::json!([]), "a refused submit must leave no row");
+    Ok(())
+}
+
+/// #868: a plain trusted submit to a daemon with no agent-link address is refused with the cause named.
+#[test]
+fn a_plain_trusted_submit_with_no_placement_reachable_is_refused_and_leaves_no_job() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_daemon(tmp.path())?;
+    assert_plain_submit_is_refused_leaving_no_job(&daemon, tmp.path(), "no remote placement is reachable")
+}
+
+/// #868: a plain trusted submit to a daemon with mesh and agent-link up but no registered host is refused, naming
+/// the missing host and how to fix it.
+#[test]
+fn a_plain_trusted_submit_with_mesh_up_and_no_host_is_refused_and_leaves_no_job() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir().context("temp dir")?;
+    let daemon = spawn_mesh_daemon(tmp.path(), false)?;
+    assert_plain_submit_is_refused_leaving_no_job(&daemon, tmp.path(), "no registered host")?;
     Ok(())
 }
 
 /// Submit a job through the real `sandy` to a daemon with a stand-in host (it is dispatched and stays `Running`),
 /// returning its id.
-fn submit_a_pending_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Result<String> {
+fn submit_a_running_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Result<String> {
     let manifest = tmp.join("manifest.bin");
     std::fs::write(&manifest, b"opaque-until-b3-defines-jobmanifest").context("write manifest")?;
     let submit = sandy(
@@ -905,7 +962,7 @@ fn submit_a_pending_job(daemon: &Daemon, tmp: &std::path::Path) -> anyhow::Resul
 fn daemon_wait_on_a_cancelled_job_prints_its_envelope_and_exits_1() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let daemon = spawn_daemon_with_host(tmp.path())?;
-    let job_id = submit_a_pending_job(&daemon, tmp.path())?;
+    let job_id = submit_a_running_job(&daemon, tmp.path())?;
     let cancel = sandy(&daemon, &["daemon", "cancel", &job_id])?;
     assert_eq!(cancel.status.code(), Some(0), "cancel stderr: {}", stderr_of(&cancel));
 
@@ -922,12 +979,13 @@ fn daemon_wait_on_a_cancelled_job_prints_its_envelope_and_exits_1() -> anyhow::R
     Ok(())
 }
 
-/// A job that never ends is reported after the bound, naming the state it was in, with the infra-fault band `3`.
+/// A job its host never finishes (the stand-in never answers a Dispatch) is reported after the bound, naming the
+/// state it was in (`Running`), with the infra-fault band `3`.
 #[test]
 fn daemon_wait_on_a_job_that_never_ends_times_out_naming_its_state() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir().context("temp dir")?;
     let daemon = spawn_daemon_with_host(tmp.path())?;
-    let job_id = submit_a_pending_job(&daemon, tmp.path())?;
+    let job_id = submit_a_running_job(&daemon, tmp.path())?;
 
     let wait = sandy(&daemon, &["daemon", "wait", &job_id, "--wait-timeout", "1"])?;
     assert_eq!(wait.status.code(), Some(3), "wait stderr: {}", stderr_of(&wait));

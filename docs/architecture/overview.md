@@ -115,11 +115,10 @@ One `sandy daemon submit` job:
 - `sandyd` places on a registered remote host whose declared
   `supported_sandbox_kinds`/`supported_isolation_classes` satisfy the
   submission (stage 1: trusted-process by default; `flake/v1` manifests
-  require a host declaring `SandboxKind::Vm`, #332). For `argv/v1`, absent a
-  configured remote or no matching host, the job is accepted and stays
-  `Pending` — nothing dispatches it, an honest, tracked gap (#292), not a
-  local fallback; a `flake/v1` submission has no fallback at all and is
-  refused outright at `Submit` time instead.
+  require a host declaring `SandboxKind::Vm`, #332). Absent a
+  configured remote or no matching host, `Submit` is refused with a named
+  reason and no row is written (#868), for `argv/v1` and `flake/v1` alike:
+  there is no local fallback.
 - The host-executor independently re-checks the isolation class before
   running anything (defense in depth), then runs the job — `bwrap` +
   `systemd-run --user` + `sandy-agent` for a trusted-process job, or

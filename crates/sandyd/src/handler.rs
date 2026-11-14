@@ -70,17 +70,26 @@ fn required_sandbox_kind_for(manifest_encoding: &str) -> SandboxKind {
     }
 }
 
-/// Refuses a submit this daemon cannot place, with `reason` as the explanation; `None` for a placed one.
-/// Placement is mandatory for every job (#868): `sandyd` has no local execution path, so an unplaced
-/// `argv/v1`+`Trusted` job would sit `Pending` with no distinct status, exactly the silent gap decision 18 rules
-/// out for `Vm` and `Untrusted` jobs. Shared by the two placement checks in `handle`'s `Submit` arm: the early one
-/// (before any side effect) and the one right after `dispatch_plan` is computed, which closes a narrow TOCTOU the
-/// early check alone cannot (a host disconnecting between the two `pick_host_for` calls, or `RemoteLink::new`'s
-/// RNG failing). A job accepted while a host is registered that later loses it is not covered here.
-fn placement_required_error(placed: bool, reason: &str) -> Option<ControlError> {
-    (!placed).then(|| ControlError {
-        message: reason.to_owned(),
-    })
+/// The refusal for a Submit this daemon cannot place (#868). Placement is mandatory for every job: `sandyd` has no
+/// local execution path, so an unplaced job would sit `Pending` with no distinct status. Used by the two placement
+/// checks in `handle`'s `Submit` arm: the early one (before any side effect) and the one right after `dispatch_plan`,
+/// which closes a narrow TOCTOU the early check alone cannot (a host disconnecting between the two `pick_host_for`
+/// calls, or `RemoteLink::new`'s RNG failing). A job accepted while a host is registered that later loses it is not
+/// covered here. `reconnect_hint` is false when the cause is this daemon's own configuration, where retrying cannot
+/// help.
+fn unplaced_refusal(request_id: u64, reason: &str, reconnect_hint: bool) -> ControlResponse {
+    let message = if reconnect_hint {
+        format!(
+            "{reason}. Register a host-executor that declares what this job needs; if hosts may still be reconnecting \
+             after a daemon restart, retry shortly"
+        )
+    } else {
+        reason.to_owned()
+    };
+    ControlResponse {
+        request_id,
+        result: Some(control_response::Result::Error(ControlError { message })),
+    }
 }
 
 /// Whether `submit` names any path field (#496, decision 21) — `inputs`,
@@ -656,7 +665,8 @@ pub async fn handle(
             };
             let placement_reason = if forward_back_addr.is_none() {
                 "this orchestrator has no agent-link listen address configured (SANDY_MESH_AGENT_LINK_LISTEN is unset) \
-                 — no remote placement is reachable at all, regardless of what hosts are registered"
+                 — no remote placement is reachable at all, regardless of what hosts are registered; set it, then \
+                 register a host-executor"
                     .to_owned()
             } else if credential_request.is_some() {
                 credential_placement_refusal()
@@ -682,11 +692,12 @@ pub async fn handle(
                      execution path)"
                 )
             };
-            if let Some(control_error) = placement_required_error(placeable, &placement_reason) {
-                return Ok(ControlResponse {
-                    request_id: request.request_id,
-                    result: Some(control_response::Result::Error(control_error)),
-                });
+            if !placeable {
+                return Ok(unplaced_refusal(
+                    request.request_id,
+                    &placement_reason,
+                    forward_back_addr.is_some(),
+                ));
             }
 
             let job_id = Uuid::new_v4().to_string();
@@ -745,7 +756,7 @@ pub async fn handle(
             // reachable, regardless of what's registered) and such a host
             // exists; run locally otherwise — today's unchanged behavior for
             // a `Trusted`+`Process` job (an `Untrusted` job with no host is
-            // refused outright instead, see `placement_required_error`
+            // refused outright instead, see `unplaced_refusal`
             // below). Binding the remote link (decision 6) happens BEFORE the
             // job is persisted/registered, so a placed job's `remote_link` is
             // set from the moment anyone can observe it; the actual
@@ -890,11 +901,8 @@ pub async fn handle(
                      placed (this daemon has no local execution path)"
                 )
             };
-            if let Some(control_error) = placement_required_error(dispatch_plan.is_some(), &dispatch_plan_reason) {
-                return Ok(ControlResponse {
-                    request_id: request.request_id,
-                    result: Some(control_response::Result::Error(control_error)),
-                });
+            if dispatch_plan.is_none() {
+                return Ok(unplaced_refusal(request.request_id, &dispatch_plan_reason, true));
             }
 
             // #481: mint the job's credential last among the Submit-time steps that
@@ -4301,21 +4309,6 @@ mod tests {
         assert_eq!(required_sandbox_kind_for(""), SandboxKind::Process);
     }
 
-    /// `handle`'s early placeability check and its post-`dispatch_plan` check call this same function, so proving
-    /// it here proves both call sites. Placement is mandatory for every job (#868): `sandyd` has no local
-    /// execution path.
-    #[test]
-    fn placement_required_error_refuses_any_unplaced_job() {
-        assert!(
-            placement_required_error(false, "unplaced").is_some(),
-            "an unplaced job must be refused"
-        );
-        assert!(
-            placement_required_error(true, "unplaced").is_none(),
-            "a placed job must not be refused"
-        );
-    }
-
     /// Positive (#332 acceptance): a `flake/v1` submit placed on a host that
     /// declared BOTH `Process` and `Vm` dispatches with `backend == Vm` —
     /// the submission's own required kind, not merely whatever the picked
@@ -4415,6 +4408,11 @@ mod tests {
         match response.result {
             Some(control_response::Result::Error(ControlError { message })) => {
                 assert!(message.contains("no registered host"), "got {message:?}");
+                assert!(
+                    message.contains("Register a host-executor"),
+                    "the refusal must say how to fix it: {message:?}"
+                );
+                assert!(message.contains("retry shortly"), "got {message:?}");
             }
             other => anyhow::bail!("expected a refusal, got {other:?}"),
         }
