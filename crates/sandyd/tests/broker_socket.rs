@@ -75,7 +75,7 @@ fn refusal(response: sandy_control_proto::ControlResponse) -> Result<String> {
 }
 
 /// With `SANDYD_BROKER_SOCK` set the daemon listens on a second socket, a socket file of mode `0600`. With it unset
-/// there is no second socket: the directory holds the main socket only.
+/// there is no second socket: the directory holds the main and the attach sockets only.
 #[tokio::test]
 async fn the_broker_socket_exists_only_when_configured_and_is_private() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -94,13 +94,15 @@ async fn the_broker_socket_exists_only_when_configured_and_is_private() -> Resul
 
     let other = tempfile::tempdir()?;
     let _daemon = start(other.path(), None)?;
-    let sockets = std::fs::read_dir(other.path())?
+    let mut sockets: Vec<String> = std::fs::read_dir(other.path())?
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
-        .count();
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    sockets.sort();
     ensure!(
-        sockets == 1,
-        "without SANDYD_BROKER_SOCK there is only the main socket, found {sockets}"
+        sockets == ["main.sock", "sandyd-attach.sock"],
+        "without SANDYD_BROKER_SOCK there are the main and the attach sockets only, found {sockets:?}"
     );
     Ok(())
 }

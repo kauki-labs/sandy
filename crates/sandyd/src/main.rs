@@ -232,6 +232,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // #888: the broker socket, validated before anything is bound so a bad value stops the daemon with nothing left
+    // behind.
+    let broker_socket = match broker_socket_path(&socket_path, std::env::var_os(BROKER_SOCK_VAR)) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!(error = %e, "invalid {BROKER_SOCK_VAR}; refusing to start");
+            std::process::exit(1);
+        }
+    };
     let (listener, _lock) = match bind_unix_listener(&socket_path) {
         Ok(bound) => bound,
         Err(e) => {
@@ -270,6 +279,18 @@ async fn main() {
         }
     };
     tracing::info!(socket = %attach_socket_path.display(), "sandyd attach data plane listening");
+
+    // #888: the broker's own control socket, the only one on which a client id is honoured. Same bind discipline.
+    let broker_listener = broker_socket.map(|path| match bind_unix_listener(&path) {
+        Ok((broker_listener, lock)) => {
+            tracing::info!(socket = %path.display(), "sandyd broker socket listening");
+            (broker_listener, lock, path)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, socket = %path.display(), "could not bind the broker socket");
+            std::process::exit(1);
+        }
+    });
 
     // #830: a job still open in the store has no connection that can deliver its result to this process, so it ends
     // `Failed` (retryable) now, before anything is served. After the socket lock: a second daemon on the same store
@@ -479,6 +500,22 @@ async fn main() {
     let mut connections = tokio::task::JoinSet::new();
     let mut backoff = AcceptBackoff::new();
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let broker_task = broker_listener.map(|(broker_listener, lock, path)| {
+        tokio::spawn(run_broker_accept_loop(
+            BrokerAccept {
+                listener: broker_listener,
+                _lock: lock,
+                path,
+                store: Arc::clone(&store),
+                environments: Arc::clone(&environments),
+                registry: Arc::clone(&registry),
+                host_registry: Arc::clone(&host_registry),
+                forward_back_addr,
+            },
+            Arc::clone(&connection_semaphore),
+            shutdown_rx.clone(),
+        ))
+    });
 
     loop {
         tokio::select! {
@@ -555,6 +592,13 @@ async fn main() {
         );
     }
 
+    // The broker listener's task drains its own connections the same way, started by the same shutdown signal.
+    if let Some(broker_task) = broker_task
+        && let Err(e) = broker_task.await
+    {
+        tracing::warn!(error = %e, "the broker socket's task panicked during shutdown");
+    }
+
     // Join the mesh listener's own task so its shutdown drain (bounded by
     // its own SHUTDOWN_GRACE, started by the same shutdown signal) gets a
     // real window to run — a fire-and-forget spawn would let the runtime
@@ -564,6 +608,148 @@ async fn main() {
         && let Err(e) = mesh_task.await
     {
         tracing::warn!(error = %e, "the mesh listener's task panicked during shutdown");
+    }
+}
+
+/// The environment variable naming the broker socket (#888).
+const BROKER_SOCK_VAR: &str = "SANDYD_BROKER_SOCK";
+
+/// The broker socket path from `value` (`$SANDYD_BROKER_SOCK`), or `None` when it is unset (#888). It is refused when
+/// it is empty, is not an absolute path, names the main socket or the attach socket, or is in another directory than
+/// the main socket. The attach socket is a fixed sibling of the control path, so the broker finds it only when its own
+/// socket is in the same directory. The directories are compared after links and `..` are resolved, so a broker socket
+/// reached through a symlinked directory is neither let through nor refused by mistake.
+fn broker_socket_path(
+    main_socket: &std::path::Path,
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(format!("{BROKER_SOCK_VAR} is empty"));
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!("{BROKER_SOCK_VAR} {} is not an absolute path", path.display()));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{BROKER_SOCK_VAR} {} has no file name", path.display()))?;
+    let directory_of = |socket: &std::path::Path, what: &str| -> Result<PathBuf, String> {
+        let parent = socket
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        parent
+            .canonicalize()
+            .map_err(|e| format!("the directory of {what} {} cannot be resolved: {e}", socket.display()))
+    };
+    let (broker_dir, main_dir) = (
+        directory_of(&path, BROKER_SOCK_VAR)?,
+        directory_of(main_socket, "SANDY_SOCK")?,
+    );
+    if broker_dir != main_dir {
+        return Err(format!(
+            "{BROKER_SOCK_VAR} {} is not in the same directory as SANDY_SOCK {}: the broker finds the attach socket \
+             as a sibling of the control socket",
+            path.display(),
+            main_socket.display()
+        ));
+    }
+    if Some(name) == main_socket.file_name() {
+        return Err(format!("{BROKER_SOCK_VAR} {} is the main socket", path.display()));
+    }
+    let attach = sandy_control_proto::attach_socket_path(main_socket);
+    if Some(name) == attach.file_name() {
+        return Err(format!("{BROKER_SOCK_VAR} {} is the attach socket", path.display()));
+    }
+    Ok(Some(path))
+}
+
+/// What the broker socket's accept loop serves with (#888).
+struct BrokerAccept {
+    listener: UnixListener,
+    /// Held for the loop's whole run: dropping it releases the socket's flock.
+    _lock: std::fs::File,
+    path: PathBuf,
+    store: Arc<JobStore>,
+    environments: Arc<sandyd::environment_store::EnvironmentStore>,
+    registry: Arc<sandyd::dispatch::JobRegistry>,
+    host_registry: Arc<sandyd::host_registry::HostRegistry>,
+    forward_back_addr: Option<SocketAddr>,
+}
+
+/// Accept connections on the broker socket until shutdown, each served as [`sandyd::Caller::Broker`]. It shares the
+/// main loop's connection cap and its peer-credential check, so the broker socket admits nobody the main socket does
+/// not (#888).
+async fn run_broker_accept_loop(
+    ctx: BrokerAccept,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    let mut backoff = AcceptBackoff::new();
+    loop {
+        tokio::select! {
+            (permit, accepted) = gate_spawn(&semaphore, ctx.listener.accept()) => {
+                let Ok(permit) = permit else {
+                    tracing::error!("connection semaphore closed unexpectedly; the broker socket stops accepting");
+                    break;
+                };
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        backoff.reset();
+                        if let Err(refused) = sandyd::peer_cred::require_same_user(&stream) {
+                            tracing::warn!(%refused, "refusing a broker connection");
+                            continue;
+                        }
+                        let (store, environments) = (Arc::clone(&ctx.store), Arc::clone(&ctx.environments));
+                        let (registry, host_registry) = (Arc::clone(&ctx.registry), Arc::clone(&ctx.host_registry));
+                        let forward_back_addr = ctx.forward_back_addr;
+                        connections.spawn(async move {
+                            let _permit = permit;
+                            sandyd::serve_connection(
+                                stream,
+                                store,
+                                environments,
+                                registry,
+                                host_registry,
+                                forward_back_addr,
+                                sandyd::Caller::Broker,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to accept a broker connection");
+                        tokio::select! {
+                            () = backoff.wait_and_grow() => {}
+                            _ = shutdown_rx.changed() => break,
+                        }
+                    }
+                }
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            _ = shutdown_rx.changed() => {
+                tracing::info!("shutdown signal received; the broker socket no longer accepts connections");
+                break;
+            }
+        }
+    }
+    let BrokerAccept { listener, path, .. } = ctx;
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    if tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            remaining = connections.len(),
+            "shutdown grace period elapsed with broker connections still in flight; exiting anyway"
+        );
     }
 }
 
@@ -1148,6 +1334,41 @@ fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+
+    /// #888: `broker_socket_path` accepts nothing it cannot place: unset is no broker socket, a link into another
+    /// directory is refused, and `..` segments are resolved, not trusted.
+    #[test]
+    fn the_broker_socket_path_check_resolves_links_and_dots() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let elsewhere = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("sub"))?;
+        let main = dir.path().join("main.sock");
+        let os = |p: &std::path::Path| Some(p.as_os_str().to_owned());
+
+        assert_eq!(
+            broker_socket_path(&main, None),
+            Ok(None),
+            "unset means no broker socket"
+        );
+
+        let through_dots = dir.path().join("sub/../broker.sock");
+        assert_eq!(
+            broker_socket_path(&main, os(&through_dots)),
+            Ok(Some(through_dots.clone())),
+            "a `..` that leads back to the main directory is the same directory"
+        );
+
+        let holder = tempfile::tempdir()?;
+        let link = holder.path().join("to-elsewhere");
+        std::os::unix::fs::symlink(elsewhere.path(), &link)?;
+        let err = broker_socket_path(&main, os(&link.join("broker.sock"))).expect_err("a link to another directory");
+        assert!(err.contains("same directory"), "{err}");
+
+        let missing = dir.path().join("no-such-dir/broker.sock");
+        let err = broker_socket_path(&main, os(&missing)).expect_err("a directory that does not exist");
+        assert!(err.contains("cannot be resolved"), "{err}");
+        Ok(())
+    }
 
     use super::*;
 
