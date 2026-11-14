@@ -1517,8 +1517,9 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   host the proxy accepts is never refused here. The proxy has no rule-count bound, so 256 is new. The direct
   `sandy run --allow` stays unbounded.
 - Path roots (#618): a Submit path may carry an optional `root`, the trusted absolute directory it lies beneath (the
-  broker sets it from the client's `roots`). `sandyd` refuses a root that is not absolute, a path not under it and a
-  `..` below it, copies it into the `Dispatch`, and opens a rooted input or output it handles itself (the data link)
+  broker sets it from the client's `roots`, canonical and never client-spelled; a root is no boundary on the local
+  control RPC). `sandyd` refuses a root that is not absolute, a path not under it, a `..` below it and a NUL byte in
+  either, copies it into the `Dispatch`, and opens a rooted input or output it handles itself (the data link)
   beneath the root without following a link. A root an executor would have to honour is placed only on a host that
   declared `path_root` (secrets always, inputs and outputs when the host has no `transfer`), because an executor drops
   a field it does not know without a word. See guest-shares decision 14.

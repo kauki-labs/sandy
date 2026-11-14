@@ -420,8 +420,10 @@ inside an input tree (macOS has no protected hardlinks).
 
 **Closing the components above the leaf (#618, owner decision 2026-11-14).** The control `Submit` and the executor
 `Dispatch` carry an optional `root` on each input, output and secret path (wire only, absent keeps today's
-behaviour). The broker sets it to the root of the client's configured `roots` that contains the path, spelled as the
-path spells it, nearest root first. `sandyd` refuses a Submit whose root is not absolute, whose path is not under it, or
+behaviour). The broker sets it to the operator's configured root of the client that contains the path, in canonical
+form and nearest root first, and rewrites the path onto it: the root is never a spelling the client chose, because
+`sandyd` follows the root, and an alias the client controls could be retargeted after the broker's check. The root is
+not a boundary on the local control RPC, where any caller can send any root. `sandyd` refuses a Submit whose root is not absolute, whose path is not under it, or
 that has a `..` below it. It then opens the path with `sandy_fsutil::beneath::{open_file_beneath,
 Beneath::open_dir_beneath, Beneath::create_dir_beneath}`: the root opens as the OS resolves it (it is trusted, and macOS
 `/tmp` is a link), and every component below it is opened with `openat` and `O_NOFOLLOW`, so a parent directory swapped

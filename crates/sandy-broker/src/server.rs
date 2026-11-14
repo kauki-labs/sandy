@@ -253,11 +253,18 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
     if body.required_isolation_class > client.max_isolation_class {
         return Err(FORBIDDEN);
     }
-    // Every path must lie beneath one of the client's roots. That root goes to sandyd with the path (#618), which opens
-    // the path beneath it without following a link, so a parent directory swapped after this check cannot redirect it.
+    // Every path must lie beneath one of the client's roots. The configured, canonical root goes to sandyd with the
+    // path rewritten onto it (#618), never the client's own spelling: sandyd follows the root and then opens the path
+    // beneath it without following a link, so neither a parent directory swapped after this check nor an alias the
+    // client retargets can redirect the open.
     let root_of = |path: &str| {
         root_for(path, &client.roots)
-            .map(|root| root.to_string_lossy().into_owned())
+            .map(|rooted| {
+                (
+                    rooted.root.to_string_lossy().into_owned(),
+                    rooted.path.to_string_lossy().into_owned(),
+                )
+            })
             .ok_or(FORBIDDEN)
     };
     let class = match body.required_isolation_class {
@@ -274,9 +281,10 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .inputs
             .into_iter()
             .map(|i| {
+                let (root, host) = root_of(&i.host)?;
                 Ok(Input {
-                    root: Some(root_of(&i.host)?),
-                    host: i.host,
+                    root: Some(root),
+                    host,
                     name: i.name,
                     guest_path: i.guest_path,
                 })
@@ -286,10 +294,11 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .outputs
             .into_iter()
             .map(|o| {
+                let (root, dest) = root_of(&o.dest)?;
                 Ok(Output {
-                    root: Some(root_of(&o.dest)?),
+                    root: Some(root),
                     name: o.name,
-                    dest: o.dest,
+                    dest,
                 })
             })
             .collect::<Result<_, ApiError>>()?,
@@ -297,10 +306,11 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
             .secrets
             .into_iter()
             .map(|s| {
+                let (root, host_path) = root_of(&s.host_path)?;
                 Ok(SecretRef {
-                    root: Some(root_of(&s.host_path)?),
+                    root: Some(root),
                     name: s.name,
-                    host_path: s.host_path,
+                    host_path,
                 })
             })
             .collect::<Result<_, ApiError>>()?,

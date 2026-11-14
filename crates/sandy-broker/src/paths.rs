@@ -12,18 +12,30 @@ use std::{
 /// (an output destination) is allowed, since there is nothing to follow. An
 /// empty `roots` allows nothing.
 ///
+/// A path confined to one of the operator's roots, in the form `sandyd` opens (#618).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Rooted {
+    /// The operator's configured root, canonical: never a spelling the client chose. `sandyd` follows the root, so a
+    /// root the client controls (a symlink it can retarget after the check below) would let it redirect every open
+    /// beneath it.
+    pub root: PathBuf,
+    /// The path rewritten onto `root`: `root` joined with the components the client named below its own spelling of
+    /// the root.
+    pub path: PathBuf,
+}
+
 /// This is a check at one moment. It cannot stop a client that swaps a directory for a link after the check, so
-/// the root it found goes to sandyd ([`root_for`]), which opens the path beneath it without following a link
-/// (decision 4, #618).
+/// the root and the rewritten path ([`root_for`]) go to sandyd, which opens the path beneath the root without
+/// following a link (decision 4, #618).
 #[cfg(test)]
 pub(crate) fn within_roots(path: &str, roots: &[PathBuf]) -> bool {
     root_for(path, roots).is_some()
 }
 
-/// The root `path` lies beneath, as the submit body sends it to sandyd (#618): the same checks as
-/// [`within_roots`], and the answer is a prefix of `path` as spelled, so sandyd can strip it. When the client has
-/// several roots that contain the path, the one nearest the path wins, so a nested root confines more.
-pub(crate) fn root_for(path: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+/// Confine `path` to one of `roots` and return it as sandyd opens it (#618): the same checks as [`within_roots`], then
+/// the canonical root and the path rewritten onto it, so the client's spelling of the root (an alias it controls) is
+/// dropped. When several roots contain the path, the nearest wins, so a nested root confines more.
+pub(crate) fn root_for(path: &str, roots: &[PathBuf]) -> Option<Rooted> {
     let path = Path::new(path);
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return None;
@@ -31,12 +43,11 @@ pub(crate) fn root_for(path: &str, roots: &[PathBuf]) -> Option<PathBuf> {
     roots
         .iter()
         .filter_map(|root| confined(path, root))
-        .max_by_key(|root| root.components().count())
+        .max_by_key(|rooted| rooted.root.components().count())
 }
 
-/// The prefix of `path` that names `root` (as `path` spells it) when `path` reaches its target through no symlink
-/// below it.
-fn confined(path: &Path, root: &Path) -> Option<PathBuf> {
+/// `path` beneath `root` when it reaches its target through no symlink below the root.
+fn confined(path: &Path, root: &Path) -> Option<Rooted> {
     let real_root = root.canonicalize().ok()?;
     // The caller may name the root through any alias. Take the shortest ancestor
     // that resolves to the root, so every component below it is walked.
@@ -47,26 +58,50 @@ fn confined(path: &Path, root: &Path) -> Option<PathBuf> {
         .rev()
         .find(|a| a.canonicalize().is_ok_and(|c| c == real_root))?;
     let rest = path.strip_prefix(spelled).ok()?;
-    let mut at = real_root;
+    let mut names = Vec::new();
     for part in rest.components() {
         match part {
-            Component::Normal(name) => at.push(name),
-            Component::CurDir => continue,
+            Component::Normal(name) => names.push(name),
+            Component::CurDir => {}
             _ => return None,
         }
+    }
+    let mut at = real_root.clone();
+    for name in &names {
+        at.push(name);
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => return None,
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(spelled.to_owned()),
+            // A part that does not exist yet (an output destination) has nothing to follow below it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
             Err(_) => return None,
         }
     }
-    Some(spelled.to_owned())
+    let path = names.iter().fold(real_root.clone(), |path, name| path.join(name));
+    Some(Rooted { root: real_root, path })
+}
+
+/// Resolve every configured root to its canonical path, once, at startup (#618). The broker sends that path to
+/// `sandyd` as the root, so it must be the operator's value and not something a client can retarget.
+///
+/// # Errors
+///
+/// A message naming the root that does not exist or cannot be resolved.
+pub(crate) fn canonical_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    roots
+        .iter()
+        .map(|root| {
+            root.canonicalize()
+                .map_err(|e| format!("root {} cannot be resolved: {e}", root.display()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+
+    use anyhow::Context as _;
 
     use super::*;
 
@@ -134,34 +169,47 @@ mod tests {
         Ok(())
     }
 
-    /// #618: the root sent to sandyd is a prefix of the path as spelled, even when the client names the root
-    /// through an alias, and the nearest of several roots wins.
+    /// #618 (review of #889): the root sent to sandyd is the canonical configured root, never the spelling the client
+    /// chose, and the path is rewritten onto it. A client that names a path through an alias it controls cannot make
+    /// the alias the root. The nearest of several roots wins.
     #[test]
-    fn the_root_sent_is_a_prefix_of_the_path_as_spelled_and_the_nearest_wins() -> anyhow::Result<()> {
+    fn the_root_sent_is_the_canonical_configured_root_and_the_path_is_rewritten_onto_it() -> anyhow::Result<()> {
         let (dir, root, _outside) = root_with_outside()?;
+        let real = root.canonicalize()?;
         let nested = root.join("deep");
         std::fs::create_dir(&nested)?;
         let alias = dir.path().join("alias-root");
         symlink(&root, &alias)?;
 
-        let under_root = root.join("f");
-        assert_eq!(
-            root_for(&under_root.to_string_lossy(), std::slice::from_ref(&alias)),
-            Some(root.clone()),
-            "the alias is only a way to name the root: the path's own spelling is sent"
-        );
-        let under_alias = alias.join("f");
-        assert_eq!(
-            root_for(&under_alias.to_string_lossy(), std::slice::from_ref(&root)),
-            Some(alias),
-            "a path spelled through an alias keeps that spelling"
-        );
+        for spelling in [root.join("a/./f"), alias.join("a/f")] {
+            assert_eq!(
+                root_for(&spelling.to_string_lossy(), std::slice::from_ref(&root)),
+                Some(Rooted {
+                    root: real.clone(),
+                    path: real.join("a/f")
+                }),
+                "{spelling:?}: the configured root and the path below it, not the client's spelling"
+            );
+        }
         let deep = nested.join("f");
-        assert_eq!(
-            root_for(&deep.to_string_lossy(), &[root.clone(), nested.clone()]),
-            Some(nested)
-        );
+        let nearest = root_for(&deep.to_string_lossy(), &[root.clone(), nested.clone()]).context("a nested root")?;
+        assert_eq!(nearest.root, nested.canonicalize()?);
+        assert_eq!(nearest.path, nested.canonicalize()?.join("f"));
         assert_eq!(root_for(&root.join("x").to_string_lossy(), &[]), None);
+        Ok(())
+    }
+
+    /// #618: a root that does not exist cannot be resolved at startup, and the error names it.
+    #[test]
+    fn a_root_that_cannot_be_resolved_is_named() -> anyhow::Result<()> {
+        let (dir, root, _outside) = root_with_outside()?;
+        let missing = dir.path().join("absent");
+
+        let ok = canonical_roots(std::slice::from_ref(&root)).map_err(anyhow::Error::msg)?;
+        let err = canonical_roots(&[root, missing.clone()]).expect_err("a missing root must be refused");
+
+        assert_eq!(ok, [std::fs::canonicalize(dir.path().join("root"))?]);
+        assert!(err.contains(&missing.display().to_string()), "{err}");
         Ok(())
     }
 

@@ -250,6 +250,10 @@ fn path_root_refusal(submit: &SubmitRequest) -> Option<String> {
     inputs.chain(outputs).chain(secrets).find_map(|(field, path, root)| {
         let root = root?;
         let refused = |why: &str| Some(format!("{field}: path {path:?} {why} (root {root:?})"));
+        // A NUL ends the string in the C call that opens it, so it would open a different path than the one checked.
+        if root.contains('\0') || path.contains('\0') {
+            return refused("or its root has a NUL byte");
+        }
         let (root_path, path) = (std::path::Path::new(root), std::path::Path::new(path));
         if !root_path.is_absolute() {
             return Some(format!("{field}: root {root:?} is not an absolute path"));

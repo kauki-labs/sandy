@@ -293,7 +293,8 @@ async fn the_broker_sends_the_clients_root_with_every_host_path() -> Result<()> 
         ..Opts::default()
     })
     .await?;
-    let root = f.root_a.clone();
+    // The broker sends the configured root in canonical form (#618), so `/tmp` on macOS is `/private/tmp`.
+    let root = f.root_a.canonicalize()?;
     std::fs::write(root.join("in.txt"), b"x")?;
     let mut body = submit_body();
     body["inputs"] = json!([{"host": root.join("in.txt").to_string_lossy(), "name": "n"}]);
