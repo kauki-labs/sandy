@@ -2790,6 +2790,86 @@ mod tests {
         Ok(())
     }
 
+    /// The env var that tells the child test below which private dir is its `TMPDIR`.
+    const PRUNE_CHILD_TMPDIR: &str = "SANDYD_TEST_PRUNE_TMPDIR";
+
+    /// #885: `Prune` through the handler spares a live job's old `cred-*` dir (#834). The handler sweeps the staging
+    /// base under `std::env::temp_dir()`, which a test cannot repoint in-process (`set_var` is `unsafe`, and a shared
+    /// `/tmp/sandy` would race the other Prune tests: their stores do not know this job, so their age-only rule would
+    /// sweep its dir). So this re-runs the child test below in its own process with `TMPDIR` set to a private dir.
+    #[test]
+    fn prune_through_the_handler_spares_a_live_jobs_old_cred_dir() -> anyhow::Result<()> {
+        let tmp = tempfile::TempDir::new().context("tempdir")?;
+        std::fs::set_permissions(tmp.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).context("chmod")?;
+        let out = std::process::Command::new(std::env::current_exe().context("current exe")?)
+            .args([
+                "--exact",
+                "handler::tests::prune_child_with_a_private_tmpdir",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TMPDIR", tmp.path())
+            .env(PRUNE_CHILD_TMPDIR, tmp.path())
+            .output()
+            .context("run the child test")?;
+        assert!(
+            out.status.success(),
+            "child test failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A name that matched nothing also exits 0, so require that the child ran its one test.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child test did not run:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        Ok(())
+    }
+
+    /// The body of [`prune_through_the_handler_spares_a_live_jobs_old_cred_dir`]. Ignored, so it runs only when the
+    /// parent starts it. It refuses to run unless `temp_dir()` is the private dir the parent made, so a manual
+    /// `--ignored` run can never sweep the real staging base.
+    #[tokio::test]
+    #[ignore = "started by prune_through_the_handler_spares_a_live_jobs_old_cred_dir with a private TMPDIR"]
+    async fn prune_child_with_a_private_tmpdir() -> anyhow::Result<()> {
+        let private = std::env::var(PRUNE_CHILD_TMPDIR).context("only the parent test sets the private TMPDIR")?;
+        anyhow::ensure!(
+            std::env::temp_dir() == std::path::Path::new(&private),
+            "temp_dir is {:?}, not the private {private:?}: refusing to sweep a real base",
+            std::env::temp_dir()
+        );
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        store.insert_pending("running", b"m", "argv/v1")?;
+        store.mark_running("running")?;
+        store.insert_pending("pending", b"m", "argv/v1")?;
+        store.insert_pending("done", b"m", "argv/v1")?;
+        store.finish("done", JobStatus::Succeeded, Some(0), "")?;
+        let base = sandy_fsutil::ensure_sandy_staging_base().context("staging base")?;
+        let running = stage_old_cred_dir(&store, &base, "running")?;
+        let pending = stage_old_cred_dir(&store, &base, "pending")?;
+        let done = stage_old_cred_dir(&store, &base, "done")?;
+        let orphan = stage_old_cred_dir(&store, &base, "no-such-job")?;
+
+        let prune = req(1, control_request::Op::Prune(PruneRequest { keep_last: u32::MAX }));
+        let response = handle(&store, &registry, &host_registry, None, test_session(), prune).await?;
+
+        let Some(control_response::Result::Prune(mut pruned)) = response.result else {
+            anyhow::bail!("expected a Prune response, got {:?}", response.result);
+        };
+        pruned.swept_staging_dirs.sort();
+        assert_eq!(
+            pruned.swept_staging_dirs,
+            ["cred-done", "cred-no-such-job"],
+            "swept dirs"
+        );
+        assert!(running.exists(), "a running job's old cred dir must survive Prune");
+        assert!(pending.exists(), "a pending job's old cred dir must survive Prune");
+        assert!(!done.exists(), "a terminal job's old cred dir must be swept");
+        assert!(!orphan.exists(), "a dir no job record owns keeps the mtime rule");
+        Ok(())
+    }
+
     /// Adversarial: a submitter with no cap at all for the requested channel
     /// is refused that capability, not granted one anyway.
     #[tokio::test]
