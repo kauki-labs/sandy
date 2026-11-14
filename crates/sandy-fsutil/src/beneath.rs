@@ -629,6 +629,28 @@ mod tests {
         Ok(())
     }
 
+    /// #618 (review of #889): a directory created below the root is reached through directories that are only searched.
+    /// An existing intermediate directory with write and search permission and no read permission (`0300`) is entered
+    /// without being read, so creating below it works. Only the final directory is opened readable. Linux-only, and
+    /// skipped for root, as the test above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_is_created_below_a_write_and_search_only_directory() -> anyhow::Result<()> {
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir()?;
+        let search = root.path().join("search");
+        fs::create_dir(&search)?;
+        let _restore = RestoreMode(search.clone(), 0o700);
+        fs::set_permissions(&search, std::os::unix::fs::PermissionsExt::from_mode(0o300))?;
+
+        Beneath::create_dir_beneath(root.path(), &search.join("new/deep")).context("create below a 0300 directory")?;
+
+        assert!(search.join("new/deep").is_dir());
+        Ok(())
+    }
+
     /// #618: a file under real directories below the root is read.
     #[test]
     fn a_file_beneath_the_root_is_opened() -> anyhow::Result<()> {
