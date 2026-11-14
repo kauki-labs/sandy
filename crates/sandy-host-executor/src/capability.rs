@@ -44,6 +44,14 @@ pub enum DetectError {
     /// typo that the operator meant as opt-in, so the executor refuses to start.
     #[error("SANDY_HOST_TRANSFER={0:?} is not one of 1, true, yes, 0, false, no (or empty)")]
     InvalidTransferFlag(String),
+    /// An operator flag is set to something other than a yes or a no spelling.
+    #[error("{name}={value:?} is not one of 1, true, yes, 0, false, no (or empty)")]
+    InvalidFlag {
+        /// The environment variable.
+        name: &'static str,
+        /// The value found.
+        value: String,
+    },
 }
 
 /// Detect this host's architecture from the running process's own build
@@ -219,6 +227,18 @@ fn transfer_from(value: Option<&str>) -> Result<bool, DetectError> {
         Some("1" | "true" | "yes") => Ok(true),
         Some(_) => Err(DetectError::InvalidTransferFlag(value.unwrap_or_default().to_owned())),
     }
+}
+
+/// Stub: the shared operator-flag parser lands in the next commit.
+#[allow(dead_code, reason = "stub until the fix commit")]
+fn flag_from(_name: &'static str, value: Option<&str>) -> Result<bool, DetectError> {
+    Ok(declared(value))
+}
+
+/// Stub: the removed-knob scan lands in the next commit.
+#[allow(dead_code, reason = "stub until the fix commit")]
+fn removed_knobs_from(_lookup: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    Vec::new()
 }
 
 /// An operator declaration: `1`, `true` or `yes`, case-insensitive; anything else, or unset, is not declared.
@@ -416,6 +436,8 @@ fn unavailable_reason(status: &ContainmentStatus) -> String {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
+
     use super::*;
     use crate::dispatch::Hypervisor;
 
@@ -647,6 +669,43 @@ mod tests {
         }
     }
 
+    /// #833: each operator flag refuses a value that is neither a yes nor a no spelling, by variable name and value.
+    #[test]
+    fn every_operator_flag_refuses_an_unknown_value_by_name() -> anyhow::Result<()> {
+        for name in FLAG_NAMES {
+            for value in ["junk", "2", "ture", "ye5", "y"] {
+                let err = flag_from(name, Some(value))
+                    .err()
+                    .with_context(|| format!("{name}={value:?} should be refused"))?;
+                assert_eq!(
+                    err,
+                    DetectError::InvalidFlag {
+                        name,
+                        value: value.to_owned()
+                    }
+                );
+                let text = err.to_string();
+                assert!(text.contains(name) && text.contains(value), "{text}");
+            }
+            for value in ["1", "true", "TRUE", "Yes", " yes "] {
+                assert_eq!(flag_from(name, Some(value)), Ok(true), "{name}={value:?}");
+            }
+            for value in ["0", "false", "No", "", "  "] {
+                assert_eq!(flag_from(name, Some(value)), Ok(false), "{name}={value:?}");
+            }
+            assert_eq!(flag_from(name, None), Ok(false), "{name} unset");
+        }
+        Ok(())
+    }
+
+    /// #833: a removed knob that is still set is reported by name; an unset one is not.
+    #[test]
+    fn removed_knobs_still_set_are_reported() {
+        let set = |k: &str| (k == "SANDY_TAP" || k == "SANDY_NETWORK").then(|| "x".to_owned());
+        assert_eq!(removed_knobs_from(set), vec!["SANDY_NETWORK", "SANDY_TAP"]);
+        assert!(removed_knobs_from(|_| None).is_empty());
+    }
+
     /// #807: the registration carries `transfer` only when asked, whatever else the host declares.
     #[test]
     fn to_wire_capabilities_declares_transfer_only_when_asked() {
@@ -782,6 +841,12 @@ mod tests {
         );
         Ok(())
     }
+
+    const FLAG_NAMES: [&str; 3] = [
+        "SANDY_HOST_SHARES_SUBMITTER_FS",
+        "SANDY_HOST_EGRESS_PROXY",
+        "SANDY_HOST_TRANSFER",
+    ];
 
     fn unsupported() -> ContainmentStatus {
         ContainmentStatus::Unsupported("process containment needs Linux cgroup v2".to_owned())
