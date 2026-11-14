@@ -11,12 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(sandyd)* refuse a Submit with no capable host instead of leaving it Pending (refs #868) ([#882](https://github.com/kauki-labs/sandy/pull/882))
-- *(sandyd)* prune and gc keep a live job's cred dir whatever its age (closes #834) ([#880](https://github.com/kauki-labs/sandy/pull/880))
+- _(sandyd)_ refuse a Submit with no capable host instead of leaving it Pending (refs #868) ([#882](https://github.com/kauki-labs/sandy/pull/882))
+- _(sandyd)_ prune and gc keep a live job's cred dir whatever its age (closes #834) ([#880](https://github.com/kauki-labs/sandy/pull/880))
 
 ### Other
 
-- *(api)* rename VmBackend to VirtualizationBackend ([#869](https://github.com/kauki-labs/sandy/pull/869))
+- _(api)_ rename VmBackend to VirtualizationBackend ([#869](https://github.com/kauki-labs/sandy/pull/869))
 
 ## [0.2.3](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.2...sandyd-v0.2.3) - 2026-11-13
 
