@@ -371,7 +371,9 @@ close; `mint_lease_checked`/`refresh_once_checked` are additive siblings instead
 
 ## 14. Host paths are not followed at or below the leaf (#618)
 
-**Status:** accepted for the leaf and everything below it. The components above the leaf are open work (#607).
+**Status:** accepted for the leaf and everything below it. The components above the leaf are closed for a path that
+carries a root, in the transfer path of `sandyd` (slice 1 of #618, see the end of this section). A shared-filesystem
+executor does not honour a root yet (slice 2).
 
 **Context.** `stage_inputs` and `collect_outputs` took host paths by name. A caller that can change a directory
 between its own check and sandyd's use (the broker checks a path against a client root, once) could redirect a read
@@ -415,6 +417,21 @@ per-client `roots` do not reach the control RPC. That is a public-API change (an
 and on `Input`, `Output` and `SecretRef`), proposed on #618 and #607. Also open: a write through a hard link, or a leaf
 swapped for one (writing a temp file and renaming it over the name would close it), and reading a hard-linked file
 inside an input tree (macOS has no protected hardlinks).
+
+**Closing the components above the leaf (#618, owner decision 2026-11-14).** The control `Submit` and the executor
+`Dispatch` carry an optional `root` on each input, output and secret path (wire only, absent keeps today's
+behaviour). The broker sets it to the root of the client's configured `roots` that contains the path, spelled as the
+path spells it, nearest root first. `sandyd` refuses a Submit whose root is not absolute, whose path is not under it, or
+that has a `..` below it. It then opens the path with `sandy_fsutil::beneath::{open_file_beneath,
+Beneath::open_dir_beneath, Beneath::create_dir_beneath}`: the root opens as the OS resolves it (it is trusted, and macOS
+`/tmp` is a link), and every component below it is opened with `openat` and `O_NOFOLLOW`, so a parent directory swapped
+for a symlink is refused. `..` is refused by the path check, because `O_NOFOLLOW` does not stop `openat(fd, "..")`.
+The CLI sets no root: a local user is no boundary. Slice 1 covers what `sandyd` opens itself: the data-link sender
+(inputs) and receiver (outputs). A shared-filesystem executor opens the same paths in `sandy::stage` from the
+sandy-api `Input`, `Output` and `SecretRef`, which carry no root yet, and `sandyd` copies the root into the `Dispatch`
+for it; it ignores it until slice 2. Secrets are read only by the executor, so slice 1 does not close them either.
+This change is additive on the wire, and a source-break for any external struct literal of the sandy-api types once
+slice 2 adds the field there.
 
 **Set aside.** `canonicalize`, then walk: `canonicalize` follows a link swapped in after the check, so the walk would
 open the attacker's target cleanly. Walking the raw path from `/` with no-follow on every component: it refuses

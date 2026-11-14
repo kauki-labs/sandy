@@ -6,7 +6,8 @@
 //! resolved a second time, and a link planted there is refused.
 //!
 //! The components above the leaf are resolved as the OS resolves them, so a system link such as macOS `/tmp` still
-//! works. Closing those needs a trusted root to open beneath, which the callers do not have yet (#607).
+//! works. A caller that has a trusted root closes those too with the `*_beneath` functions: the root is opened as the
+//! OS resolves it, and every component of the path below it is walked without following a link (#618, #607).
 
 use std::{
     ffi::{OsStr, OsString},
@@ -299,6 +300,51 @@ impl Beneath {
     }
 }
 
+/// The components of `path` below `root`. `root` must be absolute and `path` lexically under it; no component below
+/// it may be `..`, which `O_NOFOLLOW` does not stop (`openat(fd, "..")` leaves the root). `.` and a trailing `/`
+/// are dropped by [`Path::components`].
+fn below_root<'a>(root: &Path, path: &'a Path) -> Result<Vec<&'a OsStr>, FsError> {
+    let unsafe_path = |reason: &str| FsError::Unsafe {
+        path: path.to_owned(),
+        reason: format!("{reason} (root {})", root.display()),
+    };
+    if !root.is_absolute() {
+        return Err(unsafe_path("the root is not an absolute path"));
+    }
+    let rest = path
+        .strip_prefix(root)
+        .map_err(|_| unsafe_path("is not under the root"))?;
+    rest.components()
+        .map(|c| match c {
+            std::path::Component::Normal(name) => Ok(name),
+            _ => Err(unsafe_path("has a `..` or root component below the root")),
+        })
+        .collect()
+}
+
+/// Open the regular file at `path`, which lies beneath `root`, for reading. `root` resolves as the OS resolves it
+/// (it is trusted, and a system link such as macOS `/tmp` is fine); every component below it, the leaf included, is
+/// opened without following a link, so a parent directory swapped for a symlink is refused (#618).
+///
+/// # Errors
+///
+/// [`FsError::Unsafe`] when `root` is not absolute, `path` is not under it or is it, a component is `..`, or a
+/// component is a symlink or the leaf is not a regular file, else [`FsError::Io`].
+pub fn open_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
+    let mut parts = below_root(root, path)?;
+    let Some(leaf) = parts.pop() else {
+        return Err(FsError::Unsafe {
+            path: path.to_owned(),
+            reason: "is the root, not a file below it".to_owned(),
+        });
+    };
+    let mut dir = Beneath::open_root(root)?;
+    for part in parts {
+        dir = dir.open_search_subdir(part)?;
+    }
+    dir.open_file(leaf)
+}
+
 /// Open the regular file at `path` for reading. The leaf is not followed: a symlink there is refused.
 ///
 /// # Errors
@@ -347,6 +393,65 @@ impl Iterator for Entries<'_> {
 }
 
 impl Beneath {
+    /// Open `root`, a trusted absolute directory, as the OS resolves it: a link at the root or above it is followed.
+    /// It is the start of a walk below it ([`Beneath::open_dir_beneath`], [`open_file_beneath`]).
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] when `root` is not absolute or not a directory, else [`FsError::Io`].
+    pub fn open_root(root: &Path) -> Result<Self, FsError> {
+        if !root.is_absolute() {
+            return Err(FsError::Unsafe {
+                path: root.to_owned(),
+                reason: "the root is not an absolute path".to_owned(),
+            });
+        }
+        Self::open_dir_following_leaf(root)
+    }
+
+    /// Open the directory at `path`, which lies beneath `root`: `root` resolves as the OS resolves it, and every
+    /// component below it is opened without following a link (#618). A `path` equal to `root` opens `root`.
+    ///
+    /// # Errors
+    ///
+    /// [`FsError::Unsafe`] when `root` is not absolute, `path` is not under it, a component is `..`, or a component
+    /// is a symlink or not a directory, else [`FsError::Io`].
+    pub fn open_dir_beneath(root: &Path, path: &Path) -> Result<Self, FsError> {
+        let mut dir = Self::open_root(root)?;
+        for part in below_root(root, path)? {
+            dir = dir.open_subdir(part)?;
+        }
+        Ok(dir)
+    }
+
+    /// Create the directory at `path`, which lies beneath `root`, with the directories above it that are missing, and
+    /// open it. Each component is created or adopted without following a link: an existing symlink is refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Beneath::open_dir_beneath`].
+    pub fn create_dir_beneath(root: &Path, path: &Path) -> Result<Self, FsError> {
+        let mut dir = Self::open_root(root)?;
+        for part in below_root(root, path)? {
+            dir = dir.create_dir(part)?;
+        }
+        Ok(dir)
+    }
+
+    /// Open the subdirectory `name` only to search it, as [`Beneath::open_parent`] does: on Linux an `O_PATH` handle,
+    /// which needs search (execute) permission and not read. A symlink is refused.
+    fn open_search_subdir(&self, name: &OsStr) -> Result<Self, FsError> {
+        let name = component(name, &self.path)?;
+        let path = self.path.join(name);
+        #[cfg(target_os = "linux")]
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::openat(&self.fd, name, flags, Mode::empty())
+            .map_err(|e| refused("open directory", &path, e, true))?;
+        Ok(Self { fd, path })
+    }
+
     /// Open `dir`, the parent of a leaf a caller is about to open, only to search it. On Linux that is an `O_PATH`
     /// handle, which needs search (execute) permission and not read, so a file under an execute-only directory, or a
     /// destination under a write-and-execute-only one, still works. Elsewhere it is a plain read open. The parent
@@ -449,6 +554,96 @@ mod tests {
 
     fn name(s: &str) -> &OsStr {
         OsStr::new(s)
+    }
+
+    /// #618: a root and a path below it, with the parent of the leaf swapped for a link to a directory elsewhere.
+    fn swapped_parent() -> anyhow::Result<(tempfile::TempDir, tempfile::TempDir)> {
+        let outside = tempfile::tempdir()?;
+        fs::write(outside.path().join("f"), b"outside")?;
+        let root = tempfile::tempdir()?;
+        symlink(outside.path(), root.path().join("sub"))?;
+        Ok((root, outside))
+    }
+
+    /// #618: a file under real directories below the root is read.
+    #[test]
+    fn a_file_beneath_the_root_is_opened() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("a/b"))?;
+        fs::write(root.path().join("a/b/f"), b"inside")?;
+
+        let mut file = open_file_beneath(root.path(), &root.path().join("a/b/f"))?;
+
+        let mut text = String::new();
+        io::Read::read_to_string(&mut file, &mut text)?;
+        assert_eq!(text, "inside");
+        Ok(())
+    }
+
+    /// #618: a parent swapped for a link is refused by every `*_beneath` function, and the target is not touched.
+    #[test]
+    fn a_swapped_parent_is_refused_beneath_a_root() -> anyhow::Result<()> {
+        let (root, outside) = swapped_parent()?;
+        let through = root.path().join("sub");
+
+        let file = open_file_beneath(root.path(), &through.join("f")).expect_err("a file through a link");
+        let dir = Beneath::open_dir_beneath(root.path(), &through).expect_err("a directory that is a link");
+        let created =
+            Beneath::create_dir_beneath(root.path(), &through.join("new")).expect_err("create through a link");
+
+        for err in [file, dir, created] {
+            assert!(matches!(err, FsError::Unsafe { .. }), "{err}");
+        }
+        assert!(!outside.path().join("new").exists(), "nothing may be created outside");
+        Ok(())
+    }
+
+    /// #618: the root itself may be (or sit below) a link, as macOS `/tmp` does. Only what is below it is walked.
+    #[test]
+    fn a_root_that_is_a_symlink_is_followed() -> anyhow::Result<()> {
+        let real = tempfile::tempdir()?;
+        fs::write(real.path().join("f"), b"x")?;
+        let holder = tempfile::tempdir()?;
+        let link = holder.path().join("root");
+        symlink(real.path(), &link)?;
+
+        open_file_beneath(&link, &link.join("f")).context("a file under a root that is a link")?;
+        Beneath::open_dir_beneath(&link, &link).context("the root itself")?;
+        Ok(())
+    }
+
+    /// #618: a path outside the root, a `..` below it, a relative root, and the root named as a file are refused
+    /// before anything is opened.
+    #[test]
+    fn a_path_that_leaves_the_root_is_refused_lexically() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        fs::write(other.path().join("f"), b"x")?;
+        fs::create_dir(root.path().join("a"))?;
+
+        let cases: [(&Path, PathBuf); 4] = [
+            (root.path(), other.path().join("f")),
+            (root.path(), root.path().join("a/../../f")),
+            (Path::new("relative"), PathBuf::from("relative/f")),
+            (root.path(), root.path().to_owned()),
+        ];
+        for (root, path) in cases {
+            let err = open_file_beneath(root, &path).expect_err("must be refused");
+            assert!(matches!(err, FsError::Unsafe { .. }), "{path:?}: {err}");
+        }
+        Ok(())
+    }
+
+    /// #618: missing directories below the root are created, and an existing real directory is adopted.
+    #[test]
+    fn a_directory_beneath_the_root_is_created_with_its_parents() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("have"))?;
+
+        Beneath::create_dir_beneath(root.path(), &root.path().join("have/new/deep"))?;
+
+        assert!(root.path().join("have/new/deep").is_dir());
+        Ok(())
     }
 
     /// #618: a symlink at the leaf is refused, even when it names a directory.

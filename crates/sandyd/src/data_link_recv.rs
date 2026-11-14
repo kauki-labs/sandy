@@ -425,16 +425,22 @@ fn process_is_alive(pid: u32) -> bool {
     !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH))
 }
 
-/// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
-/// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
-/// including when the receive that asked for it is gone by the time this ends.
+/// Open the destination `root` (beneath `trusted_root` when one is given), create the directories in `parts`, and a new
+/// temp file in the last one. Runs on the blocking pool. The returned guard removes the temp file if it is dropped
+/// before the file is renamed, including when the receive that asked for it is gone by the time this ends.
 fn open_temp(
+    trusted_root: Option<&Path>,
     root: &Path,
     parts: &[String],
     mut seq: u64,
     sweep: bool,
 ) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
-    let mut dir = Beneath::create_dir_at(root)?;
+    // With a trusted root (#618) the destination is walked below it without following a link; without one its
+    // ancestors resolve by path, as local collection does (#607).
+    let mut dir = match trusted_root {
+        Some(trusted) => Beneath::create_dir_beneath(trusted, root)?,
+        None => Beneath::create_dir_at(root)?,
+    };
     for part in parts {
         dir = dir.create_dir(OsStr::new(part))?;
     }
@@ -533,6 +539,7 @@ impl<'a> Receive<'a> {
     /// counted first; the directory work runs on the blocking pool.
     async fn start_file(&mut self, key: (u32, String)) -> Result<(), ReceiveError> {
         let (root, parts, name) = self.target(&key)?;
+        let trusted_root = self.target_root(&key)?;
         let mut prefix = String::new();
         for part in &parts {
             if !prefix.is_empty() {
@@ -547,9 +554,10 @@ impl<'a> Receive<'a> {
         let seq = self.temp_seq;
         // `prefix` is now the file's directory below its root: the first file there sweeps it.
         let sweep = self.swept.insert(entry_key(key.0, &prefix));
-        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq, sweep))
-            .await
-            .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        let (cleanup, file, seq) =
+            tokio::task::spawn_blocking(move || open_temp(trusted_root.as_deref(), &root, &parts, seq, sweep))
+                .await
+                .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
         self.temp_seq = seq;
         self.current = Some(InFlight {
             key,
@@ -566,6 +574,15 @@ impl<'a> Receive<'a> {
             return Err(ReceiveError::TooManyEntries);
         }
         Ok(())
+    }
+
+    /// The trusted root the output's destination lies beneath, when the Submit named one (#618).
+    fn target_root(&self, key: &(u32, String)) -> Result<Option<std::path::PathBuf>, ReceiveError> {
+        let output = usize::try_from(key.0)
+            .ok()
+            .and_then(|i| self.outputs.get(i))
+            .ok_or(ReceiveError::BadIndex)?;
+        Ok(output.root.as_ref().map(std::path::PathBuf::from))
     }
 
     /// Where a chunk goes, pinned to local `collect_outputs`: the directory to open, the directories below it, and
@@ -1107,7 +1124,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 1000, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(None, dest.path(), &[], 1000, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1006, "the first free name after the stale ones");
         drop(cleanup);
         Ok(())
@@ -1121,7 +1138,7 @@ mod tests {
         for n in 1..=1000 {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
-        let Err(error) = open_temp(dest.path(), &[], 0, false) else {
+        let Err(error) = open_temp(None, dest.path(), &[], 0, false) else {
             anyhow::bail!("every name the search may try is taken, it must fail");
         };
         assert!(
@@ -1140,7 +1157,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 0, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(None, dest.path(), &[], 0, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1000);
         drop(cleanup);
         Ok(())

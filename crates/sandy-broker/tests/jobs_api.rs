@@ -283,6 +283,37 @@ async fn a_host_path_outside_the_clients_roots_is_forbidden() -> Result<()> {
     Ok(())
 }
 
+/// #618: the broker sends the client's root with every host path, so sandyd opens each path beneath it without
+/// following a link. A path under a nested root gets the nested root, and a client's root is never sent for a path
+/// the client may not name.
+#[tokio::test]
+async fn the_broker_sends_the_clients_root_with_every_host_path() -> Result<()> {
+    let mut f = fixture_with_opts(Opts {
+        path_host: true,
+        ..Opts::default()
+    })
+    .await?;
+    let root = f.root_a.clone();
+    std::fs::write(root.join("in.txt"), b"x")?;
+    let mut body = submit_body();
+    body["inputs"] = json!([{"host": root.join("in.txt").to_string_lossy(), "name": "n"}]);
+    body["outputs"] = json!([{"name": "o", "dest": root.join("out").to_string_lossy()}]);
+    body["secrets"] = json!([{"name": "S", "host_path": root.join("secret").to_string_lossy()}]);
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), f._host_dispatch.recv())
+        .await
+        .context("the job was never dispatched")?
+        .context("the dispatch channel closed")?;
+    let want = Some(root.to_string_lossy().into_owned());
+    assert_eq!(dispatch.inputs[0].root, want);
+    assert_eq!(dispatch.outputs[0].root, want);
+    assert_eq!(dispatch.secrets[0].root, want);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_planted_symlink_under_the_root_cannot_redirect_a_path() -> Result<()> {
     let f = fixture().await?;

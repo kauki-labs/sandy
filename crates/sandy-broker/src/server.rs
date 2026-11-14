@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 
 use crate::{
     Client, IsolationClass, attach, auth::authenticate, body::Body, environments, output, output::Outputs,
-    owners::Owners, paths::within_roots,
+    owners::Owners, paths::root_for,
 };
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -253,15 +253,13 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
     if body.required_isolation_class > client.max_isolation_class {
         return Err(FORBIDDEN);
     }
-    let paths = body
-        .inputs
-        .iter()
-        .map(|i| &i.host)
-        .chain(body.outputs.iter().map(|o| &o.dest))
-        .chain(body.secrets.iter().map(|s| &s.host_path));
-    if !paths.into_iter().all(|p| within_roots(p, &client.roots)) {
-        return Err(FORBIDDEN);
-    }
+    // Every path must lie beneath one of the client's roots. That root goes to sandyd with the path (#618), which opens
+    // the path beneath it without following a link, so a parent directory swapped after this check cannot redirect it.
+    let root_of = |path: &str| {
+        root_for(path, &client.roots)
+            .map(|root| root.to_string_lossy().into_owned())
+            .ok_or(FORBIDDEN)
+    };
     let class = match body.required_isolation_class {
         IsolationClass::Trusted => WireClass::Trusted,
         IsolationClass::Untrusted => WireClass::Untrusted,
@@ -275,31 +273,37 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         inputs: body
             .inputs
             .into_iter()
-            .map(|i| Input {
-                root: None,
-                host: i.host,
-                name: i.name,
-                guest_path: i.guest_path,
+            .map(|i| {
+                Ok(Input {
+                    root: Some(root_of(&i.host)?),
+                    host: i.host,
+                    name: i.name,
+                    guest_path: i.guest_path,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         outputs: body
             .outputs
             .into_iter()
-            .map(|o| Output {
-                root: None,
-                name: o.name,
-                dest: o.dest,
+            .map(|o| {
+                Ok(Output {
+                    root: Some(root_of(&o.dest)?),
+                    name: o.name,
+                    dest: o.dest,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         secrets: body
             .secrets
             .into_iter()
-            .map(|s| SecretRef {
-                root: None,
-                name: s.name,
-                host_path: s.host_path,
+            .map(|s| {
+                Ok(SecretRef {
+                    root: Some(root_of(&s.host_path)?),
+                    name: s.name,
+                    host_path: s.host_path,
+                })
             })
-            .collect(),
+            .collect::<Result<_, ApiError>>()?,
         credential: None,
         cred_capabilities: Vec::new(),
         egress: None,

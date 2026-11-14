@@ -236,6 +236,34 @@ fn egress_policy_refusal(submit: &SubmitRequest) -> Option<String> {
     })
 }
 
+/// Refuse a Submit whose path has a root it cannot lie beneath (#618): a root that is not absolute, a path that is not
+/// under it, or one with a `..` below it. `sandyd` then opens the path beneath the root without following a link, and
+/// refuses anything this check lets through only by an accident of spelling. The broker sets the root from its client's
+/// roots and already checks the same, but a root is also a public field of the control RPC. Names the field.
+fn path_root_refusal(submit: &SubmitRequest) -> Option<String> {
+    let inputs = submit.inputs.iter().map(|i| ("inputs", &i.host, i.root.as_ref()));
+    let outputs = submit.outputs.iter().map(|o| ("outputs", &o.dest, o.root.as_ref()));
+    let secrets = submit
+        .secrets
+        .iter()
+        .map(|s| ("secrets", &s.host_path, s.root.as_ref()));
+    inputs.chain(outputs).chain(secrets).find_map(|(field, path, root)| {
+        let root = root?;
+        let refused = |why: &str| Some(format!("{field}: path {path:?} {why} (root {root:?})"));
+        let (root_path, path) = (std::path::Path::new(root), std::path::Path::new(path));
+        if !root_path.is_absolute() {
+            return Some(format!("{field}: root {root:?} is not an absolute path"));
+        }
+        let Ok(rest) = path.strip_prefix(root_path) else {
+            return refused("is not under its root");
+        };
+        if rest.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return refused("has a `..` below its root");
+        }
+        None
+    })
+}
+
 /// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
 /// operator knows what to declare and a submitter knows why the job cannot be placed.
 /// The refusal for a Submit that asks for digests with no host to compute them (A2c, #483). It names the capability:
@@ -304,7 +332,7 @@ fn to_dispatch_path_fields(
         .inputs
         .iter()
         .map(|i| sandy_executor_proto::Input {
-            root: None,
+            root: i.root.clone(),
             host: i.host.clone(),
             name: i.name.clone(),
             guest_path: i.guest_path.clone(),
@@ -314,7 +342,7 @@ fn to_dispatch_path_fields(
         .outputs
         .iter()
         .map(|o| sandy_executor_proto::Output {
-            root: None,
+            root: o.root.clone(),
             name: o.name.clone(),
             dest: o.dest.clone(),
         })
@@ -323,7 +351,7 @@ fn to_dispatch_path_fields(
         .secrets
         .iter()
         .map(|s| sandy_executor_proto::SecretRef {
-            root: None,
+            root: s.root.clone(),
             name: s.name.clone(),
             host_path: s.host_path.clone(),
         })
@@ -618,6 +646,13 @@ pub async fn handle(
             }
             // A1 (#483): a malformed egress rule is refused before placement, with no side effect.
             if let Some(message) = egress_policy_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
+            // #618: a path that cannot lie beneath its root is refused before placement, with no side effect.
+            if let Some(message) = path_root_refusal(&submit) {
                 return Ok(ControlResponse {
                     request_id: request.request_id,
                     result: Some(control_response::Result::Error(ControlError { message })),
@@ -3615,6 +3650,125 @@ mod tests {
             });
             assert_eq!(dispatch.egress, want, "{name}");
         }
+        Ok(())
+    }
+
+    /// A Submit with one input, one output and one secret, each carrying `root` and a path under `base`.
+    fn submit_with_roots(root: &str, base: &str) -> ControlRequest {
+        let mut request = submit_req_with_input(1);
+        if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+            submit.inputs = vec![sandy_control_proto::Input {
+                root: Some(root.to_owned()),
+                host: format!("{base}/in"),
+                name: "in".to_owned(),
+                guest_path: None,
+            }];
+            submit.outputs = vec![sandy_control_proto::Output {
+                root: Some(root.to_owned()),
+                name: Some("out".to_owned()),
+                dest: format!("{base}/out"),
+            }];
+            submit.secrets = vec![sandy_control_proto::SecretRef {
+                root: Some(root.to_owned()),
+                name: "TOKEN".to_owned(),
+                host_path: format!("{base}/token"),
+            }];
+        }
+        request
+    }
+
+    /// #618: a rooted path the daemon could not open beneath its root is refused at Submit naming the field, and
+    /// nothing is dispatched: a root that is not absolute, a path outside the root, a `..` below it. One field at a
+    /// time, so each of the three path fields is covered.
+    #[tokio::test]
+    async fn a_path_that_cannot_lie_beneath_its_root_is_refused_at_submit() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+        let bad: [(&str, &str, &str); 3] = [
+            ("relative root", "data", "data"),
+            ("outside the root", "/srv/a", "/srv/b"),
+            ("dot-dot below the root", "/srv/a", "/srv/a/x/.."),
+        ];
+        for (name, root, base) in bad {
+            for field in ["inputs", "outputs", "secrets"] {
+                let mut request = submit_with_roots(root, base);
+                // Keep the bad root on one field only: the others are valid.
+                if let Some(control_request::Op::Submit(submit)) = request.op.as_mut() {
+                    submit.inputs[0].host = "/srv/ok/in".to_owned();
+                    submit.outputs[0].dest = "/srv/ok/out".to_owned();
+                    submit.secrets[0].host_path = "/srv/ok/token".to_owned();
+                    submit.inputs[0].root = Some("/srv/ok".to_owned());
+                    submit.outputs[0].root = Some("/srv/ok".to_owned());
+                    submit.secrets[0].root = Some("/srv/ok".to_owned());
+                    match field {
+                        "inputs" => {
+                            submit.inputs[0].root = Some(root.to_owned());
+                            submit.inputs[0].host = format!("{base}/in");
+                        }
+                        "outputs" => {
+                            submit.outputs[0].root = Some(root.to_owned());
+                            submit.outputs[0].dest = format!("{base}/out");
+                        }
+                        _ => {
+                            submit.secrets[0].root = Some(root.to_owned());
+                            submit.secrets[0].host_path = format!("{base}/token");
+                        }
+                    }
+                }
+                let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+                let mut dispatch_rx = register_test_host(&host_registry, "host", peer_ip, capabilities.clone());
+                let forward_back: std::net::SocketAddr = "100.64.0.1:9000".parse().context("forward_back")?;
+                let response = handle(
+                    &store,
+                    &registry,
+                    &host_registry,
+                    Some(forward_back),
+                    test_session(),
+                    request,
+                )
+                .await?;
+                match response.result {
+                    Some(control_response::Result::Error(e)) => {
+                        assert!(
+                            e.message.contains(field),
+                            "{name}/{field}: must name the field: {}",
+                            e.message
+                        );
+                    }
+                    other => anyhow::bail!("{name}/{field}: expected a refusal, got {other:?}"),
+                }
+                assert!(
+                    dispatch_rx.try_recv().is_err(),
+                    "{name}/{field}: nothing was dispatched"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #618: a valid rooted Submit is placed, and the host's `Dispatch` carries each root unchanged, so a host that
+    /// opens the path itself can open it beneath the root. A path with no root has none on the wire.
+    #[tokio::test]
+    async fn a_rooted_submit_reaches_the_dispatch_with_its_roots() -> anyhow::Result<()> {
+        let peer_ip: std::net::IpAddr = "100.64.0.7".parse().context("peer ip literal")?;
+        let capabilities = sandy_executor_proto::Capabilities {
+            shares_submitter_filesystem: true,
+            transfer: true,
+            ..trusted_host_capabilities()
+        };
+
+        let (dispatch, _job, _registry) =
+            place_and_read(submit_with_roots("/srv/a", "/srv/a/job"), capabilities.clone(), peer_ip).await?;
+        assert_eq!(dispatch.inputs[0].root.as_deref(), Some("/srv/a"));
+        assert_eq!(dispatch.outputs[0].root.as_deref(), Some("/srv/a"));
+        assert_eq!(dispatch.secrets[0].root.as_deref(), Some("/srv/a"));
+
+        let (unrooted, _job, _registry) = place_and_read(submit_req_with_input(1), capabilities, peer_ip).await?;
+        assert_eq!(unrooted.inputs[0].root, None, "no root in, no root out");
         Ok(())
     }
 

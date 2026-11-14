@@ -95,6 +95,12 @@ cannot leave a job without an owner.
 **Consequence.** The contract is unchanged on the wire. These are new refusals, so `sandy-mcp`
 tests keep passing.
 
+**Root sent to sandyd (#618).** The broker also sends the root that contains each path (the nearest of the client's
+`roots`, spelled as the path spells it) in the optional `root` of the control `Submit` input, output and secret
+messages. The HTTP contract does not change. `sandyd` opens an input or output beneath that root without following
+a link, which closes the parent-swap gap for the transfer path. A shared-filesystem executor honours the root after
+slice 2 of #618, so until then the residual risk below still holds for that placement.
+
 **Residual risk (_owner_).** The check is a point in time. sandyd now opens the leaf of each input, output and
 secret path without following a link and works below it through that handle (guest-shares decision 14, #618), and no
 longer copies a link inside an input tree by value. That does not stop a hostile client: the client picks the path
