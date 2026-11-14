@@ -74,9 +74,6 @@ pub struct BrokerConfig {
     pub bind: SocketAddr,
     /// Known clients.
     pub clients: Vec<Client>,
-    /// `sandyd`'s attach socket, when it is not the one derived from `control_socket` (#888): the broker's control
-    /// path is the broker socket, which `sandyd` does not derive the attach socket from. `None` derives it.
-    pub attach_socket: Option<PathBuf>,
 }
 
 /// A running broker. Dropping it stops the listener and the output collectors.

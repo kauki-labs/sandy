@@ -2954,9 +2954,12 @@ cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other pro
   carries the field is refused with an error that names `client_id` and the broker socket. It is never ignored. Every
   other operation (attach, status, cancel, list, environments, prune) is served the same way on both sockets.
 - The broker is the only writer. The HTTP submit body has no such field (`deny_unknown_fields`), and the broker sets it
-  from the client its bearer token identified, so a client cannot name another client. `BrokerConfig` takes an optional
-  explicit attach socket path. The attach socket stays the one `sandyd` derives from `SANDY_SOCK`, and the broker's
-  control path is now the broker socket, so the broker can no longer derive the attach path from it.
+  from the client its bearer token identified, so a client cannot name another client. The broker socket must be in the same directory as the
+  main socket: `sandyd` derives the attach socket as a fixed sibling of the control path (`attach_socket_path`), so
+  a broker socket there gives the broker the right attach path with no extra setting. `sandyd` refuses to start when
+  `SANDYD_BROKER_SOCK` is empty, is not an absolute path, names the main socket or the attach socket, or is in another
+  directory than `SANDY_SOCK`, naming both paths. The directories are compared after links and `..` are resolved, so a
+  broker socket reached through a symlinked directory is neither let through nor refused by mistake.
 - The receipt names the client: `who.identity = "broker:<client_id>"`, `who.authenticated = false`. The prefix says who
   asserted the id and keeps a client id such as `1000` from being read as a uid. The broker asserts the id and nothing
   verifies it, so `authenticated` stays false until verified caps exist (#413). The `sandy-api` `Who` struct does not

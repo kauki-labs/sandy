@@ -84,7 +84,6 @@ async fn main() -> ExitCode {
     };
     let running = serve_with_tuning(
         BrokerConfig {
-            attach_socket: None,
             control_socket: args.control_socket,
             rpc_deadline: std::time::Duration::from_secs(30),
             state_dir: args.state_dir,

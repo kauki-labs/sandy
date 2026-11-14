@@ -2,6 +2,8 @@
 //! a client id only there.
 
 use std::{
+    ffi::OsStr,
+    io::Read,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::Path,
     process::{Child, Command, Stdio},
@@ -125,5 +127,88 @@ async fn a_client_id_is_refused_on_the_main_socket_and_honoured_on_the_broker_so
         !on_broker.contains("client_id"),
         "the broker socket must not refuse the client id: {on_broker}"
     );
+    Ok(())
+}
+
+/// Run `sandyd` with `SANDYD_BROKER_SOCK` set to `value` and return its exit code and log. A daemon that keeps running
+/// is killed (its own child, nothing else) and the result is `None`.
+fn run_with_broker_sock(dir: &Path, value: &OsStr) -> Result<(Option<i32>, String)> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sandyd"))
+        .env("SANDY_SOCK", dir.join("main.sock"))
+        .env("SANDY_DB", dir.join("d.db"))
+        .env("SANDYD_BROKER_SOCK", value)
+        .env_remove("SANDY_ENV_BACKEND")
+        .env_remove("SANDY_AUDIT_LOG")
+        .env_remove("SANDY_MAX_JOBS")
+        .env_remove("SANDY_MAX_ENVIRONMENTS")
+        .env_remove("SANDY_PROFILES")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn sandyd")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let code = loop {
+        if let Some(status) = child.try_wait().context("wait for sandyd")? {
+            break Some(status.code());
+        }
+        if Instant::now() >= deadline {
+            child.kill().context("kill a daemon that did not exit")?;
+            child.wait().context("reap sandyd")?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut log = String::new();
+    child.stdout.take().context("stdout")?.read_to_string(&mut log)?;
+    child.stderr.take().context("stderr")?.read_to_string(&mut log)?;
+    Ok((code.flatten(), log))
+}
+
+/// A broker socket the daemon cannot trust stops it at start, exit 1, naming the cause: empty, relative, the main
+/// socket or the attach socket itself, or a directory other than `SANDY_SOCK`'s (both paths named).
+#[test]
+fn a_broker_socket_that_cannot_be_trusted_stops_the_daemon_naming_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let elsewhere = tempfile::tempdir()?;
+    let other_dir_sock = elsewhere.path().join("broker.sock");
+    let main_sock = dir.path().join("main.sock");
+    let attach_sock = dir.path().join("sandyd-attach.sock");
+    let cases: [(&str, &OsStr, &str); 5] = [
+        ("empty", OsStr::new(""), "empty"),
+        ("relative", OsStr::new("broker.sock"), "absolute"),
+        ("the main socket", main_sock.as_os_str(), "main socket"),
+        ("the attach socket", attach_sock.as_os_str(), "attach socket"),
+        ("another directory", other_dir_sock.as_os_str(), "same directory"),
+    ];
+    for (name, value, needle) in cases {
+        let (code, log) = run_with_broker_sock(dir.path(), value)?;
+        ensure!(
+            code == Some(1),
+            "{name}: exit {code:?} (None means it kept running): {log}"
+        );
+        ensure!(log.contains(needle), "{name}: the log must say `{needle}`: {log}");
+        if name == "another directory" {
+            ensure!(
+                log.contains(&other_dir_sock.display().to_string()) && log.contains(&main_sock.display().to_string()),
+                "{name}: the log must name both paths: {log}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The directories are compared after links are resolved: a broker socket reached through a symlinked directory that is
+/// the main socket's own directory is accepted, and the socket appears in that directory.
+#[tokio::test]
+async fn a_broker_socket_through_a_symlinked_directory_is_accepted() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let holder = tempfile::tempdir()?;
+    let link = holder.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link)?;
+    let via_link = link.join("broker.sock");
+    let _daemon = start(dir.path(), Some(&via_link))?;
+
+    wait_for_socket(&dir.path().join("broker.sock"), 5).context("the broker socket in the main directory")?;
     Ok(())
 }
