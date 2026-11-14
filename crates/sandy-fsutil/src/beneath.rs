@@ -453,14 +453,28 @@ impl Beneath {
     /// As [`Beneath::open_dir_beneath`].
     pub fn create_dir_beneath(root: &Path, path: &Path) -> Result<Self, FsError> {
         let parts = below_root(root, path)?;
-        if parts.is_empty() {
+        // As in `open_dir_beneath`: the destination itself is opened readable, and the root and every directory above
+        // it are only searched, so a directory on the way that has write and search permission but no read permission
+        // still works.
+        let Some((leaf, above)) = parts.split_last() else {
             return Self::open_root(root);
-        }
+        };
         let mut dir = Self::open_root_search(root)?;
-        for part in parts {
-            dir = dir.create_dir(part)?;
+        for part in above {
+            dir = dir.create_search_subdir(part)?;
         }
-        Ok(dir)
+        dir.create_dir(leaf)
+    }
+
+    /// Create the subdirectory `name`, or adopt it when it already is a directory, and open it only to search it
+    /// (see [`Beneath::open_search_subdir`]). A symlink there is refused.
+    fn create_search_subdir(&self, name: &OsStr) -> Result<Self, FsError> {
+        let component = component(name, &self.path)?;
+        match rustix::fs::mkdirat(&self.fd, component, Mode::from_raw_mode(0o777)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(FsError::io("create directory", &self.path.join(component), e)),
+        }
+        self.open_search_subdir(name)
     }
 
     /// Open the subdirectory `name` only to search it, as [`Beneath::open_parent`] does: on Linux an `O_PATH` handle,

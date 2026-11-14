@@ -433,9 +433,11 @@ The CLI sets no root: a local user is no boundary. Slice 1 covers what `sandyd` 
 sandy-api `Input`, `Output` and `SecretRef`, which carry no root yet (slice 2). An executor drops a `Dispatch` field it
 does not know without a word, so a root sent to one that cannot honour it would be ignored with the gap still open.
 The executor therefore declares a `path_root` capability, as `egress_proxy` and `digests` do (sandyd A1, A2c), and
-`sandyd` places a Submit with a rooted path only on a host that opens the paths beneath the root: `sandyd` itself, over
-the data link, for a host with `transfer` and inputs or outputs only, and otherwise a host that declared `path_root`.
-The requirement is per path field: a rooted secret needs `path_root` always (only the executor opens secrets), a rooted input or output needs it only on a host with no `transfer`, so a rooted input beside an unrooted secret is placed on a transfer host that did not declare `path_root`. With no such host the Submit is
+`sandyd` places a Submit with a rooted path only on a host that opens each rooted path beneath its root. The requirement
+is per path field. `sandyd` itself opens a rooted input or output over the data link when the host has `transfer`. The
+executor opens everything else: every rooted secret, and rooted inputs and outputs on a host with no `transfer`. That
+host must have declared `path_root`. So a rooted input beside an unrooted secret is placed on a transfer host that did
+not declare `path_root`, and a rooted secret never is. With no such host the Submit is
 refused naming the capability. No executor declares it before slice 2, so until then a broker client's secrets are
 refused and its inputs and outputs need a `transfer` host. The change is additive on the wire, and a source-break for
 any external struct literal of the sandy-api types once slice 2 adds the field there.
