@@ -151,6 +151,19 @@
             python3 ${./scripts/validate_docs.py} .
             touch "$out"
           '';
+
+          # The generated-docs gate: docs/generated/ must match a fresh render of
+          # the mermaid blocks in docs/ (scripts/render_docs.py), and the
+          # renderer's own tests must pass. Pure Python stdlib.
+          docsRender = pkgs.runCommand "sandy-docs-render" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+            cp -r ${./docs} docs
+            mkdir scripts
+            cp ${./scripts/render_docs.py} scripts/render_docs.py
+            cp ${./scripts/test_render_docs.py} scripts/test_render_docs.py
+            python3 -I scripts/test_render_docs.py
+            python3 -I scripts/render_docs.py --check .
+            touch "$out"
+          '';
         in
         {
           treefmt = {
@@ -233,6 +246,21 @@
               language = "system";
               pass_filenames = false;
             };
+            docs-render = {
+              enable = true;
+              name = "docs-render drift";
+              description = "docs/generated/ must match a fresh render of the mermaid blocks in docs/";
+              entry = "${pkgs.writeShellScript "docs-render-check" ''
+                ${pkgs.python3}/bin/python3 scripts/render_docs.py --check . || {
+                  echo "docs/generated/ is stale: run 'python3 scripts/render_docs.py' and commit docs/generated/" >&2
+                  exit 1
+                }
+              ''}";
+              files = "^(docs/.*|scripts/render_docs\\.py)$";
+              language = "system";
+              pass_filenames = false;
+              stages = [ "pre-push" ];
+            };
           };
 
           packages = sandyPackages // {
@@ -305,6 +333,7 @@
             '';
             stub-trust-root-refused = sandyPackages.stubTrustRootRefused;
             project-docs = projectDocs;
+            docs-render = docsRender;
           }
           # nixosTest only evaluates on Linux (it builds a QEMU VM derivation
           # for the host system); harmless to omit it from the darwin check
