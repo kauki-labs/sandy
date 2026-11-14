@@ -356,6 +356,28 @@ pub fn open_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
     dir.open_file(leaf)
 }
 
+/// Create (or truncate) the regular file at `path`, which lies beneath `root`, for writing, with the directories above
+/// it that are missing. As [`open_file_beneath`], every component below `root` is created or opened without following
+/// a link, and a symlink at the leaf is refused (#618).
+///
+/// # Errors
+///
+/// As [`open_file_beneath`].
+pub fn create_file_beneath(root: &Path, path: &Path) -> Result<File, FsError> {
+    let mut parts = below_root(root, path)?;
+    let Some(leaf) = parts.pop() else {
+        return Err(FsError::Unsafe {
+            path: path.to_owned(),
+            reason: "is the root, not a file below it".to_owned(),
+        });
+    };
+    let mut dir = Beneath::open_root(root)?;
+    for part in parts {
+        dir = dir.create_dir(part)?;
+    }
+    dir.create_file(leaf)
+}
+
 /// Open the regular file at `path` for reading. The leaf is not followed: a symlink there is refused.
 ///
 /// # Errors
@@ -731,6 +753,22 @@ mod tests {
             let err = open_file_beneath(root, &path).expect_err("must be refused");
             assert!(matches!(err, FsError::Unsafe { .. }), "{path:?}: {err}");
         }
+        Ok(())
+    }
+
+    /// #618: a file beneath the root is created with its parents, and a swapped parent is refused.
+    #[test]
+    fn a_file_beneath_the_root_is_created_with_its_parents() -> anyhow::Result<()> {
+        let (root, outside) = swapped_parent()?;
+        fs::create_dir(root.path().join("have"))?;
+
+        let mut file = create_file_beneath(root.path(), &root.path().join("have/new/f"))?;
+        io::Write::write_all(&mut file, b"x")?;
+        let err = create_file_beneath(root.path(), &root.path().join("sub/new")).expect_err("through a link");
+
+        assert_eq!(fs::read(root.path().join("have/new/f"))?, b"x");
+        assert!(matches!(err, FsError::Unsafe { .. }), "{err}");
+        assert!(!outside.path().join("new").exists(), "nothing may be created outside");
         Ok(())
     }
 

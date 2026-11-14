@@ -101,19 +101,16 @@ configured root in canonical form, resolved once at startup (a root that cannot 
 controls would otherwise make that alias the root and retarget it after the check. When several of the client's roots
 contain the path, the nearest wins. The path a client sees back (an output destination in the result envelope) is the
 canonical one. The HTTP contract does not change. `root` is not a boundary on the local control RPC: only the broker
-sets it, per client, and a caller of the control socket can send any root. `sandyd` opens an input or output beneath that root without following
-a link, which closes the parent-swap gap for the transfer path. A path an executor opens itself (a secret, or an
-input or output on a host with no `transfer`) is placed only on a host that declared `path_root`, so a root is never
-dropped without notice: with no such host the submit is refused naming the capability. No executor declares it until
-slice 2 of #618, so until then a broker client's secrets are refused.
+sets it, per client, and a caller of the control socket can send any root. `sandyd` opens an input or output beneath that root without following a link, and an executor opens the paths it handles
+itself (a secret, or an input or output on a host with no `transfer`) the same way (`sandy::stage`). A host that does not
+declare `path_root` (an older executor, which would drop the field) is never given a rooted job: with no such host the
+submit is refused naming the capability.
 
-**Residual risk (_owner_).** The check is a point in time. sandyd now opens the leaf of each input, output and
-secret path without following a link and works below it through that handle (guest-shares decision 14, #618), and no
-longer copies a link inside an input tree by value. That does not stop a hostile client: the client picks the path
-depth, so it can submit `root/a/leaf` and swap `root/a`, which is above the leaf and still followed. Closing that
-needs the client's root to reach sandyd, a public-API change tracked on #618 and #607. Until then, `roots` must be
-directories that the HTTP client cannot write to concurrently with a submit, or the client must be trusted with the
-daemon user's files.
+**Residual risk (_owner_).** The broker's own check is a point in time. It is closed for the paths the broker sends
+(#618): `sandyd` and the executor open each beneath the client's canonical root without following a link, so a parent
+directory swapped after the check is refused. What remains is a client that can write inside its own root and so
+changes what its paths name there, and a hard link planted inside the root (guest-shares decision 14). A client must
+still be trusted with the files under its roots, and a path sent through the local control RPC has no root.
 
 ## 5. Deferred in this slice
 

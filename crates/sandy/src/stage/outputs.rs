@@ -104,6 +104,7 @@ pub fn collect_outputs(
         collect_one(
             &src,
             &output.dest,
+            output.root.as_deref(),
             output.name.as_deref().unwrap_or(""),
             &mut budget,
             report.as_mut(),
@@ -164,6 +165,7 @@ fn validate_output_name(name: &str) -> Result<(), BackendError> {
 fn collect_one(
     src: &Path,
     dest: &Path,
+    trusted_root: Option<&Path>,
     logical: &str,
     budget: &mut Budget,
     report: Option<&mut ContentDigests>,
@@ -186,11 +188,20 @@ fn collect_one(
 
     if ty.is_dir() {
         let from = Beneath::open_dir(src).map_err(fs_err)?;
-        let to = Beneath::create_dir_at(dest).map_err(fs_err)?;
+        // With a root (#618) the destination is walked below it without following a link.
+        let to = match trusted_root {
+            Some(trusted) => Beneath::create_dir_beneath(trusted, dest),
+            None => Beneath::create_dir_at(dest),
+        }
+        .map_err(fs_err)?;
         copy_dir(&from, &to, logical, budget, report)
     } else if ty.is_file() {
         let mut from = sandy_fsutil::beneath::open_file(src).map_err(fs_err)?;
-        let mut to = sandy_fsutil::beneath::create_file_at(dest).map_err(fs_err)?;
+        let mut to = match trusted_root {
+            Some(trusted) => sandy_fsutil::beneath::create_file_beneath(trusted, dest),
+            None => sandy_fsutil::beneath::create_file_at(dest),
+        }
+        .map_err(fs_err)?;
         let sha256 = stream_copy(&mut from, &mut to, (src, dest), report.is_some())?;
         record_file(report, logical, sha256);
         Ok(())

@@ -71,7 +71,7 @@ pub fn stage_inputs(inputs: &[Input], inputs_dir: &Path) -> Result<usize, Backen
         }
     }
     for input in inputs {
-        copy_input(&input.host, &root, OsStr::new(&input.name))?;
+        copy_input(&input.host, input.root.as_deref(), &root, OsStr::new(&input.name))?;
         tracing::debug!(name = %input.name, host = %input.host.display(), "staged input (ro)");
     }
     write_manifest(inputs, inputs_dir)?;
@@ -143,10 +143,13 @@ fn validate_input_name(name: &str) -> Result<(), BackendError> {
 /// tree is staged as a link, never read: the bytes of the host file it names do not reach the guest, and a relative
 /// link between staged entries keeps working. A fifo, socket or device inside a tree is skipped. Staged entries are
 /// created new (never through an existing entry), so a link staged earlier is never written through.
-fn copy_input(host: &Path, root: &Beneath, name: &OsStr) -> Result<(), BackendError> {
+fn copy_input(host: &Path, trusted_root: Option<&Path>, root: &Beneath, name: &OsStr) -> Result<(), BackendError> {
     // `components` drops a trailing `/` and `/.`, which would make the kernel follow a link in the last component.
     let host: std::path::PathBuf = host.components().collect();
     let host = host.as_path();
+    if let Some(trusted) = trusted_root {
+        return copy_rooted_input(host, trusted, root, name);
+    }
     let meta = fs::symlink_metadata(host).map_err(|e| err("stat input source", host, &e))?;
     let ty = meta.file_type();
     if ty.is_symlink() {
@@ -162,6 +165,19 @@ fn copy_input(host: &Path, root: &Beneath, name: &OsStr) -> Result<(), BackendEr
     } else {
         let mut file = sandy_fsutil::beneath::open_file(host).map_err(fs_err)?;
         copy_file(&mut file, root, name, host)
+    }
+}
+
+/// [`copy_input`] for an input with a root (#618): the root opens as the OS resolves it, and every component of `host`
+/// below it, the leaf included, opens without following a link, so a parent directory swapped for a symlink is refused.
+fn copy_rooted_input(host: &Path, trusted: &Path, root: &Beneath, name: &OsStr) -> Result<(), BackendError> {
+    match sandy_fsutil::beneath::open_file_beneath(trusted, host) {
+        Ok(mut file) => copy_file(&mut file, root, name, host),
+        Err(_) => {
+            let src = Beneath::open_dir_beneath(trusted, host).map_err(fs_err)?;
+            let to = root.create_dir(name).map_err(fs_err)?;
+            copy_dir(&src, &to)
+        }
     }
 }
 

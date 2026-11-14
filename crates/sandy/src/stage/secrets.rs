@@ -53,7 +53,7 @@ pub fn stage_secrets(secrets: &[SecretRef], dir: &sandy_fsutil::OwnedDir) -> Res
     let mut staged = Vec::with_capacity(secrets.len());
     for secret in secrets {
         validate_secret_name(&secret.name)?;
-        let bytes = read_source(&secret.source)?;
+        let bytes = read_source(&secret.source, secret.root.as_deref())?;
         // Stage each secret under its own name: the guest mounts this dir read-only
         // and exports each file as `$NAME`, so the file name IS the env var name.
         let guest_path = dir
@@ -91,7 +91,7 @@ fn validate_secret_name(name: &str) -> Result<(), BackendError> {
 /// — must not be followed and exfiltrated into the guest, #175). The `Fd`
 /// channel needs an `unsafe` `File::from_raw_fd`, which this crate forbids
 /// (`unsafe_code = forbid`), so it is rejected rather than read.
-fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
+fn read_source(source: &SecretSource, trusted_root: Option<&Path>) -> Result<Vec<u8>, BackendError> {
     match source {
         SecretSource::File(path) => {
             // O_NOFOLLOW: a symlink final component fails with ELOOP, so a swapped
@@ -99,20 +99,30 @@ fn read_source(source: &SecretSource) -> Result<Vec<u8>, BackendError> {
             // keeps a FIFO at the path from blocking this open waiting for a writer
             // (the file-type check below then rejects it outright). O_CLOEXEC keeps
             // the fd off forked children.
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|e| {
-                    if e.raw_os_error() == Some(libc::ELOOP) {
-                        BackendError::Spawn(format!(
-                            "secret source {} is a symlink; refusing to follow it (INV-1)",
-                            path.display()
-                        ))
-                    } else {
-                        spawn_err("open secret source", path, &e)
-                    }
-                })?;
+            // With a root (#618) every component below it is opened without following a link, so a swapped parent
+            // directory is refused as well; the checks below still run on the opened fd.
+            let mut file = match trusted_root {
+                Some(trusted) => sandy_fsutil::beneath::open_file_beneath(trusted, path).map_err(|e| {
+                    BackendError::Spawn(format!(
+                        "secret source {} cannot be opened beneath its root; refusing to stage (INV-1): {e}",
+                        path.display()
+                    ))
+                })?,
+                None => fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|e| {
+                        if e.raw_os_error() == Some(libc::ELOOP) {
+                            BackendError::Spawn(format!(
+                                "secret source {} is a symlink; refusing to follow it (INV-1)",
+                                path.display()
+                            ))
+                        } else {
+                            spawn_err("open secret source", path, &e)
+                        }
+                    })?,
+            };
 
             // Validate type, owner and mode on the OPENED fd, never the path: a
             // path-based check races the open (TOCTOU), and following a symlink

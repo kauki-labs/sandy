@@ -241,7 +241,7 @@ fn to_run_inputs(inputs: &[sandy_executor_proto::Input]) -> Vec<Input> {
     inputs
         .iter()
         .map(|i| Input {
-            root: None,
+            root: i.root.as_deref().map(PathBuf::from),
             host: PathBuf::from(&i.host),
             name: i.name.clone(),
             guest_path: i.guest_path.as_deref().map(PathBuf::from),
@@ -254,7 +254,7 @@ fn to_run_outputs(outputs: &[sandy_executor_proto::Output]) -> Vec<Output> {
     outputs
         .iter()
         .map(|o| Output {
-            root: None,
+            root: o.root.as_deref().map(PathBuf::from),
             name: o.name.clone(),
             dest: PathBuf::from(&o.dest),
         })
@@ -269,7 +269,7 @@ fn to_run_secrets(secrets: &[sandy_executor_proto::SecretRef]) -> Vec<SecretRef>
     secrets
         .iter()
         .map(|s| SecretRef {
-            root: None,
+            root: s.root.as_deref().map(PathBuf::from),
             name: s.name.clone(),
             source: SecretSource::File(PathBuf::from(&s.host_path)),
         })
