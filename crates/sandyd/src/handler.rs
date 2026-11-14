@@ -2688,6 +2688,62 @@ mod tests {
         Ok(())
     }
 
+    /// A staged `cred-*` dir under the real sandy staging base, backdated past `MAX_TTL_SECS`, owned by `job_id`'s
+    /// credential record (#834). Returns the dir; the caller removes it.
+    fn stage_old_cred_dir(store: &JobStore, job_id: &str, tag: &str) -> anyhow::Result<std::path::PathBuf> {
+        let base = sandy_fsutil::ensure_sandy_staging_base().context("staging base")?;
+        let dir = base.join(format!("cred-t834-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).context("create cred dir")?;
+        let token = dir.join(CREDENTIAL_SECRET_NAME);
+        std::fs::write(&token, b"t").context("write token")?;
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(u64::from(sandy::MAX_TTL_SECS) + 600);
+        std::fs::File::open(&dir)
+            .context("open dir")?
+            .set_modified(old)
+            .context("backdate dir")?;
+        store.set_credential(
+            job_id,
+            &crate::store::CredentialRecord {
+                trust_root: "gh".to_owned(),
+                handle_id: "h".to_owned(),
+                expires_at_unix: 0,
+                token_path: token,
+            },
+        )?;
+        Ok(dir)
+    }
+
+    /// #834: a Prune must not sweep the `cred-*` dir of a job that is still live, however old the dir is. Once the job
+    /// is terminal, or when no job record owns the dir, the same dir is swept. The sweep asks the store, not the mtime.
+    #[tokio::test]
+    async fn a_prune_spares_a_live_jobs_old_cred_dir_and_sweeps_it_once_terminal() -> anyhow::Result<()> {
+        let (store, registry, host_registry) = (new_store(), new_registry(), new_host_registry());
+        store.insert_pending("running-834", b"m", "argv/v1")?;
+        store.mark_running("running-834")?;
+        store.insert_pending("pending-834", b"m", "argv/v1")?;
+        store.insert_pending("done-834", b"m", "argv/v1")?;
+        store.finish("done-834", JobStatus::Succeeded, Some(0), "")?;
+        let running = stage_old_cred_dir(&store, "running-834", "run")?;
+        let pending = stage_old_cred_dir(&store, "pending-834", "pend")?;
+        let done = stage_old_cred_dir(&store, "done-834", "done")?;
+        let orphan = stage_old_cred_dir(&store, "no-such-job-834", "orph")?;
+        let prune = req(1, control_request::Op::Prune(PruneRequest { keep_last: 100 }));
+
+        let outcome = handle(&store, &registry, &host_registry, None, test_session(), prune).await;
+
+        let kept = (running.exists(), pending.exists(), done.exists(), orphan.exists());
+        for dir in [&running, &pending, &done, &orphan] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        outcome?;
+        assert_eq!(
+            kept,
+            (true, true, false, false),
+            "(running, pending, terminal, no record) cred dirs surviving a prune"
+        );
+        Ok(())
+    }
+
     /// Adversarial: a submitter with no cap at all for the requested channel
     /// is refused that capability, not granted one anyway.
     #[tokio::test]
