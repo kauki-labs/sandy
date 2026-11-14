@@ -1,6 +1,6 @@
 //! The native vfkit backend (Block 32, macOS / Virtualization.framework).
 //!
-//! [`VfkitBackend`] is the [`VmBackend`] for the macOS path: it assembles a
+//! [`VfkitBackend`] is the [`VirtualizationBackend`] for the macOS path: it assembles a
 //! `vfkit` argv from a [`Topology`] (#31), stages the run's secrets (#50),
 //! launches `vfkit` under the PTY console transport (#33), and collapses
 //! the console protocol into the pinned [`Outcome`] (INV-8). vfkit exposes its
@@ -25,7 +25,7 @@ use std::{
 };
 
 use sandy::{
-    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VmBackend,
+    BackendError, BoxState, Hypervisor, Outcome, RunSpec, ShareDirs, StoreBacking, Topology, VirtualizationBackend,
     collect_outputs, ensure_sandy_staging_base, plan_shares, topology_until, wipe, with_digests,
 };
 use sandy_api::{
@@ -207,16 +207,16 @@ pub fn vfkit_args(topology: &Topology, spec: &RunSpec, staged: &StagedArgs) -> R
     Ok(args)
 }
 
-/// The macOS vfkit [`VmBackend`].
+/// The macOS vfkit [`VirtualizationBackend`].
 ///
 /// Launches the `vfkit` binary and owns its running-instance registry so
-/// [`boxes`](VmBackend::boxes) can list live boxes without a separate registry
+/// [`boxes`](VirtualizationBackend::boxes) can list live boxes without a separate registry
 /// read, keeping the seam backend-agnostic (INV-3).
 #[derive(Debug)]
 pub struct VfkitBackend {
     /// Path to the `vfkit` binary to launch.
     vfkit_bin: PathBuf,
-    /// The boxes launched and not yet reaped, reported by [`boxes`](VmBackend::boxes).
+    /// The boxes launched and not yet reaped, reported by [`boxes`](VirtualizationBackend::boxes).
     instances: Mutex<Vec<BoxState>>,
     /// When set, the job runs as the child of the image's sandbox agent (#238).
     agent: Option<AgentLaunch>,
@@ -517,7 +517,7 @@ fn egress_socket(base: &Path, run_id: Uuid) -> Result<PathBuf, BackendError> {
     run_socket(base, run_id, "eg", "egress proxy")
 }
 
-impl VmBackend for VfkitBackend {
+impl VirtualizationBackend for VfkitBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         self.run_with(spec, None)
     }
@@ -536,7 +536,7 @@ impl VmBackend for VfkitBackend {
 }
 
 impl VfkitBackend {
-    /// [`run`](VmBackend::run), with `proxy_override` replacing the egress proxy binary and its `READY`
+    /// [`run`](VirtualizationBackend::run), with `proxy_override` replacing the egress proxy binary and its `READY`
     /// deadline (tests drive a stub).
     fn run_with(&self, spec: &RunSpec, proxy_override: Option<(&Path, Duration)>) -> Result<Outcome, BackendError> {
         if self.agent.is_some() && self.agent_used.swap(true, Ordering::SeqCst) {
@@ -1579,8 +1579,8 @@ mod tests {
     }
 
     /// Tier-3 / host: a trivial RunSpec boots a real vfkit guest on an Apple-silicon host under a
-    /// real PTY, returns a populated [`Outcome`], [`boxes`](VmBackend::boxes)
-    /// lists the instance, and [`kill`](VmBackend::kill) tears it down — with the
+    /// real PTY, returns a populated [`Outcome`], [`boxes`](VirtualizationBackend::boxes)
+    /// lists the instance, and [`kill`](VirtualizationBackend::kill) tears it down — with the
     /// four distinct outcomes (booted+exit, `!booted`, `timed_out`,
     /// `transport_error`) each asserted on the host. Ignored in the sandbox: it
     /// spawns a hypervisor and must never be counted green from a fake (INV-S9);

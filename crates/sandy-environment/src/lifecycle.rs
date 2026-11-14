@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VmBackend};
+use sandy_api::backend::{BackendError, BoxState, Outcome, RunSpec, SandboxKind, VirtualizationBackend};
 
 /// What an environment holds while its run is up. Dropping it releases it.
 pub type RunGuard = Box<dyn Send>;
@@ -82,7 +82,7 @@ fn release(guard: Option<RunGuard>) {
     }
 }
 
-/// A [`VmBackend`] that closes its [`RunGuards`] when `run` returns.
+/// A [`VirtualizationBackend`] that closes its [`RunGuards`] when `run` returns.
 pub struct GuardedBackend<B> {
     inner: B,
     guards: RunGuards,
@@ -97,7 +97,7 @@ pub fn guarded<B>(inner: B, guards: &RunGuards) -> GuardedBackend<B> {
     }
 }
 
-impl<B: VmBackend> VmBackend for GuardedBackend<B> {
+impl<B: VirtualizationBackend> VirtualizationBackend for GuardedBackend<B> {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         let outcome = self.inner.run(spec);
         self.guards.close();

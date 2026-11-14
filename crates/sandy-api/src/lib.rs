@@ -11,7 +11,7 @@
 //! and classification types ([`result`]). Remaining seams move in later nodes.
 //!
 //! With the `acceptance` feature, [`contract`] exposes one `*_suite` per
-//! run-plane seam (`VmBackend`, `GuestShareTransport`, `EgressApplier`) that any
+//! run-plane seam (`VirtualizationBackend`, `GuestShareTransport`, `EgressApplier`) that any
 //! impl, trivial or real, runs itself against — the fake-free capstone harness
 //! (#131 R4b). This is a different contract crate/feature from `sandy-fabric`'s
 //! `contract-tests`: that one covers the agent-fabric seams over `sandy-proto`

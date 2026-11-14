@@ -36,7 +36,7 @@ use sandy_api::{
     agent::{AgentLaunch, OnLink},
     backend::{
         BackendError, Grants, Input, Outcome, Output, RunControl, RunSpec, SandboxKind as ApiSandboxKind, SecretRef,
-        SecretSource, VmBackend,
+        SecretSource, VirtualizationBackend,
     },
     containment::{Containment, ContainmentStatus},
 };

@@ -1,5 +1,5 @@
 //! The VM-backed [`EnvironmentBackend`] (#587 slice C3a): one held, agent-mode
-//! [`VmBackend::run`] per environment.
+//! [`VirtualizationBackend::run`] per environment.
 //!
 //! The box is the run. `launch` starts `run()` on its own thread and returns
 //! at once; the run stays up until `kill` cancels its [`RunControl`], which
@@ -25,7 +25,7 @@ use std::{
 };
 
 use sandy_api::{
-    backend::{BackendError, BoxState, Grants, RunControl, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, Grants, RunControl, RunSpec, VirtualizationBackend},
     environment::{EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 
@@ -40,7 +40,7 @@ const KILL_WAIT: Duration = Duration::from_secs(30);
 const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 /// A hypervisor backend an environment's run is held on.
-pub type HeldBackend = Box<dyn VmBackend + Send>;
+pub type HeldBackend = Box<dyn VirtualizationBackend + Send>;
 
 /// Builds the hypervisor backend for one environment.
 pub type BackendFactory = Box<dyn Fn(&EnvironmentSpec) -> Result<HeldBackend, BackendError> + Send + Sync>;
@@ -116,7 +116,7 @@ impl Held {
     }
 }
 
-/// An [`EnvironmentBackend`] over a hypervisor [`VmBackend`].
+/// An [`EnvironmentBackend`] over a hypervisor [`VirtualizationBackend`].
 pub struct VmEnvironmentBackend {
     factory: BackendFactory,
     config: VmEnvironmentConfig,

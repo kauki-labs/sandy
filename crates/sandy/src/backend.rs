@@ -1,6 +1,6 @@
 //! The backend seam behaviors over the pinned contract.
 //!
-//! The contract itself — the [`VmBackend`] trait and its `snake_case` data/error
+//! The contract itself — the [`VirtualizationBackend`] trait and its `snake_case` data/error
 //! types — lives in [`sandy_api::backend`] and is re-exported here so `sandy::…`
 //! import paths are unchanged. This module keeps the behaviors that are not part
 //! of the contract: the plan/accept validators. The in-memory `FakeBackend` test
@@ -125,7 +125,7 @@ mod tests {
     /// The seam defaults to a VM: the existing hypervisor backends report `Vm`
     /// without overriding, so adding `kind()` leaves them untouched.
     #[test]
-    fn vmbackend_kind_defaults_to_vm() {
+    fn virtualization_backend_kind_defaults_to_vm() {
         assert_eq!(FakeBackend::new().kind(), SandboxKind::Vm);
     }
 }

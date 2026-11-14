@@ -1,5 +1,5 @@
 //! The run-plane's fake-free seam contract-test harness (#131 R4b): one suite per
-//! seam — [`vmbackend_suite`], [`guest_share_transport_suite`],
+//! seam — [`virtualization_backend_suite`], [`guest_share_transport_suite`],
 //! [`egress_applier_suite`] — that any impl, trivial or real, runs itself against.
 //! The caller supplies the impl through a factory (a fresh instance per check), so
 //! the suite stays generic over the concrete type.
@@ -15,7 +15,7 @@
 use std::fmt::Display;
 
 use crate::{
-    backend::{Grants, RunControl, RunSpec, VmBackend},
+    backend::{Grants, RunControl, RunSpec, VirtualizationBackend},
     egress::EgressApplier,
     share::GuestShareTransport,
 };
@@ -70,7 +70,7 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, co
     }
 }
 
-/// Run the [`VmBackend`] contract: a fresh backend has no boxes, killing an
+/// Run the [`VirtualizationBackend`] contract: a fresh backend has no boxes, killing an
 /// unknown box is defined (no panic, no box appears), a trivially-successful job
 /// (`true`) boots and exits 0 with no transport fault, and no box lingers after a
 /// synchronous run.
@@ -80,8 +80,11 @@ fn run_spec<'a>(template: &'a str, command: &'a [String], grants: &'a Grants, co
 /// genuine flake-attr/image reference — pass whatever that backend's `make`
 /// factory is already configured to boot (the literal string `"contract"` is fine
 /// for a non-VM backend).
-pub fn vmbackend_suite<B: VmBackend>(template: &str, make: impl Fn() -> B) -> Result<(), ContractViolation> {
-    const SEAM: &str = "VmBackend";
+pub fn virtualization_backend_suite<B: VirtualizationBackend>(
+    template: &str,
+    make: impl Fn() -> B,
+) -> Result<(), ContractViolation> {
+    const SEAM: &str = "VirtualizationBackend";
     let backend = make();
     require(
         SEAM,
@@ -223,10 +226,10 @@ mod tests {
         share::{Placement, Presentation, ShareSpec},
     };
 
-    /// A trivial in-process `VmBackend` the suite must accept: no boxes, a `true`
+    /// A trivial in-process `VirtualizationBackend` the suite must accept: no boxes, a `true`
     /// run that exits 0.
     struct TrivialBackend;
-    impl VmBackend for TrivialBackend {
+    impl VirtualizationBackend for TrivialBackend {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
             Ok(Outcome {
                 digests: None,
@@ -248,8 +251,8 @@ mod tests {
     }
 
     #[test]
-    fn vmbackend_suite_accepts_a_trivial_conforming_backend() {
-        assert!(vmbackend_suite("contract", || TrivialBackend).is_ok());
+    fn virtualization_backend_suite_accepts_a_trivial_conforming_backend() {
+        assert!(virtualization_backend_suite("contract", || TrivialBackend).is_ok());
     }
 
     /// Adversarial: a backend that reports a lingering box after a synchronous run
@@ -260,7 +263,7 @@ mod tests {
     struct LingersBackend {
         ran: std::cell::Cell<bool>,
     }
-    impl VmBackend for LingersBackend {
+    impl VirtualizationBackend for LingersBackend {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
             self.ran.set(true);
             Ok(Outcome {
@@ -292,9 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn vmbackend_suite_rejects_a_lingering_box() -> anyhow::Result<()> {
-        let err = vmbackend_suite("contract", LingersBackend::default).expect_err("a lingering box must be caught");
-        assert_eq!(err.seam, "VmBackend");
+    fn virtualization_backend_suite_rejects_a_lingering_box() -> anyhow::Result<()> {
+        let err = virtualization_backend_suite("contract", LingersBackend::default)
+            .expect_err("a lingering box must be caught");
+        assert_eq!(err.seam, "VirtualizationBackend");
         assert!(
             err.rule.contains("linger"),
             "expected the post-run lingering-box rule, got: {}",

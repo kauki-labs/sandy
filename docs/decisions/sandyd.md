@@ -140,7 +140,7 @@ that does not matter at this daemon's scale.
 
 **Context.** `sandy`'s existing CLI (pre-#205) already has `run`/`ls`/`status`/
 `wait`/`kill`/`gc` for a direct-execution job model: no daemon, a local
-`Journal` + `VmBackend` run the job in the foreground. B4 adds `submit`/
+`Journal` + `VirtualizationBackend` run the job in the foreground. B4 adds `submit`/
 `cancel`/`attach`/`status`/`list` against `sandyd` over the control RPC — a
 different job model, with names that collide on `status` and come close on
 the rest. Routing the existing names through `sandyd` instead was considered
@@ -2449,10 +2449,10 @@ the job operations.
 
 ## 28. A level-triggered launch driver converges boxes to environment rows; the backend seam is `EnvironmentBackend` (#587)
 
-**Status:** accepted (owner decisions on #587, 2026-11-03: a sibling trait beside `VmBackend`). **Upholds:** INV-6.
+**Status:** accepted (owner decisions on #587, 2026-11-03: a sibling trait beside `VirtualizationBackend`). **Upholds:** INV-6.
 
 **Context.** Decision 26 records environments and decision 27 puts them on the wire, but nothing turns `Provisioning`
-into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a long-lived box needs its own seam.
+into a running VM or into `Ready`. `VirtualizationBackend::run` is run-to-completion, so a long-lived box needs its own seam.
 
 **Decision.**
 
@@ -2484,7 +2484,7 @@ into a running VM or into `Ready`. `VmBackend::run` is run-to-completion, so a l
   `Failed`). `mark_failed` stays `Provisioning` only. `GetEnvironment` reports `connection.url = http://<endpoint>` only
   while `Ready` and only when an endpoint was recorded, never a made-up one.
 - `EnvironmentBackend::boxes` must list only environment boxes the backend launched: the driver kills any listed box no
-  row names, so listing a `VmBackend` job VM would kill it.
+  row names, so listing a `VirtualizationBackend` job VM would kill it.
 
 **Consequences.**
 
@@ -2542,7 +2542,7 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 
 **Alternative set aside.** Counting every RPC on the id as activity, including list and cancel: it widens the poller problem and adds no owner signal.
 
-## 31. The VM environment backend holds one agent-mode `VmBackend::run` per environment (#587, C3a)
+## 31. The VM environment backend holds one agent-mode `VirtualizationBackend::run` per environment (#587, C3a)
 
 **Status:** accepted (design posted on #587, 2026-11-03). **Upholds:** INV-6.
 
@@ -2550,7 +2550,7 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 
 **Decision.**
 
-- `sandy-environment::VmEnvironmentBackend` runs one `VmBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
+- `sandy-environment::VmEnvironmentBackend` runs one `VirtualizationBackend::run` per environment on its own thread, with the deadline suspended. `launch` returns once the thread starts. `kill` marks the entry as stopping, cancels the run's `RunControl` and waits up to 30 s for `run()` to return. While it waits the box stays listed and a launch for that id is refused, so no second VM starts before the first is gone. Concurrent kills wait on the same run. A run that does not return keeps its entry, so a later kill retries. Dropping the backend waits the same bounded time, then logs and gives up instead of hanging shutdown.
 - With a `StopRequest` set (`with_graceful_stop`, #670), `kill` first asks the guest to stop, with a grace in whole seconds, and waits up to the grace plus a 5 s margin for `run()` to return; only then does it cancel as above. The guest then gets to run its teardown. A request that cannot be sent, or a run that already ended, skips the wait. The stop is a stored channel message, so an implementation posts it on a channel that belongs to one launch, never one a relaunch reuses. A `kill` now takes up to the grace plus the margin plus the 30 s cancel wait, and `EnvironmentDriver` kills serially in one reconcile pass, so many environments stopping at once delay the pass.
 - One hypervisor backend serves one environment, because agent mode runs one job per backend. The caller supplies a factory.
 - `boxes()` lists only runs still up. A run that returned is `NotRunning`, and a launch for that id starts a fresh box.
@@ -2559,7 +2559,7 @@ A client that polls `GetEnvironment` renews the lease for as long as it polls, a
 - The guest env and the boot budget come from `VmEnvironmentConfig`: its `env` is appended after the spec's own (the service spec, `SANDY_SERVICE`, goes there, or the agent runs the command as a plain job and never probes), and `boot_timeout_secs` is the `timeout_secs` the hypervisor backend sizes its serial and link connect budgets from, so a real qemu is not given one second to boot. The deadline stays suspended.
 - What a CID hook (qemu) or the agent link (vfkit, decision 35) starts, the host bridge and its probe registration, is held in `RunGuards` and released when `run()` returns, however it ends, through `GuardedBackend`. A hook that fires after that has its guard dropped at once. A run thread that panics is not running: its done flag is set on unwind.
 
-**Consequences.** The backend is generic over `VmBackend`, so it is tier-2 testable with a double that holds until cancelled. `sandyd` wires it as `vm-qemu` (decision 34) and `vm-vfkit` (decision 35); vfkit reaches the guest through a host Unix socket and needs no CID hook. VMs do not survive a daemon restart: a clean shutdown stops each run, and a SIGKILL leaves a qemu hypervisor running (a vfkit process exits with its owner). Both backends call the orphan sweep once at backend construction (run-plane decision 6). A vfkit exits with its owner through its PTY hangup, so what a killed daemon leaves on macOS is the egress proxy and the run directory. A restart policy is open on #587.
+**Consequences.** The backend is generic over `VirtualizationBackend`, so it is tier-2 testable with a double that holds until cancelled. `sandyd` wires it as `vm-qemu` (decision 34) and `vm-vfkit` (decision 35); vfkit reaches the guest through a host Unix socket and needs no CID hook. VMs do not survive a daemon restart: a clean shutdown stops each run, and a SIGKILL leaves a qemu hypervisor running (a vfkit process exits with its owner). Both backends call the orphan sweep once at backend construction (run-plane decision 6). A vfkit exits with its owner through its PTY hangup, so what a killed daemon leaves on macOS is the egress proxy and the run directory. A restart policy is open on #587.
 
 **Alternative set aside.** A new launch path in `impls/vm`: it would fork boot and teardown logic across two backends.
 

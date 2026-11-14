@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use sandy::{BackendError, Grants, Outcome, RunControl, RunSpec, SecretRef, SecretSource, VmBackend};
+use sandy::{BackendError, Grants, Outcome, RunControl, RunSpec, SecretRef, SecretSource, VirtualizationBackend};
 use sandy_api::agent::{AgentLaunch, AgentReport};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights, CapScope, encode_cap},

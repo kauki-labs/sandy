@@ -43,7 +43,7 @@ escalation) with nothing but processes.
 What provides a sandbox. Trivial/MVP impl: a **process backend** (sandbox = a local process). Richer
 impls over the same contract: VM family (qemu/vfkit — exist; Proxmox — remote VMs), platform-native
 (mobile + attestation). Self-registration advertises what kind of sandbox a host provides (VM vs
-platform-native, platform/arch, available attestation). Generalizes the existing `VmBackend`.
+platform-native, platform/arch, available attestation). Generalizes the existing `VirtualizationBackend`.
 
 ### 3.2 Sandbox agent
 

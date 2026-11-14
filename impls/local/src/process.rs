@@ -1,4 +1,4 @@
-//! The process backend: a [`VmBackend`] that runs the sandbox as a raw OS
+//! The process backend: a [`VirtualizationBackend`] that runs the sandbox as a raw OS
 //! process on the host, with no VM. This is the trivial-local executor of the
 //! fabric's Executor seam (#131 / #103): it advertises [`SandboxKind::Process`]
 //! so a job that needs a real VM is refused (via `sandy::backend_accepts`),
@@ -63,8 +63,8 @@ use std::{
 
 use sandy::{
     BackendError, BoxState, Containment, ContainmentStatus, ContentDigests, Mount, NoContainment, Outcome,
-    ResourceLimits, RunSpec, SandboxKind, ShareDirs, SharePlan, VmBackend, collect_outputs, ensure_sandy_staging_base,
-    plan_shares, wipe, with_digests,
+    ResourceLimits, RunSpec, SandboxKind, ShareDirs, SharePlan, VirtualizationBackend, collect_outputs,
+    ensure_sandy_staging_base, plan_shares, wipe, with_digests,
 };
 use sandy_api::{
     agent::{AgentLaunch, AgentReport, AgentVerdict},
@@ -100,11 +100,11 @@ const VERDICT_GRACE: Duration = Duration::from_secs(10);
 /// must not land between the two and inherit another run's descriptors.
 static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A [`VmBackend`] that runs the job as a raw OS process (no VM).
+/// A [`VirtualizationBackend`] that runs the job as a raw OS process (no VM).
 ///
-/// Owns its running-instance registry so [`boxes`](VmBackend::boxes) reports live
+/// Owns its running-instance registry so [`boxes`](VirtualizationBackend::boxes) reports live
 /// state. The run is synchronous: a box is present only while its
-/// [`run`](VmBackend::run) call is in flight.
+/// [`run`](VirtualizationBackend::run) call is in flight.
 #[derive(Debug)]
 pub struct ProcessBackend {
     instances: Mutex<Vec<BoxState>>,
@@ -175,7 +175,7 @@ impl ProcessBackend {
     /// Stage the run's shares into the per-run dirs, present them as local dirs
     /// (`SANDY_<TAG>_DIR` env, cooperative read-only), and run the job to
     /// completion or the timeout as a reaped process group. The caller
-    /// ([`run`](VmBackend::run)) owns output collection and the wipe, so this
+    /// ([`run`](VirtualizationBackend::run)) owns output collection and the wipe, so this
     /// returns the raw [`Outcome`] (or an infra [`BackendError`]) and never leaves
     /// a box registered on a returning path.
     fn run_staged(
@@ -462,7 +462,7 @@ impl ProcessBackend {
     }
 }
 
-impl VmBackend for ProcessBackend {
+impl VirtualizationBackend for ProcessBackend {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         spec.refuse_egress_proxy("process")?;
         if spec.command.is_empty() {

@@ -10,7 +10,7 @@ acceptance matrix (what must pass to ship) is in [`kpi.md`](kpi.md).
 
 sandy runs one job in an ephemeral NixOS microVM and returns a **locked result
 envelope**. It owns the hypervisor launch natively (qemu on Linux,
-vfkit on macOS) behind one `VmBackend` seam, delivers inputs/outputs/secrets and a
+vfkit on macOS) behind one `VirtualizationBackend` seam, delivers inputs/outputs/secrets and a
 scoped forge credential over virtio-fs shares, enforces an egress allow-list around
 the boot, and classifies the outcome into a status + a process exit band that never
 disagree (INV-11).
@@ -35,7 +35,7 @@ flowchart TD
   cred -- yes --> mint["mint_lease → stage token 0600<br/>(revoke at teardown)"]
   cred -- no --> egress
   mint --> egress["egress proxy per run<br/>(allow-list over vsock, no NIC)"]
-  egress --> run["VmBackend::run (Qemu | Vfkit)"]
+  egress --> run["VirtualizationBackend::run (Qemu | Vfkit)"]
   run --> stage["stage inputs/outputs/secrets → ShareSpec[]"]
   stage --> xport["GuestShareTransport<br/>virtiofsd (qemu) / virtio-fs (vfkit)"]
   xport --> boot["boot guest + console protocol<br/>(READY marker, sentinels, exit=N)"]
@@ -56,14 +56,14 @@ can grow without widening the library's surface. These are the extension points.
 ```mermaid
 flowchart LR
   subgraph seams["Seams (sandy library)"]
-    VmBackend
+    VirtualizationBackend
     GuestShareTransport
     CredentialProvider
     EgressApplier
   end
-  VmBackend --> QemuBackend
-  VmBackend --> VfkitBackend
-  VmBackend --> FakeBackend["FakeBackend (tests)"]
+  VirtualizationBackend --> QemuBackend
+  VirtualizationBackend --> VfkitBackend
+  VirtualizationBackend --> FakeBackend["FakeBackend (tests)"]
   GuestShareTransport --> VirtiofsdTransport["VirtiofsdTransport (qemu)"]
   GuestShareTransport --> VirtioFsTransport["VirtioFsTransport (vfkit)"]
   CredentialProvider --> GithubAdapter
@@ -78,7 +78,7 @@ on and the crate it lives in.
 
 | Subsystem                                                            | What it owns                                          | Key invariant                            | Crate                            |
 | -------------------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------- | -------------------------------- |
-| [Run plane](spec.md#1-run-plane-vmbackend)                           | native hypervisor launch + console protocol           | never green from a fake (INV-S9)         | `sandy-backend`                  |
+| [Run plane](spec.md#1-run-plane-virtualizationbackend)               | native hypervisor launch + console protocol           | never green from a fake (INV-S9)         | `sandy-backend`                  |
 | [Guest shares](spec.md#2-guest-shares-guestsharetransport)           | inputs/outputs/secrets as virtio-fs                   | RO enforced at the host boundary (INV-1) | `sandy-backend` + `sandy::stage` |
 | [Secret channel](spec.md#3-secret-channel)                           | `$NAME` delivery, never argv/env/store                | secrets off the data plane (INV-1)       | `sandy::stage`                   |
 | [Credential seam](spec.md#4-credential-seam-credentialprovider)      | mint → stage → revoke                                 | fail-closed mint (INV-7)                 | `sandy::cred`                    |

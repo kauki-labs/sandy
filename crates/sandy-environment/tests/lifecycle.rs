@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use sandy_api::{
-    backend::{BackendError, BoxState, Outcome, RunControl, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, Outcome, RunControl, RunSpec, VirtualizationBackend},
     environment::{EnvironmentBackend, EnvironmentSpec},
 };
 use sandy_environment::{RunGuards, VmEnvironmentBackend, VmEnvironmentConfig, guarded};
@@ -41,7 +41,7 @@ struct Vm {
     fail: bool,
 }
 
-impl VmBackend for Vm {
+impl VirtualizationBackend for Vm {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         (self.hook)();
         assert!(!self.panic_after_hook, "the hypervisor backend panicked");
@@ -150,7 +150,7 @@ fn a_run_that_fails_or_panics_still_releases_it() -> Result<()> {
 fn a_hook_that_fires_after_the_run_ended_has_its_guard_dropped_at_once() {
     let guards = RunGuards::new();
     struct Inner;
-    impl VmBackend for Inner {
+    impl VirtualizationBackend for Inner {
         fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
             Ok(outcome())
         }
@@ -201,7 +201,7 @@ fn a_guard_that_panics_on_drop_does_not_take_the_caller_down() {
 }
 
 struct NoRun;
-impl VmBackend for NoRun {
+impl VirtualizationBackend for NoRun {
     fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
         Ok(outcome())
     }

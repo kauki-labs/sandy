@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use sandy_api::backend::{BackendError, Grants, Outcome, RunControl, RunSpec, VmBackend};
+use sandy_api::backend::{BackendError, Grants, Outcome, RunControl, RunSpec, VirtualizationBackend};
 use sandy_fabric::{
     capauth::{Cap, CapAuthority, CapRights, CapScope},
     types::{ChannelId, PeerId},

@@ -30,7 +30,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use sandy::{VmBackend as _, admits_untrusted};
+use sandy::{VirtualizationBackend as _, admits_untrusted};
 use sandy_api::backend::{Grants, RunControl, RunSpec, SandboxKind, SecretRef, SecretSource};
 use sandy_backend::ProcessBackend;
 use sandy_fabric::{
@@ -50,7 +50,7 @@ use sandy_fabric::{
 };
 use sandy_fabric_local::{
     LocalCapAuthority,
-    executor::VmBackendExecutor,
+    executor::VirtualizationBackendExecutor,
     inmem::InMem,
     minter::LocalMinter,
     placement::{ExecutorCapacity, LeaseTable, StaticRegistry},
@@ -113,11 +113,11 @@ fn the_all_local_profile_fake_seams_match_the_tracking_lists() {
         ("Minter", is_fake::<LocalMinter>()),
         ("ChannelBackend", is_fake::<InMem>()),
         ("Transport", is_fake::<FakeTransport>()),
-        ("Executor", is_fake::<VmBackendExecutor<ProcessBackend>>()),
+        ("Executor", is_fake::<VirtualizationBackendExecutor<ProcessBackend>>()),
         ("Discovery", is_fake::<StaticRegistry>()),
         (
             "Capacity",
-            is_fake::<ExecutorCapacity<VmBackendExecutor<ProcessBackend>>>(),
+            is_fake::<ExecutorCapacity<VirtualizationBackendExecutor<ProcessBackend>>>(),
         ),
         ("Lifecycle", is_fake::<LeaseTable>()),
         ("TelemetrySink", is_fake::<LocalLog>()),
@@ -250,10 +250,10 @@ fn process_capabilities() -> Capabilities {
 /// The all-local profile's `Capacity` slot (real, #112): a direct probe over
 /// a second `Process` executor instance, since `validate_profile` takes an
 /// independent factory per seam.
-fn executor_capacity() -> ExecutorCapacity<VmBackendExecutor<ProcessBackend>> {
+fn executor_capacity() -> ExecutorCapacity<VirtualizationBackendExecutor<ProcessBackend>> {
     ExecutorCapacity::new().with_host(
         HostId::from(StaticRegistry::LOCALHOST),
-        VmBackendExecutor::new(ProcessBackend::new()),
+        VirtualizationBackendExecutor::new(ProcessBackend::new()),
         1,
     )
 }
@@ -273,7 +273,7 @@ async fn validate_all_local_profile(telemetry_dir: &Path) -> Result<(), Contract
         || LocalMinter,
         InMem::default,
         FakeTransport::default,
-        || VmBackendExecutor::new(ProcessBackend::new()),
+        || VirtualizationBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
         StaticRegistry::default,
@@ -322,7 +322,7 @@ async fn gate_rejects_a_broken_channel_backend_even_though_its_slot_is_real() ->
         || LocalMinter,
         SnapshotBackend::default,
         FakeTransport::default,
-        || VmBackendExecutor::new(ProcessBackend::new()),
+        || VirtualizationBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
         StaticRegistry::default,
@@ -356,7 +356,7 @@ async fn gate_rejects_a_broken_minter_even_though_its_slot_is_real() -> anyhow::
         || ConstantMinter,
         InMem::default,
         FakeTransport::default,
-        || VmBackendExecutor::new(ProcessBackend::new()),
+        || VirtualizationBackendExecutor::new(ProcessBackend::new()),
         process_capabilities(),
         "contract",
         StaticRegistry::default,
@@ -388,7 +388,7 @@ async fn gate_rejects_a_broken_minter_even_though_its_slot_is_real() -> anyhow::
 /// is safe (that's #111's job when it lands). It also isn't re-deriving
 /// `sandy-impls-local`'s own `a_secret_value_is_absent_from_the_process_env`
 /// test (which already proves `ProcessBackend`'s env isolation directly) —
-/// `VmBackendExecutor::run` is a zero-transformation passthrough
+/// `VirtualizationBackendExecutor::run` is a zero-transformation passthrough
 /// (`block_in_place(|| self.backend.run(spec))`), so this confirms the
 /// fabric Executor adapter doesn't regress that guarantee, which is a real
 /// but much thinner claim than "INV-1 end-to-end."
@@ -402,7 +402,7 @@ async fn inv1_holds_through_the_real_executor_dispatch_path() -> anyhow::Result<
     std::fs::write(&secret_file, MARKER).context("write secret file")?;
     std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600)).context("secret file perms")?;
 
-    let executor = VmBackendExecutor::new(ProcessBackend::new());
+    let executor = VirtualizationBackendExecutor::new(ProcessBackend::new());
     let secrets = [SecretRef {
         name: "TOKEN".to_owned(),
         source: SecretSource::File(secret_file),

@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use sandy_api::{
-    backend::{BackendError, BoxState, DirFingerprint, Outcome, RunSpec, VmBackend},
+    backend::{BackendError, BoxState, DirFingerprint, Outcome, RunSpec, VirtualizationBackend},
     environment::{Endpoint, EnvironmentBackend, EnvironmentSpec, Launch, Probe},
 };
 use sandy_environment::{ConsoleSink, ConsoleTaps, ServiceProbe, VmEnvironmentBackend, VmEnvironmentConfig};
@@ -41,7 +41,7 @@ struct Holding {
     stubborn: Option<Arc<AtomicBool>>,
 }
 
-impl VmBackend for Holding {
+impl VirtualizationBackend for Holding {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         self.seen.commands.lock().unwrap().push(spec.command.to_vec());
         self.seen
@@ -396,7 +396,7 @@ fn the_config_env_follows_the_spec_env_and_the_boot_budget_reaches_the_run() -> 
 
 /// A hypervisor backend whose run panics at once.
 struct Panicking;
-impl VmBackend for Panicking {
+impl VirtualizationBackend for Panicking {
     fn run(&self, _spec: &RunSpec) -> Result<Outcome, BackendError> {
         panic!("the hypervisor backend panicked");
     }
@@ -436,7 +436,7 @@ struct Printing {
     printed: Arc<AtomicBool>,
 }
 
-impl VmBackend for Printing {
+impl VirtualizationBackend for Printing {
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError> {
         (self.sink)(self.lines.as_bytes());
         self.printed.store(true, Ordering::SeqCst);

@@ -1,6 +1,6 @@
 //! The long-lived sandbox seam (#587, slice C): [`EnvironmentBackend`].
 //!
-//! A sibling of [`crate::backend::VmBackend`], which runs one job to completion.
+//! A sibling of [`crate::backend::VirtualizationBackend`], which runs one job to completion.
 //! An environment is launched once, probed until its service answers, and killed
 //! when it is deleted. Nothing here runs a job; a launched box stays up until
 //! [`EnvironmentBackend::kill`].
@@ -112,7 +112,7 @@ pub trait EnvironmentBackend {
 
     /// The environment boxes this backend launched and still runs, keyed by
     /// environment id in [`BoxState::box_id`]. It must not list boxes of other
-    /// kinds (a `VmBackend` job VM): the reconciler kills any box it lists that
+    /// kinds (a `VirtualizationBackend` job VM): the reconciler kills any box it lists that
     /// no environment row names.
     ///
     /// The reconciler uses it to find a box with no live environment.

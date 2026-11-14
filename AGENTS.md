@@ -14,12 +14,12 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 (`[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints]`):
 
 - **`sandy`** — the deep library. Private implementation modules behind a curated
-  `pub use` facade: the `VmBackend` seam, the result envelope (INV-11), nix
+  `pub use` facade: the `VirtualizationBackend` seam, the result envelope (INV-11), nix
   topology, egress, seed, secret staging, and gc. Seam
   test doubles (`FakeBackend`, `FakeApplier`, `FakeProvider`,
   `FakeProvisioner`, `FakeContainment`) live in `sandy-test-support`. The
   VM-only console driver lives in `sandy-impls-vm`.
-- **`sandy-backend`** — the native `VmBackend` implementations: `QemuBackend`
+- **`sandy-backend`** — the native `VirtualizationBackend` implementations: `QemuBackend`
   (Linux/KVM, serial on `ttyS0`) and `VfkitBackend` (macOS/Virtualization.framework,
   console on `hvc0`).
 - **`sandy-cli`** — the `sandy` binary: `doctor` (host prerequisites, then `sandyd`
@@ -97,7 +97,7 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
 - **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587): the opt-in,
   trusted-only `ProcessEnvironmentBackend` (a service such as an HTTP server as a host process group,
   cleared environment, no isolation, `SANDY_ENV_BACKEND=process-insecure`, decision 29), and
-  `VmEnvironmentBackend`, one held agent-mode `VmBackend::run` per environment (decision 31). `sandyd` composes it
+  `VmEnvironmentBackend`, one held agent-mode `VirtualizationBackend::run` per environment (decision 31). `sandyd` composes it
   as `SANDY_ENV_BACKEND=vm-qemu` (Linux only, decision 34) and `vm-vfkit` (macOS only, decision 35). A Ready VM environment cannot be linked yet: pairing in VM
   mode has no owner (#590).
 - **`sandy-egress-proxy`** — the per-run host egress proxy for NIC-less guests
@@ -239,7 +239,7 @@ A two-level spec of the existing system lives under
 
 - **Orientation / cross-cutting change** → read
   [`docs/architecture/overview.md`](docs/architecture/overview.md): the run pipeline,
-  the four seams (`VmBackend`, `GuestShareTransport`, `CredentialProvider`,
+  the four seams (`VirtualizationBackend`, `GuestShareTransport`, `CredentialProvider`,
   `EgressApplier`), and the subsystem map, with mermaid diagrams.
 - **Deep work in one subsystem** → read that subsystem's section in
   [`docs/architecture/spec.md`](docs/architecture/spec.md): run plane, guest shares,
@@ -270,7 +270,7 @@ its full record in `docs/decisions/`, and the live matrix in `kpi.md`.
   the `pub use` facade in `lib.rs`. Reach a type through the facade, never into a
   module.
 - **The run plane**: sandy owns the hypervisor launch natively through the
-  `VmBackend` seam (qemu on Linux, vfkit on macOS). The VM shape comes from
+  `VirtualizationBackend` seam (qemu on Linux, vfkit on macOS). The VM shape comes from
   evaluating a guest flake attr into a typed `Topology` (`nix eval --json`); Nix
   still builds the artifacts. `FakeBackend` stands in for the sandbox tiers; a
   real boot is tier-3 (host), never counted green from a fake (INV-S9).

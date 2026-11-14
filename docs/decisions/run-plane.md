@@ -1,14 +1,14 @@
 ---
-title: "Decisions: run plane (VmBackend)"
+title: "Decisions: run plane (VirtualizationBackend)"
 status: accepted
 project: sandy
 updated: 2026-10-14
 ---
 
-# Decisions: run plane (`VmBackend`)
+# Decisions: run plane (`VirtualizationBackend`)
 
 Launching the guest natively and driving it to a physical `Outcome`. Subsystem
-spec: [`../architecture/spec.md#1-run-plane-vmbackend`](../architecture/spec.md#1-run-plane-vmbackend).
+spec: [`../architecture/spec.md#1-run-plane-virtualizationbackend`](../architecture/spec.md#1-run-plane-virtualizationbackend).
 
 ## 1. One seam, two native backends
 
@@ -17,7 +17,7 @@ spec: [`../architecture/spec.md#1-run-plane-vmbackend`](../architecture/spec.md#
 **Context.** sandy must run guests on Linux and macOS without taking a heavy VM
 orchestration library as a dependency.
 
-**Decision.** A single `VmBackend` trait with two native impls: `QemuBackend`
+**Decision.** A single `VirtualizationBackend` trait with two native impls: `QemuBackend`
 (Linux/KVM, serial on `ttyS0`) and `VfkitBackend`
 (macOS/Virtualization.framework, console on `hvc0`). The topology→argv mapping is
 a **pure function**, so `qemu_args` / `vfkit_args` are unit-testable without

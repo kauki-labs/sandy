@@ -53,7 +53,7 @@ one terminal write after redaction is final.
 process and can misreport a crashed owner as alive.
 
 **Decision.** `status`/`wait`/`kill` reach running state via
-`reconcile_job` + `VmBackend::boxes` and the owner's liveness lock (decision 3),
+`reconcile_job` + `VirtualizationBackend::boxes` and the owner's liveness lock (decision 3),
 never a direct registry read.
 
 **Consequences.** A crashed owner is reconciled to a terminal state rather than

@@ -1,7 +1,7 @@
-//! The backend seam (INV-8, pinned contract): the `VmBackend` trait and its
+//! The backend seam (INV-8, pinned contract): the `VirtualizationBackend` trait and its
 //! `snake_case` data/error types.
 //!
-//! [`VmBackend`] is the only way sandy reaches a hypervisor. The backend returns
+//! [`VirtualizationBackend`] is the only way sandy reaches a hypervisor. The backend returns
 //! the *physical* [`Outcome`] only; the core maps that into the result envelope
 //! and the `retryable` / exit bands. Every [`BackendError`] is an infra fault.
 //!
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{egress::AllowList, result::ContentDigests};
 
-/// A live handle into a running [`VmBackend::run`] call, letting something
+/// A live handle into a running [`VirtualizationBackend::run`] call, letting something
 /// outside the call (a `daemon cancel`, an attach-state transition, a grace
 /// period expiring) change its fate without that call having computed a
 /// fixed deadline once at the start and never hearing from anyone again
@@ -33,7 +33,7 @@ use crate::{egress::AllowList, result::ContentDigests};
 ///
 /// `Clone`, cheaply (an `Arc` underneath): the caller that starts a run
 /// keeps one clone to drive it (suspend/extend the deadline, cancel), and
-/// hands another to [`VmBackend::run`] itself via [`RunSpec::control`] to
+/// hands another to [`VirtualizationBackend::run`] itself via [`RunSpec::control`] to
 /// poll. Neither side blocks the other — every method here is a quick
 /// lock/atomic read or write, never an await or a condvar wait, so it's
 /// equally usable from `run()`'s own blocking poll loop (`impls/local`,
@@ -231,7 +231,7 @@ pub struct Grants {
 
 /// A directory's device and inode, fingerprinting the exact filesystem object an
 /// already-open, already-validated handle named (#323) — not just its path. A
-/// consumer that must re-open the directory by path (a [`VmBackend`] receives only
+/// consumer that must re-open the directory by path (a [`VirtualizationBackend`] receives only
 /// [`RunSpec::secret_dir`]'s path, never the caller's live handle) checks the
 /// reopen against this instead of trusting owner/mode alone: a same-uid,
 /// same-mode directory swapped in at that path since would carry a different
@@ -359,7 +359,7 @@ pub struct RunDigests {
     pub outputs: ContentDigests,
 }
 
-/// The state of one running box, as reported by [`VmBackend::boxes`].
+/// The state of one running box, as reported by [`VirtualizationBackend::boxes`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoxState {
     /// The box's stable id.
@@ -420,7 +420,7 @@ fn guest_exit_text(guest_exit: &Option<i32>) -> String {
 /// What kind of sandbox a backend provides, so a job that requires a particular
 /// kind can be matched to (or refused by) a backend — a VM-only job must not land
 /// on the raw-process backend. The executor seam advertises its kind via
-/// [`VmBackend::kind`]; a dispatcher compares it against the job's requirement
+/// [`VirtualizationBackend::kind`]; a dispatcher compares it against the job's requirement
 /// with the core's `backend_accepts`. A closed set for now (richer capabilities —
 /// arch, attestation — come later per the fabric spec's self-registration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,9 +433,9 @@ pub enum SandboxKind {
 }
 
 /// The hypervisor seam. `FakeBackend` and the native backends implement this
-/// identically; reconcile reaches running state through [`VmBackend::boxes`],
+/// identically; reconcile reaches running state through [`VirtualizationBackend::boxes`],
 /// never a direct registry read, so the seam stays backend-agnostic.
-pub trait VmBackend {
+pub trait VirtualizationBackend {
     /// Run `spec` to completion and return its physical [`Outcome`].
     fn run(&self, spec: &RunSpec) -> Result<Outcome, BackendError>;
     /// Tear down the box identified by `box_id`.

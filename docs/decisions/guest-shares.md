@@ -339,11 +339,11 @@ still matches. Two call chains use it:
   directory other than the one actually validated.
 - **Guest shares.** `RunSpec::secret_dir` carries `(path, DirFingerprint)`
   instead of a bare path, since a backend only ever receives the spec, never
-  the caller's live handle, across the `VmBackend` seam. `plan_shares` reopens
+  the caller's live handle, across the `VirtualizationBackend` seam. `plan_shares` reopens
   it with `open_matching` against that fingerprint.
 
 **Consequences.** A directory fingerprint, not a live file descriptor, crosses
-the `VmBackend` trait boundary: `sandy-api`'s `RunSpec` stays a plain data/error
+the `VirtualizationBackend` trait boundary: `sandy-api`'s `RunSpec` stays a plain data/error
 contract with no dependency on `sandy-fsutil`'s `OwnedDir` behavior. The
 fingerprint is as strong as the owner/mode check it rides alongside, but not
 stronger than the filesystem's own inode allocation: an attacker who can force
