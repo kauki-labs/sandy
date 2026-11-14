@@ -2962,8 +2962,9 @@ cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other pro
   verifies it, so `authenticated` stays false until verified caps exist (#413). The `sandy-api` `Who` struct does not
   change.
 - The id is stored on the job row (`client_id`, an additive column, migrated like `attach_token`). The store writes it
-  into the receipt whenever it writes a terminal envelope: a completed run, a cancel, and the recovery of a job a
-  daemon restart found open. Every terminal path names the client.
+  into the receipt of every terminal envelope that has one: a completed run, and the recovery of a job a daemon
+  restart found open. A cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to
+  name; its client id stays on the row.
 
 **Residual.** A hostile process of the daemon's own uid can connect to the broker socket and set any client id. Nothing
 in a one-uid daemon can prevent that: that process can already submit, read and cancel every job as the daemon user. The
