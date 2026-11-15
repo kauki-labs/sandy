@@ -8,12 +8,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{Client, server::Peer};
 
-/// The current time in unix seconds. A clock that cannot be read is the end of time, so every pin reads as expired
-/// (fail closed): it never makes an expired pin look valid.
-pub(crate) fn now_unix() -> u64 {
+/// The current time in unix seconds, or `None` when the clock cannot be read (it is before the epoch).
+pub(crate) fn now_unix() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(u64::MAX, |d| d.as_secs())
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,7 +58,8 @@ impl Pins {
     }
 
     /// The fingerprints whose pins are not past their `not_after` at `now`: what the handshake admits.
-    pub(crate) fn live(&self, now: u64) -> HashSet<Fingerprint> {
+    pub(crate) fn live(&self, now: Option<u64>) -> HashSet<Fingerprint> {
+        let now = now.unwrap_or(u64::MAX);
         self.0
             .iter()
             .filter(|(_, pin)| pin.not_after.is_none_or(|deadline| now <= deadline))
@@ -69,7 +70,13 @@ impl Pins {
     /// The client `fingerprint` is pinned to, unless its pin is past `not_after` at `now`. Checked on every request,
     /// so a connection that outlives its pin stops working at the deadline. The fingerprint is a hash of a public
     /// certificate, so nothing secret is compared and the lookup need not be constant time.
-    pub(crate) fn client<'a>(&self, clients: &'a [Client], fingerprint: &Fingerprint, now: u64) -> Option<&'a Client> {
+    pub(crate) fn client<'a>(
+        &self,
+        clients: &'a [Client],
+        fingerprint: &Fingerprint,
+        now: Option<u64>,
+    ) -> Option<&'a Client> {
+        let now = now.unwrap_or(u64::MAX);
         let pin = self.0.get(fingerprint)?;
         if pin.not_after.is_some_and(|deadline| now > deadline) {
             return None;
@@ -102,7 +109,7 @@ pub(crate) fn resolve<'a>(
     pins: &Pins,
     peer: Peer,
     authorization: Option<&str>,
-    now: u64,
+    now: Option<u64>,
 ) -> Option<&'a Client> {
     match peer {
         Peer::Bearer => authenticate(clients, authorization),
@@ -159,7 +166,7 @@ mod tests {
         let clients = [client("a", "ta", 1, None), client("b", "tb", 2, Some(100))];
         let pins = Pins::build(&clients).expect("distinct pins");
         let id = |peer: Peer, header: Option<&str>, now: u64| {
-            resolve(&clients, &pins, peer, header, now).map(|c| c.id.as_str())
+            resolve(&clients, &pins, peer, header, Some(now)).map(|c| c.id.as_str())
         };
 
         assert_eq!(
@@ -192,20 +199,41 @@ mod tests {
         let pins = Pins::build(&clients).expect("distinct pins");
 
         assert_eq!(
-            resolve(&clients, &pins, Peer::Bearer, Some(&bearer("tb")), 0).map(|c| c.id.as_str()),
+            resolve(&clients, &pins, Peer::Bearer, Some(&bearer("tb")), Some(0)).map(|c| c.id.as_str()),
             Some("b")
         );
-        assert!(resolve(&clients, &pins, Peer::Bearer, None, 0).is_none());
+        assert!(resolve(&clients, &pins, Peer::Bearer, None, Some(0)).is_none());
     }
 
-    /// A clock that cannot be read makes every pin look expired, never valid.
+    /// A clock that cannot be read refuses every pin, whatever its shape: no deadline, a deadline at the largest
+    /// timestamp, and an ordinary one. Time-based checks cannot be trusted on a broken clock, and the clock must never
+    /// make a pin look valid. The bearer path does not use the clock, so it is unaffected.
     #[test]
-    fn an_unreadable_clock_expires_every_pin() {
-        let clients = [client("a", "ta", 1, Some(u64::MAX - 1))];
-        let pins = Pins::build(&clients).expect("a pin");
+    fn an_unreadable_clock_refuses_every_pin() {
+        let clients = [
+            client("none", "t0", 1, None),
+            client("max", "t1", 2, Some(u64::MAX)),
+            client("later", "t2", 3, Some(4_000_000_000)),
+        ];
+        let pins = Pins::build(&clients).expect("pins");
 
-        assert!(pins.live(u64::MAX).is_empty(), "the end of time is past every deadline");
-        assert!(pins.client(&clients, &fingerprint(1), u64::MAX).is_none());
+        assert_eq!(pins.live(Some(1_000)).len(), 3, "a readable clock admits all three");
+        assert!(pins.live(None).is_empty(), "no pin is admitted at the handshake");
+        for byte in 1..=3 {
+            assert!(
+                pins.client(&clients, &fingerprint(byte), None).is_none(),
+                "pin {byte} is refused per request"
+            );
+            assert!(
+                resolve(&clients, &pins, Peer::Cert(fingerprint(byte)), None, None).is_none(),
+                "pin {byte} is refused by resolve"
+            );
+        }
+        assert_eq!(
+            resolve(&clients, &pins, Peer::Bearer, Some(&bearer("t0")), None).map(|c| c.id.as_str()),
+            Some("none"),
+            "a bearer token does not depend on the clock"
+        );
     }
 
     fn client_pinned_to(id: &str, sha256: &str) -> Client {
@@ -232,7 +260,7 @@ mod tests {
         let id = |hex: &str| {
             Fingerprint::from_hex(hex)
                 .ok()
-                .and_then(|fp| pins.client(&clients, &fp, 0))
+                .and_then(|fp| pins.client(&clients, &fp, Some(0)))
                 .map(|c| c.id.as_str())
         };
 
