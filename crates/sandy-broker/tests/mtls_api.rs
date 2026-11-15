@@ -624,6 +624,45 @@ async fn an_unsafe_identity_directory_or_key_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// An operator upgrading from a broker that created its identity directory under a loose umask (0775, key 0644) must
+/// be told the exact fix: the refusal names the path and the command.
+#[tokio::test]
+async fn the_identity_refusals_name_the_path_and_the_fix() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let id = TlsIdentity::generate()?;
+    let refusal = |result: std::result::Result<sandy_broker::Running, BrokerError>| match result {
+        Err(BrokerError::Tls(message)) => Ok(message),
+        other => anyhow::bail!("expected a refusal: {other:?}"),
+    };
+
+    // A 0775 directory, as an old broker made it under umask 002.
+    let loose = tempfile::tempdir()?;
+    let dir = loose.path().join("tls");
+    std::fs::create_dir(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775))?;
+    let message = refusal(start_tls(loose.path(), &id, 1).await)?;
+    assert!(message.contains(&format!("chmod 700 {}", dir.display())), "{message}");
+
+    // A 0644 key.
+    let leaky = tempfile::tempdir()?;
+    drop(start_tls(leaky.path(), &id, 1).await?);
+    let key = leaky.path().join("tls/identity.key.der");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644))?;
+    let message = refusal(start_tls(leaky.path(), &id, 2).await)?;
+    assert!(message.contains(&format!("chmod 600 {}", key.display())), "{message}");
+
+    // A symlinked key says what to put there instead.
+    let linked = tempfile::tempdir()?;
+    std::fs::create_dir(linked.path().join("tls"))?;
+    std::fs::set_permissions(linked.path().join("tls"), std::fs::Permissions::from_mode(0o700))?;
+    let key = linked.path().join("tls/identity.key.der");
+    symlink(linked.path().join("elsewhere.der"), &key)?;
+    let message = refusal(start_tls(linked.path(), &id, 1).await)?;
+    assert!(message.contains(&key.display().to_string()), "{message}");
+    assert!(message.contains("regular file"), "{message}");
+    Ok(())
+}
+
 struct LogWriter(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogWriter {
