@@ -111,8 +111,10 @@ the broker with `--tls-identity-dir`: it then serves mutual TLS only, on any add
 
    `not_after` is optional (unix seconds). A pin already past it when the broker starts is refused at the handshake. The
    handshake list is fixed at start, so a pin that expires later still completes the handshake. Each request re-checks
-   `not_after` and answers `401 unauthenticated` once it has passed, on a new connection and on a long one alike. If the
-   system clock cannot be read, the broker refuses every pin, with or without a `not_after`: it does not start in mTLS
+   `not_after` and answers `401 unauthenticated` once it has passed, a new request on an existing connection included.
+   An attach stream admitted before `not_after` is not cut at the deadline: it ends when the job ends, the client
+   disconnects, or the broker restarts (#904 tracks cutting it). To cut an admitted stream now, remove the pin and restart
+   the broker. If the system clock cannot be read, the broker refuses every pin, with or without a `not_after`: it does not start in mTLS
    mode, and a running broker answers every certificate request `401`. Time-based checks cannot be trusted on a broken
    clock, so the broker never guesses. The certificate's own validity period is not checked. To rotate, list the old and
    the new pin together, restart, move the caller to the new certificate, then remove the old pin and restart. A fingerprint belongs to one
