@@ -448,6 +448,7 @@ async fn a_submit_body_cannot_carry_a_client_id() -> Result<()> {
 async fn a_client_id_sandyd_would_refuse_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mk = |clients| BrokerConfig {
+        tls: None,
         control_socket: Path::new("/nonexistent").to_path_buf(),
         rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
@@ -468,6 +469,7 @@ async fn a_client_id_sandyd_would_refuse_is_refused_at_startup() -> Result<()> {
 async fn an_ambiguous_clients_list_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mk = |clients| BrokerConfig {
+        tls: None,
         control_socket: Path::new("/nonexistent").to_path_buf(),
         rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
@@ -501,6 +503,7 @@ async fn a_non_loopback_bind_is_refused_at_startup() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let bind: SocketAddr = "0.0.0.0:0".parse()?;
     let result = serve(BrokerConfig {
+        tls: None,
         control_socket: Path::new("/nonexistent").to_path_buf(),
         rpc_deadline: std::time::Duration::from_secs(30),
         state_dir: dir.path().join("state"),
@@ -525,6 +528,7 @@ async fn a_sandyd_that_never_answers_gives_unavailable_within_the_deadline() -> 
         }
     });
     let broker = serve(BrokerConfig {
+        tls: None,
         control_socket: socket,
         rpc_deadline: std::time::Duration::from_millis(200),
         state_dir: dir.path().join("state"),

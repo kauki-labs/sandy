@@ -6,7 +6,8 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use reqwest::{Client as Http, StatusCode};
-use sandy_broker::{BrokerConfig, Client, IsolationClass, Running, Tuning, serve_with_tuning};
+use sandy_broker::{BrokerConfig, CertPin, Client, IsolationClass, Running, TlsConfig, Tuning, serve_with_tuning};
+use sandy_conn::{Conn, Fingerprint, TlsIdentity, connect_tls};
 use sandy_fabric_local::{agent::TTY_STDOUT, channel::MembershipId};
 use sandy_proto::{MessageType, Tty};
 use sandyd::{
@@ -33,6 +34,130 @@ pub struct Fixture {
     pub root_a: std::path::PathBuf,
     /// Keeps the stand-in host's dispatch channel open for the fixture's life.
     pub _host_dispatch: tokio::sync::mpsc::Receiver<sandy_executor_proto::Dispatch>,
+    /// The mTLS side, when [`Opts::mtls`] is set.
+    pub mtls: Option<Mtls>,
+}
+
+/// What a caller needs to reach a broker running in mTLS mode.
+pub struct Mtls {
+    /// Where to connect: loopback and the broker's port (the broker itself is bound to every address).
+    pub addr: std::net::SocketAddr,
+    /// The broker's fingerprint, which a caller pins.
+    pub broker: Fingerprint,
+    /// One generated identity per client id.
+    pub identities: Vec<(String, TlsIdentity)>,
+}
+
+impl Mtls {
+    pub fn identity(&self, client: &str) -> &TlsIdentity {
+        &self
+            .identities
+            .iter()
+            .find(|(id, _)| id == client)
+            .expect("a fixture client")
+            .1
+    }
+
+    /// Open a TLS connection as `identity`, pinning the broker.
+    pub async fn connect(&self, identity: &TlsIdentity) -> Result<Box<dyn Conn>> {
+        connect_tls(self.addr, identity, self.broker, None)
+            .await
+            .context("connect over mutual TLS")
+    }
+
+    /// One request as `client` on its own connection, closed after the response.
+    pub async fn call(
+        &self,
+        client: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        bearer: Option<&str>,
+    ) -> Result<(u16, Value)> {
+        let mut conn = self.connect(self.identity(client)).await?;
+        http_over(&mut conn, method, path, body.as_ref(), bearer, true).await
+    }
+}
+
+/// One HTTP/1.1 request on `conn`, and its response. `close` asks the broker to end the connection after it; without it
+/// the connection stays open for another request.
+pub async fn http_over(
+    conn: &mut Box<dyn Conn>,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    bearer: Option<&str>,
+    close: bool,
+) -> Result<(u16, Value)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let payload = body.map(Value::to_string).unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: broker\r\nContent-Length: {}\r\n",
+        payload.len()
+    );
+    if body.is_some() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    if let Some(token) = bearer {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if close {
+        request.push_str("Connection: close\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(&payload);
+    conn.write_all(request.as_bytes()).await.context("write the request")?;
+    conn.flush().await?;
+
+    let mut raw = Vec::new();
+    let head_end = loop {
+        if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = conn.read(&mut chunk).await.context("read the response head")?;
+        anyhow::ensure!(n > 0, "the connection closed before a response head");
+        raw.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .context("a status line")?
+        .parse()
+        .context("a numeric status")?;
+    let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+    let text = if chunked {
+        loop {
+            if let Some(body) = decode_chunked(&raw[head_end..]) {
+                break String::from_utf8_lossy(&body).into_owned();
+            }
+            let mut chunk = [0u8; 4096];
+            let n = conn
+                .read(&mut chunk)
+                .await
+                .context("read a chunk of the response body")?;
+            anyhow::ensure!(n > 0, "the connection closed inside a chunked body");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+    } else {
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while raw.len() < head_end + length {
+            let mut chunk = [0u8; 4096];
+            let n = conn.read(&mut chunk).await.context("read the response body")?;
+            anyhow::ensure!(n > 0, "the connection closed inside the body");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&raw[head_end..head_end + length]).into_owned()
+    };
+    Ok((status, serde_json::from_str(&text).unwrap_or(Value::String(text))))
 }
 
 /// Knobs for [`fixture_with_opts`].
@@ -61,6 +186,11 @@ pub struct Opts {
     /// Declare `transfer` and `shares_submitter_filesystem` on the stand-in host, so a submit with host paths of
     /// every kind (a secret path needs the shared filesystem) can be placed.
     pub path_host: bool,
+    /// Serve mutual TLS only (decision 10), bound to every address, with clients `a`, `b` and `c` pinned to
+    /// certificates the fixture generates and no bearer tokens.
+    pub mtls: bool,
+    /// With `mtls`: the `not_after` (unix seconds) of client `c`'s pin.
+    pub mtls_not_after_c: Option<u64>,
 }
 
 impl Default for Opts {
@@ -77,12 +207,15 @@ impl Default for Opts {
             output_join_backoff: Tuning::default().output_join_backoff,
             trusted_only_backend: false,
             path_host: false,
+            mtls: false,
+            mtls_not_after_c: None,
         }
     }
 }
 
 pub fn client(id: &str, token: &str, max: IsolationClass, roots: Vec<std::path::PathBuf>) -> Client {
     Client {
+        certs: Vec::new(),
         id: id.to_owned(),
         token_sha256: hex::encode(Sha256::digest(token.as_bytes())),
         max_isolation_class: max,
@@ -257,21 +390,38 @@ async fn build(
     });
     let root_a = dir.path().join("root-a");
     std::fs::create_dir(&root_a)?;
+    let mut clients = vec![
+        Client {
+            max_environments,
+            max_environment_records,
+            ..client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()])
+        },
+        client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
+        client("c", TOKEN_C, IsolationClass::Trusted, vec![]),
+    ];
+    let mut identities = Vec::new();
+    if opts.mtls {
+        // mTLS mode has no bearer: each client is pinned to a certificate of its own.
+        for client in &mut clients {
+            let identity = TlsIdentity::generate()?;
+            client.token_sha256.clear();
+            client.certs = vec![CertPin {
+                sha256: identity.fingerprint().to_hex(),
+                not_after: if client.id == "c" { opts.mtls_not_after_c } else { None },
+            }];
+            identities.push((client.id.clone(), identity));
+        }
+    }
     let broker = serve_with_tuning(
         BrokerConfig {
+            tls: opts.mtls.then(|| TlsConfig {
+                identity_dir: dir.path().join("broker-tls"),
+            }),
             control_socket: socket,
             rpc_deadline: std::time::Duration::from_secs(30),
             state_dir: dir.path().join("state"),
-            bind: "127.0.0.1:0".parse()?,
-            clients: vec![
-                Client {
-                    max_environments,
-                    max_environment_records,
-                    ..client("a", TOKEN_A, IsolationClass::Trusted, vec![root_a.clone()])
-                },
-                client("b", TOKEN_B, IsolationClass::Untrusted, vec![]),
-                client("c", TOKEN_C, IsolationClass::Trusted, vec![]),
-            ],
+            bind: if opts.mtls { "0.0.0.0:0" } else { "127.0.0.1:0" }.parse()?,
+            clients,
         },
         Tuning {
             ticket_ttl: opts.ticket_ttl,
@@ -285,7 +435,16 @@ async fn build(
         },
     )
     .await?;
+    let mtls = match &broker.fingerprint {
+        Some(fingerprint) if opts.mtls => Some(Mtls {
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], broker.addr.port())),
+            broker: Fingerprint::from_hex(fingerprint)?,
+            identities,
+        }),
+        _ => None,
+    };
     Ok(Fixture {
+        mtls,
         base: format!("http://{}", broker.addr),
         store,
         registry,
@@ -474,5 +633,23 @@ impl Lines {
             last = Some(line);
         }
         last.context("empty stream")
+    }
+}
+
+/// The body of a complete `Transfer-Encoding: chunked` message, or `None` while it is still incomplete.
+fn decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size = usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).ok()?.trim(), 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return (rest.len() >= 2).then_some(out);
+        }
+        if rest.len() < size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
     }
 }

@@ -18,14 +18,26 @@ use serde_json::{Value, json};
 use tokio::net::UnixStream;
 
 use crate::{
-    Client, IsolationClass, attach, auth::authenticate, body::Body, environments, output, output::Outputs,
-    owners::Owners, paths::root_for,
+    Client, IsolationClass, attach, auth::resolve, body::Body, environments, output, output::Outputs, owners::Owners,
+    paths::root_for,
 };
 
 const MAX_BODY: usize = 1024 * 1024;
 
+/// How a connection was authenticated, which decides how a request's client is found (decision 10).
+#[derive(Clone, Copy)]
+pub(crate) enum Peer {
+    /// Plaintext on loopback: the client is the one whose token the request's `Authorization: Bearer` carries.
+    Bearer,
+    /// Mutual TLS: the client is the one the verified certificate's fingerprint is pinned to. The `Authorization`
+    /// header is never read.
+    Cert(sandy_conn::Fingerprint),
+}
+
 pub(crate) struct State {
     pub(crate) control_socket: PathBuf,
+    /// Every client's pinned certificates. Empty in bearer mode.
+    pub(crate) pins: crate::auth::Pins,
     pub(crate) rpc_deadline: std::time::Duration,
     pub(crate) clients: Vec<Client>,
     pub(crate) owners: Owners,
@@ -52,7 +64,7 @@ pub(crate) struct ApiError {
 const UNAUTHENTICATED: ApiError = ApiError {
     status: StatusCode::UNAUTHORIZED,
     code: "unauthenticated",
-    message: "missing or unknown bearer token",
+    message: "missing, unknown or expired credential",
 };
 pub(crate) const NOT_FOUND: ApiError = ApiError {
     status: StatusCode::NOT_FOUND,
@@ -109,9 +121,15 @@ pub(crate) fn internal_error() -> Response<Body> {
     )
 }
 
-pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>) -> Response<Body> {
+pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>, peer: Peer) -> Response<Body> {
     let authorization = req.headers().get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let Some(client) = authenticate(&state.clients, authorization) else {
+    let Some(client) = resolve(
+        &state.clients,
+        &state.pins,
+        peer,
+        authorization,
+        crate::auth::now_unix(),
+    ) else {
         return error(&UNAUTHENTICATED);
     };
     let method = req.method().clone();

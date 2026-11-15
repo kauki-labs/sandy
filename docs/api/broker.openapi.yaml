@@ -6,8 +6,15 @@ info:
     Client-facing API tier over sandyd (docs/decisions/sandyd.md section 7). Draft contract for #585 and #591. The job operations mirror the control RPC; the environment operations follow the orb contract O1-O9 in #585. No operation accepts or returns a secret (O8). The job attach token stays in the API tier, bound to the caller's identity, and never crosses this surface.
 servers:
   - url: http://127.0.0.1:8787
+    description: Bearer mode. Plaintext HTTP, loopback only.
+  - url: https://{host}:{port}
+    description: Mutual TLS mode (--tls-identity-dir). Any address; the caller presents a pinned client certificate.
+    variables:
+      host: {default: broker.example}
+      port: {default: "8443"}
 security:
   - bearer: []
+  - mutualTLS: []
 paths:
   /v1/jobs:
     post:
@@ -325,6 +332,12 @@ components:
     bearer:
       type: http
       scheme: bearer
+      description: >-
+        Plaintext on loopback only. A broker started without --tls-identity-dir accepts this and nothing else.
+    mutualTLS:
+      type: mutualTLS
+      description: >-
+        A broker started with --tls-identity-dir serves mutual TLS only, on any address. The client is the one whose pinned certificate fingerprint the connection presented; the Authorization header is not read. A handshake that fails (not pinned, a pin already expired when the broker started, plaintext on the TLS port) gets no HTTP response. Pins already expired at startup are excluded from the handshake list; a pin that expires later still completes the handshake, and each request is re-checked and answered 401 unauthenticated. A system clock that cannot be read refuses every pin. See docs/decisions/broker-api.md decision 10.
   parameters:
     JobId:
       name: job_id

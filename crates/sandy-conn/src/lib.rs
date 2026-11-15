@@ -351,11 +351,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<[u8; 32]> {
-    // `is_ascii` first: a 64-*byte* string containing a multi-byte UTF-8
+    // Hex digits first: a 64-*byte* string containing a multi-byte UTF-8
     // character (e.g. one "€" plus 61 ASCII bytes) would pass the length
     // check below and then panic on a `&s[i*2..i*2+2]` slice that lands
     // mid-character. ASCII guarantees every byte is its own char boundary.
-    if !s.is_ascii() || s.len() != 64 {
+    // It also keeps out the sign `from_str_radix` takes: "+0" parses as 0.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -1473,5 +1474,29 @@ mod tests {
 
         assert!(Fingerprint::from_hex("too-short").is_err());
         assert!(Fingerprint::from_hex(&"zz".repeat(32)).is_err());
+    }
+
+    /// `u8::from_str_radix` accepts a leading `+`, so "+0" parses as 0: a pin of `"+0"` x 32 would be a valid
+    /// all-zero fingerprint. Only `[0-9a-fA-F]` is a fingerprint digit.
+    #[test]
+    fn fingerprint_from_hex_accepts_only_hex_digits() -> anyhow::Result<()> {
+        assert!(
+            Fingerprint::from_hex(&"+0".repeat(32)).is_err(),
+            "a plus sign is not a digit"
+        );
+        assert!(
+            Fingerprint::from_hex(&"-0".repeat(32)).is_err(),
+            "a minus sign is not a digit"
+        );
+        assert!(
+            Fingerprint::from_hex(&" 0".repeat(32)).is_err(),
+            "a space is not a digit"
+        );
+        let mixed = "aB0f".repeat(16);
+        assert_eq!(
+            Fingerprint::from_hex(&mixed)?,
+            Fingerprint::from_hex(&mixed.to_lowercase())?
+        );
+        Ok(())
     }
 }

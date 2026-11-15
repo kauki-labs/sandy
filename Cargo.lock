@@ -2402,6 +2402,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "rustls",
  "sandy-conn",
  "sandy-control-proto",
  "sandy-executor-proto",
@@ -2417,6 +2418,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

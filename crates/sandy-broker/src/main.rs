@@ -16,12 +16,19 @@ struct Args {
     /// Directory for the 0600 job-owner table.
     #[arg(long)]
     state_dir: PathBuf,
-    /// Listen address. Loopback only.
+    /// Listen address. Loopback unless --tls-identity-dir is set, which allows any address.
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
-    /// JSON array of clients: id, token_sha256, max_isolation_class, roots. Must be mode 0600.
+    /// JSON array of clients: id, token_sha256 (bearer mode) or certs (mTLS mode), max_isolation_class, roots. Must be
+    /// mode 0600.
     #[arg(long)]
     clients_file: PathBuf,
+    /// Serve mutual TLS only, on any address, authenticating each client by its pinned certificate and ignoring
+    /// bearer tokens. The directory holds the broker's own TLS identity (created on first use); its fingerprint is
+    /// printed on stdout at start, for callers to pin. Without it the broker serves plaintext on loopback with bearer
+    /// tokens.
+    #[arg(long)]
+    tls_identity_dir: Option<PathBuf>,
 }
 
 fn load_clients(path: &std::path::Path) -> Result<Vec<Client>, String> {
@@ -90,6 +97,9 @@ async fn main() -> ExitCode {
             state_dir: args.state_dir,
             bind: args.bind,
             clients,
+            tls: args
+                .tls_identity_dir
+                .map(|identity_dir| sandy_broker::TlsConfig { identity_dir }),
         },
         Tuning {
             output_retention,
@@ -105,6 +115,11 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(addr = %running.addr, "broker listening");
+    // Printed, not only logged: the default log filter shows errors only, and the operator needs this value to pin the
+    // broker. It is a hash of the broker's public certificate, not a secret.
+    if let Some(fingerprint) = &running.fingerprint {
+        println!("broker mTLS fingerprint: {fingerprint}");
+    }
     tokio::select! {
         () = running.wait() => {}
         _ = tokio::signal::ctrl_c() => {}

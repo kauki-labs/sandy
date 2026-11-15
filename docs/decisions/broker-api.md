@@ -47,11 +47,12 @@ auth, and the token store inside the process that holds submitter caps.
   or logs a token.
 - A request without a valid `Authorization: Bearer` gets `unauthenticated`. Tokens compare in
   constant time.
-- The broker binds loopback only. A non-loopback address is refused at startup, because
-  this slice has no TLS. Remote callers and mTLS (`sandyd.md` decision 20) are a follow-up.
+- The bearer path binds loopback only. A non-loopback address is refused at startup unless the broker
+  runs in mTLS mode (decision 10, #887), where there is no bearer.
 
-**Alternative set aside.** Deciding mTLS client auth here: a security-model choice that
-belongs to the owner, and `sandy-mcp` accepts only loopback `http` today.
+**Alternative set aside.** Deciding mTLS client auth in the first slice: a security-model choice that
+belonged to the owner. The owner ratified this file and pulled mTLS forward (#607, 2026-11-14); decision 10 is that
+slice. `sandy-mcp` accepts only loopback `http` today and keeps the bearer path.
 
 ## 3. Job ownership and the attach token stay in the broker
 
@@ -302,6 +303,104 @@ derives the attach socket as a sibling of the control path, so the broker socket
 socket (`sandyd` refuses to start otherwise). The broker refuses a clients file whose id is empty, longer than 128 bytes or holds a control character. The HTTP contract does not
 change.
 
+## 10. Remote callers over mutual TLS: pinned client certificates (#887)
+
+**Context.** The broker listens on loopback and authenticates a bearer token (decisions 1 and 2). The owner ratified that
+model on #607 and pulled forward remote callers with mTLS. The mesh already has the TLS stack and the trust model
+(`sandyd.md` decision 20: pinned per-peer keys, no CA, client auth mandatory), and the broker already depends on
+`sandy-conn`. Nothing new is added to the crypto dependencies.
+
+**Decision.**
+
+- **One broker is in one mode.** With no `--tls-identity-dir` the broker is as before: plaintext, bearer, loopback only.
+  With `--tls-identity-dir` it is mTLS only: the listener accepts nothing but mutual TLS, on any address, and there is
+  no bearer path. A bearer token is never accepted over a non-loopback listener, because there is no non-loopback
+  listener without mTLS.
+- **A non-loopback bind is accepted only in mTLS mode.** Without it the broker refuses to start, as today
+  (`BrokerError::NonLoopback`, whose text now says why).
+- **The listener is `sandy_conn::listen_tls`.** Same stack as the mesh: rustls with the `ring` provider, the library's
+  safe defaults (TLS 1.2 and 1.3, AEAD suites only), client authentication mandatory (an anonymous peer fails the
+  handshake), no CA and no chain validation. The handshake runs in the connection's own task under a 10 s timeout, so
+  one slow peer never delays the next accept.
+- **The broker's own identity** is `TlsIdentity::load_or_generate(dir)`: a self-signed certificate persisted in
+  `--tls-identity-dir` (the key file `0600`), so its fingerprint is stable across restarts. The broker prints the fingerprint
+  on stdout at start (`broker mTLS fingerprint: <hex>`), not only in the log, because the default log filter shows errors
+  only; a caller pins it. The identity is separate from `sandyd`'s mesh identity.
+- **The identity directory is checked before the key is read or written** (the broker's own check; `sandy-conn` is not
+  changed, because the mesh uses the same loader and a stricter loader there would change mesh behaviour). The broker
+  creates the directory `0700`, owned by its user. It refuses to start when the directory is a symlink, is owned by another
+  user or is writable by group or world, and when `identity.key.der` exists and is not a regular file (a symlink, even a
+  dangling one, is refused: the loader would write through it), is owned by another user, or is readable by group or world.
+  The certificate is public and its mode is not checked. Operator requirement: the directory `0700` and the key `0600`,
+  both owned by the broker's user. Residual: a process running as the broker's own user can still replace the key.
+- **Clients are pinned by certificate fingerprint.** The clients file gives each client a `certs` list of
+  `{"sha256": "<64 hex>", "not_after": <unix seconds, optional>}`. The fingerprint is the SHA-256 of the end-entity
+  certificate's DER bytes, as `sandy-conn` computes it. A caller presents a certificate; the broker compares its
+  fingerprint to the pins. Rotation lists the old and the new pin together, then drops the old one.
+- **The client id derives from the verified certificate, and from nothing else.** The accepted connection carries its
+  verified fingerprint (`PeerAddr::TcpTls`). Each request resolves the client by exact equality of that fingerprint with a
+  pin. The `Authorization` header is not read on an mTLS connection, so a caller holding a certificate for A and a token
+  for B is A.
+- **Everything after authentication is unchanged.** The resolved `Client` carries the same `roots`,
+  `max_isolation_class`, environment limits and profiles, so the path checks (decision 4), the isolation check, the
+  environment policies, job ownership (decision 3) and the receipt's `broker:<client_id>` (`sandyd.md` decision 39) apply
+  as for a bearer client. `sandyd`'s broker socket stays the only place a client id is honoured, and `sandyd` is not
+  told how the broker authenticated the caller.
+- **A failed handshake is refused with a typed reason.** No HTTP exchange exists before a handshake, so the refusal is
+  the TLS alert and a closed connection, not an HTTP status. The broker logs the typed `sandy_conn::ConnError`
+  kind (`tls`, `handshake_timeout` or `io`) at `warn`, with the peer address and never any certificate or key bytes (the
+  line shows with `RUST_LOG=warn`; the default filter shows errors only). Startup problems
+  are typed `BrokerError`s: `NonLoopback`, and `Tls` for an unsafe, unreadable or corrupt identity or no usable pin.
+- **Startup validation, all fail-closed.** In mTLS mode every client needs at least one pin, no client may hold a bearer
+  token (a dead credential is refused, not kept), and a fingerprint is valid only as exactly 64 ASCII hex digits.
+  A fingerprint listed for two clients is refused: one certificate is one client. In bearer mode a client with `certs`
+  is refused, so an operator is never left believing mTLS applies. Every error names the client id.
+
+**Adversarial review** (each row is a test or a property of the stack).
+
+| Attack                                                                 | Why it fails                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A certificate for client A makes requests as client B                  | The id is a pure function of the fingerprint; the body and headers carry no id; a fingerprint belongs to one client.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| A certificate whose subject, SAN or serial resembles a pinned one      | Only the SHA-256 of the whole certificate is compared, by equality. No subject, SAN, prefix or substring is read.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| A self-signed or CA-signed certificate that is not pinned              | The handshake fails (`client certificate fingerprint is not in the pinned allowlist`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| No client certificate                                                  | The handshake fails with a `certificate required` alert: client auth is mandatory, not optional (`a_client_presenting_no_certificate_is_refused_at_the_handshake` fails if the verifier is made optional).                                                                                                                                                                                                                                                                                                                                                                                      |
+| Plaintext HTTP to the TLS port, or TLS to a plaintext broker           | The handshake fails (typed `Tls`), or in bearer mode the TLS bytes are a malformed HTTP request.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| A bearer token sent over mTLS, or with a certificate of another client | The header is not read.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| A revoked certificate                                                  | Remove its pin and restart the broker. There is no hot reload: the file is read once, like the token hashes today.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| An expired certificate                                                 | The certificate's own validity period is not checked (decision 20: the certificate only carries a key). The pin's `not_after` is the expiry. A pin already past it at start is left out of the handshake allowlist, so its holder is refused at the handshake. The allowlist is fixed at start, so a pin that expires later still completes the handshake; each request re-checks it and answers `unauthenticated`, so a request made after the deadline is refused, a new request on an existing connection included. An attach stream admitted before the deadline is not cut (the next row). |
+| A request or stream that outlives its certificate's pin                | A request: the same per-request `not_after` check. An attach stream already admitted: not cut, because the pin is checked once, when the stream is admitted (tracked residual, #904).                                                                                                                                                                                                                                                                                                                                                                                                           |
+| A system clock that cannot be read                                     | Clock failure refuses every pin, with or without a `not_after`: the clock read is explicit (`None`, not a sentinel timestamp), the handshake list is empty so a broker does not start in mTLS mode, and a running broker answers every certificate request `401`. Time-based checks cannot be trusted on a broken clock. A bearer token does not use the clock.                                                                                                                                                                                                                                 |
+| A fingerprint that is a prefix, one digit off, or not hex              | Lookup is exact equality of the whole 32-byte value. A pin parses only as exactly 64 `[0-9a-fA-F]` digits: a prefix, a truncation, a sign (`+0` x 32) or a space is refused at start (`only_an_exact_fingerprint_maps_to_a_client`).                                                                                                                                                                                                                                                                                                                                                            |
+| A key or directory another user can write, or a symlinked key          | Refused at start by the identity-directory check (above); nothing is written through a symlink.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| A downgrade or a weak suite                                            | rustls offers no suite below TLS 1.2 AEAD.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| A timing difference between pins                                       | The fingerprint is public: it is a hash of a public certificate, so no secret is compared. The bearer path keeps its constant-time compare.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+
+**Residual.**
+
+- An unauthenticated peer can open connections and hold up to 128 slots for the handshake timeout (the connection cap
+  is taken before the handshake). Firewall the port to the callers' addresses. A per-address limit is not built.
+- A revocation needs a restart, and a restart ends every connection, the attach streams and the collectors in flight.
+- **An admitted attach stream is not cut at `not_after`** (#904). `server::handle` authenticates a request once, and
+  `attach::pump` and `attach::run` do not re-check the pin, so a stream admitted before the deadline keeps sending output
+  until the job ends, the client disconnects, or the broker restarts. Expiry rejects subsequent requests, a new request on
+  an existing connection included. To cut an admitted stream now, remove the pin and restart the broker (revocation is a
+  restart). #904 tracks closing such a stream within a bounded delay.
+- Each refused handshake is one log line, so a scanner can fill the log of a broker exposed to the internet: firewall the
+  port and rotate the log.
+- A compromised caller key is a compromised client: nothing binds a key to an address.
+- The identity check covers the directory and the key, not the directory's ancestors. A rename race on an ancestor needs a
+  parent that is writable by another user without the sticky bit. Keep the identity directory under a parent only the
+  broker's user can write.
+- An upgrade from a broker that created the directory under a loose umask (0775, key 0644) is refused at startup. The error
+  names the path and the `chmod`; the runbook has an upgrade note. The fingerprint does not change.
+- `sandy-mcp` keeps the bearer path on loopback. A remote caller uses its own mTLS HTTP client.
+
+**Set aside.** A CA bundle with subject-to-client mapping (a second trust model, chain and revocation rules to get right,
+and a name-matching rule that is easy to make substring-shaped). Accepting both bearer and mTLS on one broker (two
+credentials per client, and a mixed listener that makes "no bearer over plaintext on a non-loopback bind" harder to
+state). Reading the client id from the certificate's subject. Hot reload, CRL and OCSP (a restart-based revocation is
+the smaller step; reload is its own change).
+
 ## Consequences
 
 - Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,
@@ -311,7 +410,7 @@ change.
   code gets a fixed message.
 - A broker restart keeps job ownership, so the owner can still cancel. It loses retained output (decision 8).
 - The owner table is rewritten whole on each submit and each environment create, and never pruned. Pruning waits for #596.
-- A caller on another machine cannot reach the broker until the TLS follow-up lands.
+- A caller on another machine reaches the broker only in mTLS mode (decision 10).
 - sandyd cannot tell two HTTP clients apart. The broker is the only per-client boundary.
 
 ## Acceptance
