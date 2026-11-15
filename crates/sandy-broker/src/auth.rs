@@ -207,4 +207,54 @@ mod tests {
         assert!(pins.live(u64::MAX).is_empty(), "the end of time is past every deadline");
         assert!(pins.client(&clients, &fingerprint(1), u64::MAX).is_none());
     }
+
+    fn client_pinned_to(id: &str, sha256: &str) -> Client {
+        Client {
+            certs: vec![CertPin {
+                sha256: sha256.to_owned(),
+                not_after: None,
+            }],
+            ..client(id, "t", 0, None)
+        }
+    }
+
+    /// Only exact equality of the whole fingerprint maps to a client. Two pins share their first 8 hex digits, a
+    /// fingerprint one digit off A's has that prefix too, and a prefix or a truncation is not a fingerprint at all.
+    #[test]
+    fn only_an_exact_fingerprint_maps_to_a_client() {
+        let a_hex = hex::encode([0x11u8; 32]);
+        let mut b_bytes = [0x11u8; 32];
+        b_bytes[4..].fill(0x22);
+        let b_hex = hex::encode(b_bytes);
+        assert_eq!(a_hex[..8], b_hex[..8], "B shares A's 8-digit prefix");
+        let clients = [client_pinned_to("a", &a_hex), client_pinned_to("b", &b_hex)];
+        let pins = Pins::build(&clients).expect("two distinct pins");
+        let id = |hex: &str| {
+            Fingerprint::from_hex(hex)
+                .ok()
+                .and_then(|fp| pins.client(&clients, &fp, 0))
+                .map(|c| c.id.as_str())
+        };
+
+        assert_eq!(id(&a_hex), Some("a"));
+        assert_eq!(id(&b_hex), Some("b"));
+        let one_off = format!("{}0", &a_hex[..63]);
+        assert_eq!(id(&one_off), None, "the last digit differs");
+        let first_off = format!("0{}", &a_hex[1..]);
+        assert_eq!(id(&first_off), None, "the first digit differs");
+        assert_eq!(id(&a_hex[..8]), None, "an 8-digit prefix");
+        assert_eq!(id(&a_hex[..63]), None, "one digit short");
+        assert!(
+            Pins::build(&[client_pinned_to("t", &a_hex[..8])]).is_err(),
+            "a prefix is not a pin"
+        );
+        assert!(
+            Pins::build(&[client_pinned_to("t", &a_hex[..63])]).is_err(),
+            "a truncation is not a pin"
+        );
+        assert!(
+            Pins::build(&[client_pinned_to("t", &"+0".repeat(32))]).is_err(),
+            "a plus sign is not a digit"
+        );
+    }
 }

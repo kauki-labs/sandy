@@ -459,6 +459,171 @@ async fn a_non_loopback_bind_without_mtls_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// Accepts the broker's certificate only when its fingerprint is the pinned one, so the test client can handshake
+/// without presenting a certificate of its own.
+#[derive(Debug)]
+struct PinnedServer {
+    broker: sandy_conn::Fingerprint,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if hex::encode(Sha256::digest(end_entity.as_ref())) == self.broker.to_hex() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("not the pinned broker".to_owned()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Client authentication is required, not optional: a caller that trusts the broker but presents NO certificate gets
+/// no HTTP response, and the broker's alert names the missing certificate. An optional-auth verifier would let this
+/// caller through to HTTP, where it would be refused as unauthenticated: the response itself is the failure here.
+#[tokio::test]
+async fn a_client_presenting_no_certificate_is_refused_at_the_handshake() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = fixture_with_opts(mtls()).await?;
+    let m = f.mtls.as_ref().context("an mTLS fixture")?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServer {
+            broker: m.broker,
+            provider,
+        }))
+        .with_no_client_auth();
+
+    let outcome = async {
+        let tcp = tokio::net::TcpStream::connect(m.addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("sandy-mesh")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let mut conn = tokio_rustls::TlsConnector::from(Arc::new(tls))
+            .connect(name, tcp)
+            .await?;
+        conn.write_all(b"GET /v1/jobs HTTP/1.1\r\nHost: broker\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        conn.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    }
+    .await;
+
+    match outcome {
+        Err(e) => assert!(
+            e.to_string().to_ascii_lowercase().contains("certificaterequired"),
+            "the alert must say a certificate is required: {e}"
+        ),
+        Ok(response) => anyhow::bail!(
+            "a caller with no certificate got a response: {}",
+            String::from_utf8_lossy(&response)
+        ),
+    }
+    Ok(())
+}
+
+/// Starts a broker in mTLS mode on `dir`'s identity directory. Each start has its own state directory: a dropped
+/// `Running` releases its owner-table lock asynchronously.
+async fn start_tls(
+    dir: &std::path::Path,
+    id: &TlsIdentity,
+    n: u32,
+) -> std::result::Result<sandy_broker::Running, BrokerError> {
+    let mut cfg = config(dir, "127.0.0.1:0", vec![client("alice", None, vec![pin(id)])], true)
+        .map_err(|e| BrokerError::Tls(e.to_string()))?;
+    cfg.state_dir = dir.join(format!("state-{n}"));
+    serve(cfg).await
+}
+
+fn mode_of(path: &std::path::Path) -> Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::symlink_metadata(path)?.permissions().mode() & 0o777)
+}
+
+/// An identity directory the broker creates is private (0700) and its key is 0600, whatever the umask.
+#[tokio::test]
+async fn a_new_identity_directory_is_private_and_its_key_is_0600() -> Result<()> {
+    let id = TlsIdentity::generate()?;
+    let dir = tempfile::tempdir()?;
+
+    let broker = start_tls(dir.path(), &id, 1).await?;
+
+    assert_eq!(mode_of(&dir.path().join("tls"))?, 0o700, "the identity directory");
+    assert_eq!(mode_of(&dir.path().join("tls/identity.key.der"))?, 0o600, "the key");
+    drop(broker);
+    Ok(())
+}
+
+/// An identity directory that others can write to, a key that others can read, and a key that is a symlink are each
+/// refused, typed, and nothing is written through the symlink.
+#[tokio::test]
+async fn an_unsafe_identity_directory_or_key_is_refused() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let id = TlsIdentity::generate()?;
+
+    // A directory others can write to.
+    let open = tempfile::tempdir()?;
+    std::fs::create_dir(open.path().join("tls"))?;
+    std::fs::set_permissions(open.path().join("tls"), std::fs::Permissions::from_mode(0o777))?;
+    match start_tls(open.path(), &id, 1).await {
+        Err(BrokerError::Tls(_)) => {}
+        other => anyhow::bail!("a world-writable identity directory must be refused: {other:?}"),
+    }
+
+    // A key that others can read, after a normal first start made it.
+    let leaky = tempfile::tempdir()?;
+    drop(start_tls(leaky.path(), &id, 1).await?);
+    let key = leaky.path().join("tls/identity.key.der");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644))?;
+    match start_tls(leaky.path(), &id, 2).await {
+        Err(BrokerError::Tls(message)) => assert!(message.contains("identity.key.der"), "{message}"),
+        other => anyhow::bail!("a world-readable key must be refused: {other:?}"),
+    }
+
+    // A key that is a dangling symlink: refused, and the link's target is never created.
+    let linked = tempfile::tempdir()?;
+    let target = linked.path().join("elsewhere.der");
+    std::fs::create_dir(linked.path().join("tls"))?;
+    std::fs::set_permissions(linked.path().join("tls"), std::fs::Permissions::from_mode(0o700))?;
+    symlink(&target, linked.path().join("tls/identity.key.der"))?;
+    match start_tls(linked.path(), &id, 1).await {
+        Err(BrokerError::Tls(_)) => {}
+        other => anyhow::bail!("a symlinked key must be refused: {other:?}"),
+    }
+    assert!(!target.exists(), "nothing may be written through the symlink");
+    Ok(())
+}
+
 struct LogWriter(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogWriter {

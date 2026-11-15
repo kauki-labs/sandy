@@ -1474,4 +1474,28 @@ mod tests {
         assert!(Fingerprint::from_hex("too-short").is_err());
         assert!(Fingerprint::from_hex(&"zz".repeat(32)).is_err());
     }
+
+    /// `u8::from_str_radix` accepts a leading `+`, so "+0" parses as 0: a pin of `"+0"` x 32 would be a valid
+    /// all-zero fingerprint. Only `[0-9a-fA-F]` is a fingerprint digit.
+    #[test]
+    fn fingerprint_from_hex_accepts_only_hex_digits() -> anyhow::Result<()> {
+        assert!(
+            Fingerprint::from_hex(&"+0".repeat(32)).is_err(),
+            "a plus sign is not a digit"
+        );
+        assert!(
+            Fingerprint::from_hex(&"-0".repeat(32)).is_err(),
+            "a minus sign is not a digit"
+        );
+        assert!(
+            Fingerprint::from_hex(&" 0".repeat(32)).is_err(),
+            "a space is not a digit"
+        );
+        let mixed = "aB0f".repeat(16);
+        assert_eq!(
+            Fingerprint::from_hex(&mixed)?,
+            Fingerprint::from_hex(&mixed.to_lowercase())?
+        );
+        Ok(())
+    }
 }
