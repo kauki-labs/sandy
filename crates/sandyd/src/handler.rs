@@ -798,6 +798,7 @@ pub async fn handle(
 
             let job_id = Uuid::new_v4().to_string();
             // Cloned before `submit.manifest` is moved out below: a partial move makes rustc refuse a later `&submit`.
+            // The id goes into the INSERT of the job row (#888), so no later write can be lost to a fault.
             let client_id_for_job = submit.client_id.clone();
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
@@ -810,7 +811,6 @@ pub async fn handle(
             // job terminally instead of leaving it silently `Pending`.
             let store_for_dispatch_failure = Arc::clone(store);
             let store_for_archive = Arc::clone(store);
-            let store_for_client = Arc::clone(store);
             let store = Arc::clone(store);
 
             // #327: a durable, re-presentable credential — independent of
@@ -1044,8 +1044,10 @@ pub async fn handle(
                 }
             }
 
-            let insert_outcome =
-                tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
+            let insert_outcome = tokio::task::spawn_blocking(move || {
+                store.insert_pending_for(&inserted_id, &manifest, &encoding, client_id_for_job.as_deref())
+            })
+            .await??;
             // CF-M-2: a capacity refusal must leave no trace, same as every
             // other Submit-time refusal above — never registered, never
             // dispatched, even though `dispatch_plan` may already have minted
@@ -1060,12 +1062,6 @@ pub async fn handle(
                         ),
                     })),
                 });
-            }
-            // #888: the API client the broker submitted for, stored before anything can end the job, so every terminal
-            // envelope names it. A store fault is the same class as the insert's: it ends the connection.
-            if let Some(client_id) = client_id_for_job {
-                let (store, job_id) = (Arc::clone(&store_for_client), job_id.clone());
-                tokio::task::spawn_blocking(move || store.set_client_id(&job_id, &client_id)).await??;
             }
             // The job now exists: it owns the credential until a terminal path
             // releases it.

@@ -124,7 +124,10 @@ pub struct Logs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Who {
     /// The local uid (direct `sandy run`, or a sandyd job with no verified
-    /// submitter cap) or the verified submitter cap's `scope.peer`
+    /// submitter cap), `broker:<client_id>` (a sandyd job the broker
+    /// submitted for an API client; asserted by the broker, never verified,
+    /// so `authenticated` is `false`, `docs/decisions/sandyd.md` decision 39),
+    /// or the verified submitter cap's `scope.peer`
     /// (`docs/decisions/sandyd.md` section 11).
     pub identity: String,
     /// `true` only for a submitter cap `CapAuthority::verify`d against its

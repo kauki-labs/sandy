@@ -324,6 +324,21 @@ impl JobStore {
         manifest: &[u8],
         manifest_encoding: &str,
     ) -> Result<InsertOutcome, StoreError> {
+        self.insert_pending_for(job_id, manifest, manifest_encoding, None)
+    }
+
+    /// [`JobStore::insert_pending`] for a job the broker submitted for an API client (#888): the client id is written
+    /// by the INSERT itself, so a crash or a fault after it can never leave a job that names the uid.
+    ///
+    /// # Errors
+    /// As [`JobStore::insert_pending`].
+    pub fn insert_pending_for(
+        &self,
+        job_id: &str,
+        manifest: &[u8],
+        manifest_encoding: &str,
+        client_id: Option<&str>,
+    ) -> Result<InsertOutcome, StoreError> {
         let conn = self.lock();
         // CF-M-2: counted under the same lock the insert itself takes, so a
         // concurrent insert can never slip the table past the cap between
@@ -336,25 +351,27 @@ impl JobStore {
         }
         let now = now_unix();
         conn.execute(
-            "INSERT INTO jobs (job_id, status, manifest, manifest_encoding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            "INSERT INTO jobs (job_id, status, manifest, manifest_encoding, created_at, updated_at, client_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
             (
                 job_id,
                 status_name(JobStatus::Pending),
                 manifest,
                 manifest_encoding,
                 now,
+                client_id,
             ),
         )?;
         Ok(InsertOutcome::Inserted)
     }
 
-    /// Record the API client the broker submitted `job_id` for (#888). Called once, right after
-    /// [`JobStore::insert_pending`], for a Submit that came in on the broker socket with a client id.
+    /// Record the API client the broker submitted `job_id` for (#888), on an existing row. Production writes the id in
+    /// the INSERT ([`JobStore::insert_pending_for`]); this is for tests that need to set or change it afterwards.
     ///
     /// # Errors
     /// [`StoreError::Sqlite`] if the write faults.
-    pub fn set_client_id(&self, job_id: &str, client_id: &str) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn set_client_id(&self, job_id: &str, client_id: &str) -> Result<(), StoreError> {
         self.lock()
             .execute("UPDATE jobs SET client_id = ?1 WHERE job_id = ?2", (client_id, job_id))?;
         Ok(())
@@ -799,10 +816,6 @@ fn parse_status(job_id: &str, raw: &str) -> Result<JobStatus, StoreError> {
     })
 }
 
-/// Run `add_column_sql` only if `column` is not already on the `jobs` table —
-/// an idempotent `ADD COLUMN IF NOT EXISTS`, which SQLite itself lacks. Reads
-/// `PRAGMA table_info` rather than matching on the "duplicate column" error
-/// string, so it stays correct regardless of SQLite's error wording.
 /// The API client the broker submitted `job_id` for, read on an open connection (#888).
 fn read_client_id(conn: &Connection, job_id: &str) -> Result<Option<String>, StoreError> {
     match conn.query_row("SELECT client_id FROM jobs WHERE job_id = ?1", [job_id], |row| {
@@ -815,13 +828,19 @@ fn read_client_id(conn: &Connection, job_id: &str) -> Result<Option<String>, Sto
 }
 
 /// Name the broker's client in `envelope`'s receipt (#888): `who.identity` becomes `broker:<client_id>`. The broker
-/// asserts the id and nothing verifies it, so `authenticated` stays false. With no client id the receipt is unchanged.
+/// asserts the id and nothing verifies it, so `authenticated` is forced to false, whatever it was: a verified cap
+/// (#413) must not make the broker's claim look verified. With no client id the receipt is unchanged.
 fn name_client(envelope: &mut sandy::ResultEnvelope, client_id: Option<&str>) {
     if let (Some(client_id), Some(receipt)) = (client_id, envelope.receipt.as_mut()) {
         receipt.host_observed.who.identity = format!("broker:{client_id}");
+        receipt.host_observed.who.authenticated = false;
     }
 }
 
+/// Run `add_column_sql` only if `column` is not already on the `jobs` table —
+/// an idempotent `ADD COLUMN IF NOT EXISTS`, which SQLite itself lacks. Reads
+/// `PRAGMA table_info` rather than matching on the "duplicate column" error
+/// string, so it stays correct regardless of SQLite's error wording.
 fn ensure_column(conn: &Connection, column: &str, add_column_sql: &str) -> Result<(), StoreError> {
     let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('jobs') WHERE name = ?1")?;
     let present = stmt.exists([column])?;

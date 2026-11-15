@@ -2964,7 +2964,8 @@ cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other pro
   asserted the id and keeps a client id such as `1000` from being read as a uid. The broker asserts the id and nothing
   verifies it, so `authenticated` stays false until verified caps exist (#413). The `sandy-api` `Who` struct does not
   change.
-- The id is stored on the job row (`client_id`, an additive column, migrated like `attach_token`). The store writes it
+- The id is stored on the job row (`client_id`, an additive column, migrated like `attach_token`), written by the same
+  INSERT that creates the row, so a crash or a fault after it can never leave a job that names the uid. The store writes it
   into the receipt of every terminal envelope that has one: a completed run, and the recovery of a job a daemon
   restart found open. A cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to
   name; its client id stays on the row.
