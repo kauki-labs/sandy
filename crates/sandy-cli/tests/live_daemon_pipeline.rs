@@ -650,60 +650,53 @@ fn the_watchdog_kills_only_processes_that_name_its_own_dir() -> anyhow::Result<(
 /// Each guard of the watchdog pins one wrong argument: it must exit 1 before it kills anything or removes anything.
 /// For every case a sleeper whose `TMPDIR` is `<base>/dt` is the would-be victim, and the owner is already gone (its
 /// start time never matches), so a loosened guard would reach the kill within a second and fail this test.
+///
+/// Every path the cases need lives inside one unique, random `anchor` dir, so two runs never collide and nothing is
+/// left in `/tmp` if the test is killed: the anchor has its own watchdog (the real one), which removes it and kills
+/// the sleepers (their `TMPDIR` names the anchor) once this process is gone. The cases that name `/tmp` itself or a
+/// name directly under it are left out on purpose: a loosened guard would then act on a shared path.
+///
+/// Pinned: a wrong inode, a wrong birth time, a base with a trailing slash, a base nested below a dir of the right
+/// shape, an empty base and a missing argument. Not pinned: the `[ ! -L ]` link check (the inode check already
+/// refuses a link, because `stat` without `-L` reads the link's own inode), and the length and character class of the
+/// name (they would need names directly under `/tmp`).
 #[test]
 fn the_watchdog_refuses_anything_but_the_dir_the_test_made() -> anyhow::Result<()> {
     let mut cleanup = Cleanup::default();
     let me = std::process::id();
-    let real = tempfile::Builder::new()
+    let anchor = tempfile::Builder::new()
         .prefix("s")
         .tempdir_in("/tmp")
-        .context("temp dir under /tmp")?;
-    let (ino, birth) = dir_identity(real.path())?;
-    let real_base = real.path().to_string_lossy().into_owned();
+        .context("a unique dir under /tmp")?;
+    start_watchdog(me, anchor.path())?;
+    let (ino, birth) = dir_identity(anchor.path())?;
+    let anchor_path = anchor.path().to_string_lossy().into_owned();
+    // A dir of the right name shape below the anchor: a real directory, but a base that is not `/tmp/s` + six.
+    let nested = anchor.path().join("s654321");
+    std::fs::create_dir(&nested).context("a nested dir")?;
+    let (nested_ino, nested_birth) = dir_identity(&nested)?;
 
     // (case, base as the watchdog is told it, inode, birth time)
-    let mut cases: Vec<(String, String, u64, u64)> = vec![
-        ("a wrong inode".into(), real_base.clone(), ino + 1, birth),
-        ("a wrong birth time".into(), real_base.clone(), ino, birth + 1),
+    let cases: Vec<(&str, String, u64, u64)> = vec![
+        ("a wrong inode", anchor_path.clone(), ino + 1, birth),
+        ("a wrong birth time", anchor_path.clone(), ino, birth + 1),
+        ("a trailing slash", format!("{anchor_path}/"), ino, birth),
+        (
+            "a dir nested below one of the right shape",
+            nested.to_string_lossy().into_owned(),
+            nested_ino,
+            nested_birth,
+        ),
     ];
-    // A symlink whose name has the right shape, to the real dir: only the link check can refuse it.
-    let link = PathBuf::from("/tmp/s858001");
-    ensure!(
-        std::fs::symlink_metadata(&link).is_err(),
-        "{} is in the way: remove it",
-        link.display()
-    );
-    std::os::unix::fs::symlink(real.path(), &link).context("a symlink with the right shape")?;
-    cleanup.dirs.push(link.clone());
-    cases.push((
-        "a symlinked base".into(),
-        link.to_string_lossy().into_owned(),
-        ino,
-        birth,
-    ));
-    // Real dirs with lookalike names, so only the name check can refuse them.
-    for name in ["s85800", "s8580001", "s858-01", "x858001"] {
-        let path = PathBuf::from("/tmp").join(name);
-        std::fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
-        cleanup.dirs.push(path.clone());
-        let (i, b) = dir_identity(&path)?;
-        cases.push((
-            format!("the lookalike name {name}"),
-            path.to_string_lossy().into_owned(),
-            i,
-            b,
-        ));
-    }
-
     for (case, base, i, b) in cases {
         let victim = cleanup.sleeper("TMPDIR", &format!("{base}/dt"))?;
         let mut watchdog = spawn_watchdog(me, 0, &base, i, b)?;
-        let status = wait_exit(&mut watchdog, 30, case.as_str())?;
+        let status = wait_exit(&mut watchdog, 30, case)?;
         ensure!(status.code() == Some(1), "{case}: the watchdog exited {status}, not 1");
         ensure!(cleanup.is_alive(victim)?, "{case}: the process was killed");
         ensure!(Path::new(&base).exists(), "{case}: the dir was removed");
     }
-    ensure!(real.path().exists(), "the real dir was removed");
+    ensure!(anchor.path().exists(), "the anchor dir was removed");
 
     // An empty base, and a missing argument, exit 1 too (`set -u` and the argument check).
     let mut empty = spawn_watchdog(me, 0, "", ino, birth)?;
@@ -712,7 +705,7 @@ fn the_watchdog_refuses_anything_but_the_dir_the_test_made() -> anyhow::Result<(
         "an empty base was accepted"
     );
     let mut short = Command::new("sh")
-        .args(["-c", WATCHDOG, "watchdog", "1", "0", &real_base, &ino.to_string()])
+        .args(["-c", WATCHDOG, "watchdog", "1", "0", &anchor_path, &ino.to_string()])
         .stdin(Stdio::null())
         .spawn()
         .context("spawn a watchdog with four arguments")?;
