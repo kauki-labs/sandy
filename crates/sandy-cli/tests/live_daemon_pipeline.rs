@@ -464,7 +464,8 @@ fn a_nonzero_guest_exit_is_a_task_fault_not_an_infrastructure_one() -> anyhow::R
 
 /// K14 (without a credential) and K9: an input, a secret and an output compose in one boot, and the secret's value
 /// never reaches `logs.tail`. The job exits 0 only when the guest saw the input and the secret, and the console is
-/// proved non-empty first, so an absent value is not an absent console.
+/// proved non-empty first, so an absent value is not an absent console. The job's own text splits the secret literal,
+/// so a console that echoes the command line cannot hold the value by itself.
 #[test]
 fn input_secret_and_output_compose_and_the_secret_stays_out_of_the_logs() -> anyhow::Result<()> {
     let stack = Stack::start()?;
@@ -494,7 +495,7 @@ fn input_secret_and_output_compose_and_the_secret_stays_out_of_the_logs() -> any
             "--",
             "sh",
             "-c",
-            "echo console-canary; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = WRONG-VALUE ] && \
+            "echo console-canary; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = SECRET-\"\"VALUE ] && \
              printf done > /run/sandy/outputs/result/out",
         ],
     )?;
