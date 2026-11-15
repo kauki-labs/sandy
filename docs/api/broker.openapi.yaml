@@ -8,6 +8,7 @@ servers:
   - url: http://127.0.0.1:8787
 security:
   - bearer: []
+  - mutualTLS: []
 paths:
   /v1/jobs:
     post:
@@ -325,6 +326,12 @@ components:
     bearer:
       type: http
       scheme: bearer
+      description: >-
+        Plaintext on loopback only. A broker started without --tls-identity-dir accepts this and nothing else.
+    mutualTLS:
+      type: mutualTLS
+      description: >-
+        A broker started with --tls-identity-dir serves mutual TLS only, on any address. The client is the one whose pinned certificate fingerprint the connection presented; the Authorization header is not read. A handshake that fails (not pinned, expired pin, plaintext on the TLS port) gets no HTTP response. See docs/decisions/broker-api.md decision 10.
   parameters:
     JobId:
       name: job_id

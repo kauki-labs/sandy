@@ -88,6 +88,44 @@ broker and stores jobs and environments.
    and broker in a temp directory, spawns an environment, retries it, reads it back and
    deletes it. `BROKER_SMOKE_READY=1` adds the process backend and checks the full path.
 
+## Remote callers over mutual TLS (#887)
+
+A broker is in one mode. The steps above are bearer mode: plaintext, loopback only. For callers on other machines, start
+the broker with `--tls-identity-dir`: it then serves mutual TLS only, on any address, and ignores bearer tokens.
+
+1. Make each caller a certificate. The broker pins a certificate by the SHA-256 of its DER bytes. The mesh's generator
+   makes a suitable self-signed one: `sandy mesh key generate <dir>` writes `<dir>/identity.cert.der` and
+   `<dir>/identity.key.der` and prints the fingerprint (the same one you pin).
+2. Put the fingerprint in the clients file instead of `token_sha256` (a client has one or the other, never both, and the
+   broker refuses to start otherwise):
+
+   ```json
+   {
+     "id": "remote-a",
+     "certs": [{ "sha256": "<64 hex digits>", "not_after": 1798761600 }],
+     "max_isolation_class": "untrusted",
+     "profiles": ["dev"],
+     "roots": []
+   }
+   ```
+
+   `not_after` is optional (unix seconds). A pin past it is refused at the handshake and on every request of a long
+   connection. The certificate's own validity period is not checked. To rotate, list the old and the new pin together,
+   restart, move the caller to the new certificate, then remove the old pin and restart. A fingerprint belongs to one
+   client: listing it twice is refused.
+
+3. Start the broker: `sandy-broker --control-socket /path/broker.sock --state-dir /path/broker-state --clients-file
+/path/clients.json --bind 0.0.0.0:8443 --tls-identity-dir /path/broker-tls`. It creates the identity on first use and
+   logs `fingerprint=...`: a caller pins that value. Keep the directory `0700`.
+4. A caller connects with its certificate and key and pins the broker's fingerprint. Every caller needs a certificate,
+   including a loopback one: `sandy-mcp` has no TLS client, so it keeps using a bearer broker on loopback.
+
+To revoke a caller, remove its pin and restart the broker. The clients file is read once, so there is no reload, and a
+restart ends every connection, attach stream and output collection in flight. A handshake that fails (a certificate that
+is not pinned, a timeout, plaintext on the TLS port) gets no HTTP answer; the broker logs `handshake refused` with the
+kind (`tls` or `handshake_timeout`) and the peer address, never a certificate. Unauthenticated peers can hold up to 128
+connection slots for the handshake timeout (10 s), so firewall the port to the callers' addresses.
+
 ## Run an environment end to end
 
 `SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
@@ -113,7 +151,7 @@ stops the process on the driver's next tick (about a second).
 - Without `SANDY_ENV_BACKEND` a spawn stays `provisioning` and `connection` is absent. The
   isolated VM backend is #587 slice C.
 - `link` returns `unsupported` until a service offers an external link interface.
-- No TLS or remote callers. mTLS client auth is an owner decision (#607).
+- Remote callers need mTLS (above): no CA, no hot reload, revocation by restart. Bearer stays loopback only.
 - A create whose reply times out and is never retried leaves an environment with no owner
   (#621). sandyd collects deleted rows after `SANDY_ENV_RETENTION_SECS` (default one day) (#633).
 
