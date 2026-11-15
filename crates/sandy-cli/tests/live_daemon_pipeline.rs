@@ -462,6 +462,66 @@ fn a_nonzero_guest_exit_is_a_task_fault_not_an_infrastructure_one() -> anyhow::R
     Ok(())
 }
 
+/// K14 (without a credential) and K9: an input, a secret and an output compose in one boot, and the secret's value
+/// never reaches `logs.tail`. The job exits 0 only when the guest saw the input and the secret, and the console is
+/// proved non-empty first, so an absent value is not an absent console.
+#[test]
+fn input_secret_and_output_compose_and_the_secret_stays_out_of_the_logs() -> anyhow::Result<()> {
+    let stack = Stack::start()?;
+    let staging = stack.dir.path().join("k14");
+    let input_dir = staging.join("in");
+    std::fs::create_dir_all(&input_dir)?;
+    std::fs::write(input_dir.join("f"), b"INPUT-MARKER")?;
+    let secret_file = staging.join("tok");
+    std::fs::write(&secret_file, b"SECRET-VALUE")?;
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+    let out_dest = staging.join("collected");
+    let input_arg = format!("{}:data", input_dir.display());
+    let secret_arg = format!("TOK=@{}", secret_file.display());
+    let out_arg = format!("result:{}", out_dest.display());
+
+    let (code, envelope) = stack.sandy(
+        "k14-compose",
+        &[
+            "run",
+            "--input",
+            &input_arg,
+            "--secret",
+            &secret_arg,
+            "--out",
+            &out_arg,
+            TEMPLATE,
+            "--",
+            "sh",
+            "-c",
+            "echo console-canary; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = WRONG-VALUE ] && \
+             printf done > /run/sandy/outputs/result/out",
+        ],
+    )?;
+
+    ensure!(code == 0, "sandy run exited {code}: {envelope}");
+    ensure!(str_at(&envelope, &["result", "status"]) == "succeeded", "{envelope}");
+    ensure!(
+        envelope["exit_code"] == 0,
+        "the guest did not see the input and the secret: {envelope}"
+    );
+    ensure!(
+        std::fs::read(out_dest.join("out")).context("the output was not collected")? == b"done",
+        "the output bytes differ"
+    );
+    let listed = envelope["result"]["outputs"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|o| o["path"] == "result/out"));
+    ensure!(listed, "the envelope does not list result/out: {envelope}");
+    let tail = str_at(&envelope, &["result", "logs", "tail"]);
+    ensure!(tail.contains("console-canary"), "the console tail is empty: {envelope}");
+    ensure!(
+        !tail.contains("SECRET-VALUE"),
+        "the secret leaked into logs.tail: {tail}"
+    );
+    Ok(())
+}
+
 /// K3: `ls`, `status`, `wait`, `kill` and `gc` operate over a real running job and reconcile it. After `kill` the
 /// guest's qemu is gone, and `gc` removes the terminal record.
 #[test]
