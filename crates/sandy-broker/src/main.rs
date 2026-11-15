@@ -90,6 +90,7 @@ async fn main() -> ExitCode {
             state_dir: args.state_dir,
             bind: args.bind,
             clients,
+            tls: None,
         },
         Tuning {
             output_retention,

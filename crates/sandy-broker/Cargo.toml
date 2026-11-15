@@ -23,6 +23,7 @@ hex.workspace = true
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+sandy-conn.workspace = true
 sandy-control-proto.workspace = true
 sandy-fabric.workspace = true
 sandy-fabric-local.workspace = true
@@ -47,7 +48,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 sandy.workspace = true
-sandy-conn.workspace = true
 sandy-executor-proto.workspace = true
 sandy-proto.workspace = true
 sandyd = { path = "../sandyd" }

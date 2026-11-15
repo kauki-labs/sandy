@@ -29,13 +29,28 @@ pub enum IsolationClass {
     Trusted,
 }
 
+/// A pinned client certificate (decision 10, #887).
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertPin {
+    /// The SHA-256 of the certificate's DER bytes: exactly 64 ASCII hex digits.
+    pub sha256: String,
+    /// Unix seconds after which the pin is refused. `None` never expires.
+    #[serde(default)]
+    pub not_after: Option<u64>,
+}
+
 /// One API client, as read from the clients file.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct Client {
     /// Stable client id, the owner key of its jobs.
     pub id: String,
-    /// Lowercase hex SHA-256 of the client's bearer token.
+    /// Lowercase hex SHA-256 of the client's bearer token. Required in bearer mode, refused in mTLS mode.
+    #[serde(default)]
     pub token_sha256: String,
+    /// The certificates that authenticate this client in mTLS mode. Required there, refused in bearer mode.
+    #[serde(default)]
+    pub certs: Vec<CertPin>,
     /// The highest isolation class the client may request.
     pub max_isolation_class: IsolationClass,
     /// Most non-terminal environments the client may hold at once.
@@ -74,6 +89,15 @@ pub struct BrokerConfig {
     pub bind: SocketAddr,
     /// Known clients.
     pub clients: Vec<Client>,
+    /// `Some`: serve mutual TLS only, on any address, with no bearer path (decision 10). `None`: bearer over loopback.
+    pub tls: Option<TlsConfig>,
+}
+
+/// mTLS settings (decision 10, #887).
+#[derive(Clone, Debug)]
+pub struct TlsConfig {
+    /// The directory holding the broker's persisted TLS identity, created on first use. A caller pins its fingerprint.
+    pub identity_dir: PathBuf,
 }
 
 /// A running broker. Dropping it stops the listener and the output collectors.
@@ -81,6 +105,9 @@ pub struct BrokerConfig {
 pub struct Running {
     /// The bound address.
     pub addr: SocketAddr,
+    /// The broker's TLS fingerprint (64 lowercase hex digits) in mTLS mode, which a caller pins. `None` in bearer
+    /// mode.
+    pub fingerprint: Option<String>,
     task: tokio::task::JoinHandle<()>,
     outputs: Arc<output::Outputs>,
 }
@@ -122,6 +149,9 @@ pub enum BrokerError {
     /// The clients list is ambiguous or malformed.
     #[error("invalid clients: {0}")]
     InvalidClients(String),
+    /// Mutual TLS could not start: an unreadable or corrupt identity, or no usable pin.
+    #[error("mutual TLS: {0}")]
+    Tls(String),
 }
 
 /// Most connections served at once. A connection over the cap waits in the
@@ -323,5 +353,10 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
             });
         }
     });
-    Ok(Running { addr, task, outputs })
+    Ok(Running {
+        addr,
+        fingerprint: None,
+        task,
+        outputs,
+    })
 }
