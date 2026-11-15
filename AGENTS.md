@@ -91,7 +91,8 @@ version, metadata, dependency versions, and lints through the root `Cargo.toml`
   (fake broker) and the `live`-gated `live_broker.rs` (real `sandyd`, `sandy-broker` and qemu guest, Linux/KVM only).
 - **`sandy-broker`** — the broker HTTP API tier over sandyd (#591): bearer-token clients, per-client
   job and environment ownership, the job and environment endpoints of the OpenAPI contract,
-  loopback only. It speaks the control RPC over UDS and keeps each job's attach token. Attach
+  plaintext bearer on loopback only, or mutual TLS on any address with pinned client certificates (#887). It
+  speaks the control RPC over UDS and keeps each job's attach token. Attach
   bridges sandyd's attach socket to an NDJSON stream behind a single-use ticket (#616); link
   answers `unsupported` for now. See `docs/decisions/broker-api.md`.
 - **`sandy-environment`** — `EnvironmentBackend` implementations for `sandyd` (#587): the opt-in,

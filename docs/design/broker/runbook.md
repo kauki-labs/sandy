@@ -70,8 +70,8 @@ broker and stores jobs and environments.
      --clients-file /path/clients.json --bind 127.0.0.1:8787
    ```
 
-   The bind address must be loopback. There is no TLS yet. Run one broker per state
-   directory.
+   In bearer mode the bind address must be loopback. For other machines use mutual TLS (below). Run one
+   broker per state directory.
 
    Point `--control-socket` at the broker socket, not the main one. The broker puts a client id in every
    submission, and `sandyd` refuses a client id on the main socket, so a broker on the main socket cannot submit
@@ -109,14 +109,19 @@ the broker with `--tls-identity-dir`: it then serves mutual TLS only, on any add
    }
    ```
 
-   `not_after` is optional (unix seconds). A pin past it is refused at the handshake and on every request of a long
-   connection. The certificate's own validity period is not checked. To rotate, list the old and the new pin together,
+   `not_after` is optional (unix seconds). A pin already past it when the broker starts is refused at the handshake. The
+   handshake list is fixed at start, so a pin that expires later still completes the handshake and then gets `401
+unauthenticated`, on a new connection and on a long one alike. If the clock cannot be read, every pin that has a
+   `not_after` reads as expired; a pin without one is unaffected. The certificate's own validity period is not checked. To rotate, list the old and the new pin together,
    restart, move the caller to the new certificate, then remove the old pin and restart. A fingerprint belongs to one
    client: listing it twice is refused.
 
 3. Start the broker: `sandy-broker --control-socket /path/broker.sock --state-dir /path/broker-state --clients-file
 /path/clients.json --bind 0.0.0.0:8443 --tls-identity-dir /path/broker-tls`. It creates the identity on first use and
-   prints `broker mTLS fingerprint: <64 hex digits>` on stdout: a caller pins that value. Keep the directory `0700`.
+   prints `broker mTLS fingerprint: <64 hex digits>` on stdout: a caller pins that value. The broker creates the identity
+   directory `0700`. It refuses to start if that directory is a symlink or is owned or writable by another user, or if
+   `identity.key.der` is a symlink, is owned by another user, or is readable by group or world. If you made the
+   directory yourself, give it `0700` and the key `0600`, owned by the broker's user.
 4. A caller connects with its certificate and key and pins the broker's fingerprint. Every caller needs a certificate,
    including a loopback one: `sandy-mcp` has no TLS client, so it keeps using a bearer broker on loopback.
 

@@ -6,6 +6,12 @@ info:
     Client-facing API tier over sandyd (docs/decisions/sandyd.md section 7). Draft contract for #585 and #591. The job operations mirror the control RPC; the environment operations follow the orb contract O1-O9 in #585. No operation accepts or returns a secret (O8). The job attach token stays in the API tier, bound to the caller's identity, and never crosses this surface.
 servers:
   - url: http://127.0.0.1:8787
+    description: Bearer mode. Plaintext HTTP, loopback only.
+  - url: https://{host}:{port}
+    description: Mutual TLS mode (--tls-identity-dir). Any address; the caller presents a pinned client certificate.
+    variables:
+      host: {default: broker.example}
+      port: {default: "8443"}
 security:
   - bearer: []
   - mutualTLS: []
