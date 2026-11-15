@@ -126,21 +126,37 @@ pub async fn http_over(
         .context("a status line")?
         .parse()
         .context("a numeric status")?;
-    let length: usize = head
-        .lines()
-        .find_map(|l| {
-            l.to_ascii_lowercase()
-                .strip_prefix("content-length:")
-                .map(|v| v.trim().parse().unwrap_or(0))
-        })
-        .unwrap_or(0);
-    while raw.len() < head_end + length {
-        let mut chunk = [0u8; 4096];
-        let n = conn.read(&mut chunk).await.context("read the response body")?;
-        anyhow::ensure!(n > 0, "the connection closed inside the body");
-        raw.extend_from_slice(&chunk[..n]);
-    }
-    let text = String::from_utf8_lossy(&raw[head_end..head_end + length]).into_owned();
+    let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+    let text = if chunked {
+        loop {
+            if let Some(body) = decode_chunked(&raw[head_end..]) {
+                break String::from_utf8_lossy(&body).into_owned();
+            }
+            let mut chunk = [0u8; 4096];
+            let n = conn
+                .read(&mut chunk)
+                .await
+                .context("read a chunk of the response body")?;
+            anyhow::ensure!(n > 0, "the connection closed inside a chunked body");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+    } else {
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while raw.len() < head_end + length {
+            let mut chunk = [0u8; 4096];
+            let n = conn.read(&mut chunk).await.context("read the response body")?;
+            anyhow::ensure!(n > 0, "the connection closed inside the body");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&raw[head_end..head_end + length]).into_owned()
+    };
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::String(text))))
 }
 
@@ -617,5 +633,23 @@ impl Lines {
             last = Some(line);
         }
         last.context("empty stream")
+    }
+}
+
+/// The body of a complete `Transfer-Encoding: chunked` message, or `None` while it is still incomplete.
+fn decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size = usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).ok()?.trim(), 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return (rest.len() >= 2).then_some(out);
+        }
+        if rest.len() < size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size + 2..];
     }
 }

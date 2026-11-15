@@ -31,7 +31,7 @@ fn owner_of(f: &common::Fixture, job: &str) -> Result<Option<String>> {
 }
 
 /// A non-loopback bind is accepted in mTLS mode (the fixture binds every address), and the caller is the client its
-/// certificate is pinned to: a job submitted over A's certificate is A's, over B's certificate is B's.
+/// certificate is pinned to: a job submitted over A's certificate is A's, over C's certificate is C's.
 #[tokio::test]
 async fn the_client_id_derives_from_the_certificate() -> Result<()> {
     let f = fixture_with_opts(mtls()).await?;
@@ -39,26 +39,16 @@ async fn the_client_id_derives_from_the_certificate() -> Result<()> {
 
     let (status, a) = m.call("a", "POST", "/v1/jobs", Some(submit_body()), None).await?;
     assert_eq!(status, 202, "{a}");
-    let (status, b) = m
-        .call(
-            "b",
-            "POST",
-            "/v1/jobs",
-            Some(json!({
-                "manifest": "bQ==", "manifest_encoding": "test/v1", "required_isolation_class": "untrusted"
-            })),
-            None,
-        )
-        .await?;
-    assert_eq!(status, 202, "{b}");
+    let (status, c) = m.call("c", "POST", "/v1/jobs", Some(submit_body()), None).await?;
+    assert_eq!(status, 202, "{c}");
 
     assert_eq!(
         owner_of(&f, a["job_id"].as_str().context("job id")?)?.as_deref(),
         Some("a")
     );
     assert_eq!(
-        owner_of(&f, b["job_id"].as_str().context("job id")?)?.as_deref(),
-        Some("b")
+        owner_of(&f, c["job_id"].as_str().context("job id")?)?.as_deref(),
+        Some("c")
     );
     Ok(())
 }
@@ -415,22 +405,28 @@ async fn a_broker_with_no_usable_pin_refuses_to_start() -> Result<()> {
 async fn the_brokers_identity_is_stable_and_a_corrupt_one_is_refused() -> Result<()> {
     let id = TlsIdentity::generate()?;
     let dir = tempfile::tempdir()?;
-    let start = || async {
-        serve(config(
+    // Each start has its own state directory: dropping a `Running` aborts its task asynchronously, so the previous
+    // owner table's lock may still be held. Only the TLS identity directory is shared, which is what this tests.
+    let attempt = std::cell::Cell::new(0);
+    let start = || {
+        attempt.set(attempt.get() + 1);
+        let mut cfg = config(
             dir.path(),
             "127.0.0.1:0",
             vec![client("alice", None, vec![pin(&id)])],
             true,
-        )?)
-        .await
-        .context("start the broker")
+        );
+        if let Ok(cfg) = cfg.as_mut() {
+            cfg.state_dir = dir.path().join(format!("state-{}", attempt.get()));
+        }
+        async move { serve(cfg.map_err(|e| BrokerError::Tls(e.to_string()))?).await }
     };
 
-    let first = start().await?;
+    let first = start().await.context("the first start")?;
     let fingerprint = first.fingerprint.clone().context("an mTLS broker has a fingerprint")?;
     assert_eq!(fingerprint.len(), 64);
     drop(first);
-    let second = start().await?;
+    let second = start().await.context("the second start")?;
     assert_eq!(
         second.fingerprint.as_deref(),
         Some(fingerprint.as_str()),
@@ -439,14 +435,7 @@ async fn the_brokers_identity_is_stable_and_a_corrupt_one_is_refused() -> Result
     drop(second);
 
     std::fs::remove_file(dir.path().join("tls/identity.key.der"))?;
-    match serve(config(
-        dir.path(),
-        "127.0.0.1:0",
-        vec![client("alice", None, vec![pin(&id)])],
-        true,
-    )?)
-    .await
-    {
+    match start().await {
         Err(BrokerError::Tls(message)) => assert!(!message.is_empty()),
         other => anyhow::bail!("expected Tls for a corrupt identity, got {other:?}"),
     }

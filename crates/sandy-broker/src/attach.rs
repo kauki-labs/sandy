@@ -498,6 +498,7 @@ mod tests {
             control_socket: socket,
             rpc_deadline: Duration::from_secs(30),
             clients: Vec::new(),
+            pins: crate::auth::Pins::default(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
             outputs: Arc::new(crate::output::Outputs::new(
@@ -519,6 +520,7 @@ mod tests {
             control_socket: dir.join("absent.sock"),
             rpc_deadline: Duration::from_secs(30),
             clients: Vec::new(),
+            pins: crate::auth::Pins::default(),
             owners: crate::owners::Owners::open(&dir.join("state"))?,
             tickets: Tickets::new(Duration::from_secs(30)),
             outputs: Arc::new(crate::output::Outputs::new(

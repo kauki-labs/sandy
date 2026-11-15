@@ -19,9 +19,15 @@ struct Args {
     /// Listen address. Loopback only.
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
-    /// JSON array of clients: id, token_sha256, max_isolation_class, roots. Must be mode 0600.
+    /// JSON array of clients: id, token_sha256 (bearer mode) or certs (mTLS mode), max_isolation_class, roots. Must be
+    /// mode 0600.
     #[arg(long)]
     clients_file: PathBuf,
+    /// Serve mutual TLS only, on any address, authenticating each client by its pinned certificate and ignoring
+    /// bearer tokens. The directory holds the broker's own TLS identity (created on first use); its fingerprint is
+    /// logged at start, for callers to pin. Without it the broker serves plaintext on loopback with bearer tokens.
+    #[arg(long)]
+    tls_identity_dir: Option<PathBuf>,
 }
 
 fn load_clients(path: &std::path::Path) -> Result<Vec<Client>, String> {
@@ -90,7 +96,9 @@ async fn main() -> ExitCode {
             state_dir: args.state_dir,
             bind: args.bind,
             clients,
-            tls: None,
+            tls: args
+                .tls_identity_dir
+                .map(|identity_dir| sandy_broker::TlsConfig { identity_dir }),
         },
         Tuning {
             output_retention,
@@ -105,7 +113,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing::info!(addr = %running.addr, "broker listening");
+    tracing::info!(addr = %running.addr, fingerprint = ?running.fingerprint, "broker listening");
     tokio::select! {
         () = running.wait() => {}
         _ = tokio::signal::ctrl_c() => {}
