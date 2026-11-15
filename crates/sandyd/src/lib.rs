@@ -304,7 +304,15 @@ mod tests {
     /// One Submit over a connection accepted as `caller`, with a trusted process host registered so a valid Submit is
     /// placed. Returns the response and the store.
     async fn submit_as(caller: Caller, client_id: Option<&str>) -> anyhow::Result<(ControlResponse, Arc<JobStore>)> {
-        let store = Arc::new(JobStore::open_in_memory()?);
+        submit_on(Arc::new(JobStore::open_in_memory()?), caller, client_id).await
+    }
+
+    /// [`submit_as`] on a store the test prepared.
+    async fn submit_on(
+        store: Arc<JobStore>,
+        caller: Caller,
+        client_id: Option<&str>,
+    ) -> anyhow::Result<(ControlResponse, Arc<JobStore>)> {
         let (mut client, server) = UnixStream::pair()?;
         let registry = Arc::new(JobRegistry::new()?);
         let host_registry = Arc::new(HostRegistry::default());
@@ -419,6 +427,34 @@ mod tests {
             Some(128),
             "the bound is inclusive"
         );
+        Ok(())
+    }
+
+    /// #888: the client id is written by the INSERT of the job row, not by a later UPDATE, so a crash or a fault between two
+    /// statements cannot leave a job that names the uid. This store faults on any UPDATE of `client_id` (the stand-in
+    /// for that window): the Submit must still succeed with the id on the row.
+    #[tokio::test]
+    async fn a_fault_after_the_insert_cannot_lose_the_client_id() -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY, status TEXT NOT NULL, manifest BLOB NOT NULL,
+                manifest_encoding TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                client_id TEXT
+            );
+            CREATE TRIGGER no_client_id_update BEFORE UPDATE OF client_id ON jobs
+            BEGIN SELECT RAISE(ABORT, 'a fault between the insert and the update'); END;",
+        )?;
+
+        let (response, store) = submit_on(
+            Arc::new(JobStore::from_connection(conn)?),
+            Caller::Broker,
+            Some("alice"),
+        )
+        .await?;
+
+        let job = submitted_job(response)?;
+        assert_eq!(store.client_id(&job)?.as_deref(), Some("alice"));
         Ok(())
     }
 

@@ -242,7 +242,7 @@ impl JobStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+    pub(crate) fn from_connection(conn: Connection) -> Result<Self, StoreError> {
         // Wait briefly instead of failing at once when `sandyd cancel` and a starting daemon open the
         // same file together (#545).
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -1314,6 +1314,22 @@ mod tests {
             .envelope(job_id)?
             .and_then(|envelope| envelope.receipt)
             .map(|receipt| receipt.host_observed.who.identity))
+    }
+
+    /// #888: naming the broker's client never marks the receipt authenticated, whatever it said before: nothing
+    /// verifies the id (#413), so the claim in the spec holds even once a verified cap sets `authenticated` elsewhere.
+    #[test]
+    fn naming_a_client_forces_the_receipt_to_unauthenticated() -> Result<(), StoreError> {
+        let mut envelope = crate::envelope::infra_fault("job-1", "reason", None);
+        let receipt = envelope.receipt.as_mut().expect("an infra fault carries a receipt");
+        receipt.host_observed.who.authenticated = true;
+
+        name_client(&mut envelope, Some("alice"));
+
+        let who = envelope.receipt.expect("the receipt").host_observed.who;
+        assert_eq!(who.identity, "broker:alice");
+        assert!(!who.authenticated, "an id the broker asserts is not verified");
+        Ok(())
     }
 
     /// #888: a cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to name a
