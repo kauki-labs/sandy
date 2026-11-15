@@ -110,10 +110,12 @@ the broker with `--tls-identity-dir`: it then serves mutual TLS only, on any add
    ```
 
    `not_after` is optional (unix seconds). A pin already past it when the broker starts is refused at the handshake. The
-   handshake list is fixed at start, so a pin that expires later still completes the handshake and then gets `401
-unauthenticated`, on a new connection and on a long one alike. If the clock cannot be read, every pin that has a
-   `not_after` reads as expired; a pin without one is unaffected. The certificate's own validity period is not checked. To rotate, list the old and the new pin together,
-   restart, move the caller to the new certificate, then remove the old pin and restart. A fingerprint belongs to one
+   handshake list is fixed at start, so a pin that expires later still completes the handshake. Each request re-checks
+   `not_after` and answers `401 unauthenticated` once it has passed, on a new connection and on a long one alike. If the
+   system clock cannot be read, the broker refuses every pin, with or without a `not_after`: it does not start in mTLS
+   mode, and a running broker answers every certificate request `401`. Time-based checks cannot be trusted on a broken
+   clock, so the broker never guesses. The certificate's own validity period is not checked. To rotate, list the old and
+   the new pin together, restart, move the caller to the new certificate, then remove the old pin and restart. A fingerprint belongs to one
    client: listing it twice is refused.
 
 3. Start the broker: `sandy-broker --control-socket /path/broker.sock --state-dir /path/broker-state --clients-file

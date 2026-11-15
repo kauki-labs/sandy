@@ -337,7 +337,7 @@ components:
     mutualTLS:
       type: mutualTLS
       description: >-
-        A broker started with --tls-identity-dir serves mutual TLS only, on any address. The client is the one whose pinned certificate fingerprint the connection presented; the Authorization header is not read. A handshake that fails (not pinned, expired pin, plaintext on the TLS port) gets no HTTP response. See docs/decisions/broker-api.md decision 10.
+        A broker started with --tls-identity-dir serves mutual TLS only, on any address. The client is the one whose pinned certificate fingerprint the connection presented; the Authorization header is not read. A handshake that fails (not pinned, a pin already expired when the broker started, plaintext on the TLS port) gets no HTTP response. Pins already expired at startup are excluded from the handshake list; a pin that expires later still completes the handshake, and each request is re-checked and answered 401 unauthenticated. A system clock that cannot be read refuses every pin. See docs/decisions/broker-api.md decision 10.
   parameters:
     JobId:
       name: job_id

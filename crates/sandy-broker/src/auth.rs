@@ -58,8 +58,13 @@ impl Pins {
     }
 
     /// The fingerprints whose pins are not past their `not_after` at `now`: what the handshake admits.
+    ///
+    /// `now` is `None` when the clock cannot be read: time-based checks cannot be trusted then, so no pin is live,
+    /// whatever its `not_after` (a pin with none included).
     pub(crate) fn live(&self, now: Option<u64>) -> HashSet<Fingerprint> {
-        let now = now.unwrap_or(u64::MAX);
+        let Some(now) = now else {
+            return HashSet::new();
+        };
         self.0
             .iter()
             .filter(|(_, pin)| pin.not_after.is_none_or(|deadline| now <= deadline))
@@ -76,7 +81,8 @@ impl Pins {
         fingerprint: &Fingerprint,
         now: Option<u64>,
     ) -> Option<&'a Client> {
-        let now = now.unwrap_or(u64::MAX);
+        // An unreadable clock refuses every pin, as in `live`.
+        let now = now?;
         let pin = self.0.get(fingerprint)?;
         if pin.not_after.is_some_and(|deadline| now > deadline) {
             return None;

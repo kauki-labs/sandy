@@ -368,11 +368,14 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
     let bind_err = |source| BrokerError::Bind { addr: bind, source };
     // Bound before any state is opened, so a broker that cannot listen leaves nothing behind.
     let (acceptor, addr, fingerprint) = if let Some(tls) = &config.tls {
-        let allowed = pins.live(auth::now_unix());
+        let now = auth::now_unix();
+        let allowed = pins.live(now);
         if allowed.is_empty() {
-            return Err(BrokerError::Tls(
-                "no usable certificate pin: every pin is past its not_after".to_owned(),
-            ));
+            return Err(BrokerError::Tls(if now.is_none() {
+                "the system clock cannot be read, so no certificate pin can be checked: fix the clock".to_owned()
+            } else {
+                "no usable certificate pin: every pin is past its not_after".to_owned()
+            }));
         }
         let tls_err =
             |e: &dyn std::fmt::Display| BrokerError::Tls(format!("identity in {}: {e}", tls.identity_dir.display()));
