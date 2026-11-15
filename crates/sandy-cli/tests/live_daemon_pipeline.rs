@@ -16,8 +16,10 @@
 //! started (matched by pid and start time) and removes its temp dir. `Drop` does not run when a signal ends the test
 //! process (a nextest timeout, Ctrl-C, `kill -9`), so each stack also starts a watchdog: a `sh` in its own process
 //! group that waits for the test's pid to go, then kills every process whose environment names this stack's temp dir
-//! (an exact `TMPDIR=<dir>` or `TMPDIR=<dir>/...` entry, inherited by `sandyd`, the executor and qemu) and removes
-//! the dir. It reads no command line and touches nothing from another session; a decoy test pins that.
+//! (an exact `TMPDIR=<dir>` or `TMPDIR=<dir>/...` entry, inherited by `sandyd`, the executor and qemu, or an exact
+//! `SANDY_LIVE_STACK=<dir>` entry, which every setup helper carries: the guest build, the key generation, the
+//! fallback `sandyd` build) and removes the dir. It reads no command line and touches nothing from another session;
+//! a decoy test and a guard test pin that.
 //!
 //! Not covered here: that virtiofsd inherits `TMPDIR` is unchecked (the signal proof showed no survivor, but did not
 //! name the virtiofsd processes), and the egress proxy clears its environment. A later `--allow` slice that boots a
@@ -44,6 +46,12 @@ const TEMPLATE: &str = "topologies.x86_64-linux.qemu";
 /// A cold guest build plus a boot, and the longest a single `sandy` call may take.
 const BUILD_SECS: u64 = 1500;
 const CALL_SECS: u64 = 600;
+/// The fallback `cargo build -p sandyd` when `SANDYD_BIN` is unset: long enough for a cold build, short enough that
+/// a wait on a cargo lock cannot hang the start.
+const SANDYD_BUILD_SECS: u64 = 900;
+/// Every helper the stack runs gets this variable with the stack's dir, so the watchdog reaches a helper whose own
+/// environment has no `TMPDIR` under the dir (the guest build, the key generation, the `sandyd` build).
+const STACK_MARKER: &str = "SANDY_LIVE_STACK";
 /// The guest's qemu appears within a minute of the job reading Running (about 20 s on ws01).
 const GUEST_SECS: u64 = 120;
 
@@ -108,8 +116,13 @@ impl Drop for Proc {
 
 /// Run `cmd` to its end or kill it after `secs`, with its output in files so a large result cannot fill a pipe.
 fn run_timeout(mut cmd: Command, dir: &Path, label: &str, secs: u64) -> anyhow::Result<(i32, String, String)> {
+    use std::os::unix::process::CommandExt as _;
     let (out, err) = (dir.join(format!("{label}.out")), dir.join(format!("{label}.err")));
+    // Its own process group, so a timeout kills the helper and what it started (cargo's rustc), and the marker
+    // lets the watchdog reach it if the test dies first.
     let mut child = cmd
+        .env(STACK_MARKER, dir)
+        .process_group(0)
         .stdout(Stdio::from(std::fs::File::create(&out)?))
         .stderr(Stdio::from(std::fs::File::create(&err)?))
         .spawn()
@@ -120,6 +133,10 @@ fn run_timeout(mut cmd: Command, dir: &Path, label: &str, secs: u64) -> anyhow::
             break status;
         }
         if Instant::now() > deadline {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--"])
+                .arg(format!("-{}", child.id()))
+                .status();
             let _ = child.kill();
             let _ = child.wait();
             bail!("{label} did not finish within {secs}s");
@@ -139,18 +156,18 @@ fn env_path(name: &str) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("{name} is required: see the doc comment of this file"))
 }
 
-fn sandyd_bin() -> anyhow::Result<PathBuf> {
+fn sandyd_bin(base: &Path) -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("SANDYD_BIN") {
         return Ok(PathBuf::from(path));
     }
     let sandy = PathBuf::from(env!("CARGO_BIN_EXE_sandy"));
-    let status = Command::new(env!("CARGO"))
+    let mut build = Command::new(env!("CARGO"));
+    build
         .args(["build", "-p", "sandyd", "--bin", "sandyd"])
         .arg("--manifest-path")
-        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
-        .status()
-        .context("build sandyd")?;
-    ensure!(status.success(), "cargo build -p sandyd failed");
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
+    let (code, _, err) = run_timeout(build, base, "sandyd-build", SANDYD_BUILD_SECS)?;
+    ensure!(code == 0, "cargo build -p sandyd failed: {err}");
     Ok(sandy.parent().context("sandy's binary has no parent")?.join("sandyd"))
 }
 
@@ -162,50 +179,77 @@ fn two_free_ports() -> anyhow::Result<(u16, u16)> {
 }
 
 /// Waits for the owner process to go (pid and start time, so a reused pid does not keep it), then kills every process
-/// whose environment has an entry that is exactly `TMPDIR=<base>` or starts with `TMPDIR=<base>/`, and removes
-/// `base`. Runs as `sh` in its own process group: a group signal to the test (a nextest timeout) does not reach it.
+/// whose environment has an entry that is exactly `TMPDIR=<base>`, `SANDY_LIVE_STACK=<base>`, or one of those two
+/// followed by `/...`, and removes `base`. Runs as `sh` in its own process group: a group signal to the test (a nextest
+/// timeout) does not reach it.
 ///
-/// Guards, all checked before any kill and again before the removal: `base` must be `/tmp/s` plus six alphanumerics
-/// (the shape of the test's own temp dir), and must still be the directory the test created (a real directory, not a
-/// link, with the inode the test passed). The environment match is per NUL-delimited entry (`grep -z -x`), never a
-/// substring, so `XTMPDIR=<base>/x` and `TMPDIR=<base>x/...` do not match. It reads no command line and matches no
-/// name.
+/// Guards, all checked before any kill and again before the removal: five non-empty arguments (`set -u`), `base` is
+/// `/tmp/s` plus six alphanumerics (the shape of the test's own temp dir), and it is still the directory the test
+/// created (a real directory, not a link, with the inode and birth time the test passed). The environment match is per
+/// NUL-delimited entry (`grep -z -x`), never a substring, so `XTMPDIR=<base>/x` and `TMPDIR=<base>x/...` do not match.
+/// A pid's start ticks are read before the match and checked again right before the signal, so a pid reused in
+/// between is not signalled. It reads no command line and matches no name.
 const WATCHDOG: &str = r#"
-pid=$1; start=$2; base=$3; ino=$4
+set -u
+[ $# -eq 5 ] || exit 1
+pid=$1; start=$2; base=$3; ino=$4; birth=$5
+for v in "$pid" "$start" "$base" "$ino" "$birth"; do [ -n "$v" ] || exit 1; done
 case "$base" in /tmp/s[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 1 ;; esac
-same_dir() { [ -d "$base" ] && [ ! -L "$base" ] && [ "$(stat -c %i "$base")" = "$ino" ]; }
+ticks() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+same_dir() { [ -d "$base" ] && [ ! -L "$base" ] && [ "$(stat -c %i:%W "$base")" = "$ino:$birth" ]; }
 same_dir || exit 1
-alive() { [ -r "/proc/$pid/stat" ] && [ "$(sed 's/.*) //' "/proc/$pid/stat" | cut -d' ' -f20)" = "$start" ]; }
+alive() { [ -r "/proc/$pid/stat" ] && [ "$(ticks "$pid")" = "$start" ]; }
 while alive; do sleep 1; done
 for round in 1 2 3; do
   same_dir || exit 1
   for p in /proc/[0-9]*; do
     n=${p#/proc/}
     [ "$n" = "$$" ] && continue
-    grep -qzxE "TMPDIR=$base(/.*)?" "$p/environ" 2>/dev/null && kill -KILL "$n" 2>/dev/null
+    t0=$(ticks "$n")
+    [ -n "$t0" ] || continue
+    if grep -qzxE "(TMPDIR|SANDY_LIVE_STACK)=$base(/.*)?" "$p/environ" 2>/dev/null; then
+      [ "$(ticks "$n")" = "$t0" ] && kill -KILL "$n" 2>/dev/null
+    fi
   done
   sleep 1
 done
 same_dir && rm -rf "$base"
 "#;
 
-/// Start the [`WATCHDOG`] for `base`, to reap once `owner` (a pid of this host) is gone. Its own stdio is null and
-/// its environment holds no `TMPDIR=<base>`.
-fn start_watchdog(owner: u32, base: &Path) -> anyhow::Result<()> {
-    use std::os::unix::{fs::MetadataExt as _, process::CommandExt as _};
-    let (_, start) = parent_and_start(owner).context("read the owner's start time")?;
-    let ino = std::fs::metadata(base).context("stat the temp dir")?.ino();
+/// Run the [`WATCHDOG`] with exactly these arguments. Its stdio is null and its environment holds no marker for `base`.
+/// The tests pass wrong arguments to pin the guards; `start_watchdog` passes the right ones.
+fn spawn_watchdog(owner: u32, owner_start: u64, base: &str, ino: u64, birth: u64) -> anyhow::Result<Child> {
+    use std::os::unix::process::CommandExt as _;
     Command::new("sh")
-        .args(["-c", WATCHDOG, "watchdog", &owner.to_string(), &start.to_string()])
-        .arg(base)
-        .arg(ino.to_string())
+        .args(["-c", WATCHDOG, "watchdog"])
+        .args([owner.to_string(), owner_start.to_string()])
+        .args([base.to_owned(), ino.to_string(), birth.to_string()])
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("spawn the watchdog")?;
-    Ok(())
+        .context("spawn the watchdog")
+}
+
+/// The inode and birth time (whole seconds, 0 when the filesystem has none) of `path`, as the watchdog's `stat -c
+/// %i:%W` reads them.
+fn dir_identity(path: &Path) -> anyhow::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).context("stat the temp dir")?;
+    let birth = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    Ok((meta.ino(), birth))
+}
+
+/// Start the [`WATCHDOG`] for `base`, to reap once `owner` (a pid of this host) is gone.
+fn start_watchdog(owner: u32, base: &Path) -> anyhow::Result<Child> {
+    let (_, start) = parent_and_start(owner).context("read the owner's start time")?;
+    let (ino, birth) = dir_identity(base)?;
+    spawn_watchdog(owner, start, &base.to_string_lossy(), ino, birth)
 }
 
 fn private_dir(path: &Path) -> anyhow::Result<()> {
@@ -263,7 +307,7 @@ impl Stack {
         let sock = base.join("d.sock");
         let (mesh, link) = two_free_ports()?;
         let daemon = Proc(
-            Command::new(sandyd_bin()?)
+            Command::new(sandyd_bin(base)?)
                 .env("SANDY_SOCK", &sock)
                 .env("SANDY_DB", base.join("d.db"))
                 .env("TMPDIR", base.join("dt"))
@@ -494,24 +538,72 @@ fn the_lifecycle_verbs_operate_on_a_real_running_job() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Child processes the test started for the decoy test: killed when this drops, by `Child::kill` on the handle.
-struct Decoys(Vec<Child>);
+/// Cleanup that runs when it drops, so it is in place before the next step that can fail: it kills and reaps the
+/// children the test holds a handle for, and removes the directories it was given. Register a child or a dir the
+/// moment it exists.
+#[derive(Default)]
+struct Cleanup {
+    children: Vec<Child>,
+    dirs: Vec<PathBuf>,
+}
 
-impl Drop for Decoys {
+impl Cleanup {
+    /// A `sleep 600` whose environment holds `key=value`; the index of its handle in `children`.
+    fn sleeper(&mut self, key: &str, value: &str) -> anyhow::Result<usize> {
+        let child = Command::new("sleep")
+            .arg("600")
+            .env(key, value)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn a sleeper")?;
+        self.children.push(child);
+        Ok(self.children.len() - 1)
+    }
+
+    fn is_alive(&mut self, index: usize) -> anyhow::Result<bool> {
+        Ok(self.children[index].try_wait()?.is_none())
+    }
+}
+
+impl Drop for Cleanup {
     fn drop(&mut self) {
-        for child in &mut self.0 {
+        for child in &mut self.children {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
 
-/// The watchdog kills a process whose environment is exactly this stack's `TMPDIR=<dir>/...` and nothing else. The
-/// positive control (`TMPDIR=<dir>/dt`) must die. The decoys must live: a dir whose name only starts like this one
-/// (`TMPDIR=<dir>x/dt`), an entry that only ends like it (`XTMPDIR=<dir>/dt`) and an unrelated `TMPDIR`. The owner
-/// is a short-lived child, so no VM is needed.
+/// Wait for `child` to end, or kill it after `secs`.
+fn wait_exit(child: &mut Child, secs: u64, label: &str) -> anyhow::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{label} did not finish within {secs}s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The watchdog kills a process whose environment names its dir exactly, and nothing else. Two positive controls must
+/// die: `TMPDIR=<dir>/dt` and the setup helpers' `SANDY_LIVE_STACK=<dir>`. Four decoys must live: a dir whose name only
+/// starts like this one (`TMPDIR=<dir>x/dt`), an entry that only ends like it (`XTMPDIR=<dir>/dt`,
+/// `XSANDY_LIVE_STACK=<dir>`) and an unrelated `TMPDIR`. The owner is a short-lived child, so no VM is needed (and
+/// `require_live` is not called, on purpose). Every child and dir is registered with [`Cleanup`] as soon as it exists,
+/// so a failed step cannot leak the ones before it.
 #[test]
 fn the_watchdog_kills_only_processes_that_name_its_own_dir() -> anyhow::Result<()> {
+    let mut cleanup = Cleanup::default();
     let dir = tempfile::Builder::new()
         .prefix("s")
         .tempdir_in("/tmp")
@@ -519,43 +611,114 @@ fn the_watchdog_kills_only_processes_that_name_its_own_dir() -> anyhow::Result<(
     let base = dir.path().to_string_lossy().into_owned();
     let longer = PathBuf::from(format!("{base}x"));
     std::fs::create_dir(&longer).context("a dir whose name starts like the stack's")?;
-    let sleeper = |key: &str, value: String| -> anyhow::Result<Child> {
-        Command::new("sleep")
-            .arg("600")
-            .env(key, value)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn a decoy")
-    };
-    let mut target = sleeper("TMPDIR", format!("{base}/dt"))?;
-    let mut decoys = Decoys(vec![
-        sleeper("TMPDIR", format!("{base}x/dt"))?,
-        sleeper("XTMPDIR", format!("{base}/dt"))?,
-        sleeper("TMPDIR", "/tmp/unrelated-858".to_owned())?,
-    ]);
-    let mut owner = Command::new("sleep").arg("1").spawn().context("spawn the owner")?;
-    start_watchdog(owner.id(), dir.path())?;
-    owner.wait().context("the owner ends")?;
+    cleanup.dirs.push(longer.clone());
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while target.try_wait()?.is_none() {
+    let dies = [
+        cleanup.sleeper("TMPDIR", &format!("{base}/dt"))?,
+        cleanup.sleeper(STACK_MARKER, &base)?,
+    ];
+    let lives = [
+        cleanup.sleeper("TMPDIR", &format!("{base}x/dt"))?,
+        cleanup.sleeper("XTMPDIR", &format!("{base}/dt"))?,
+        cleanup.sleeper(&format!("X{STACK_MARKER}"), &base)?,
+        cleanup.sleeper("TMPDIR", "/tmp/unrelated-858")?,
+    ];
+    let owner = {
+        let child = Command::new("sleep").arg("1").spawn().context("spawn the owner")?;
+        cleanup.children.push(child);
+        cleanup.children.len() - 1
+    };
+    let mut watchdog = start_watchdog(cleanup.children[owner].id(), dir.path())?;
+    cleanup.children[owner].wait().context("the owner ends")?;
+
+    let status = wait_exit(&mut watchdog, 30, "the watchdog")?;
+    ensure!(status.success(), "the watchdog exited {status}");
+    for i in dies {
         ensure!(
-            Instant::now() < deadline,
-            "the watchdog never killed the process of its own dir"
+            !cleanup.is_alive(i)?,
+            "a process of the stack's dir survived the watchdog"
         );
-        std::thread::sleep(Duration::from_millis(100));
     }
-    while dir.path().exists() {
-        ensure!(Instant::now() < deadline, "the watchdog never removed its dir");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    for (i, decoy) in decoys.0.iter_mut().enumerate() {
-        ensure!(decoy.try_wait()?.is_none(), "decoy {i} was killed");
+    ensure!(!dir.path().exists(), "the watchdog did not remove its dir");
+    for (n, i) in lives.into_iter().enumerate() {
+        ensure!(cleanup.is_alive(i)?, "decoy {n} was killed");
     }
     ensure!(longer.exists(), "the dir that only starts like the stack's was touched");
-    std::fs::remove_dir(&longer).context("remove the decoy dir")?;
-    // `dir` is already gone: its own drop finds nothing to remove and ignores that.
+    Ok(())
+}
+
+/// Each guard of the watchdog pins one wrong argument: it must exit 1 before it kills anything or removes anything.
+/// For every case a sleeper whose `TMPDIR` is `<base>/dt` is the would-be victim, and the owner is already gone (its
+/// start time never matches), so a loosened guard would reach the kill within a second and fail this test.
+#[test]
+fn the_watchdog_refuses_anything_but_the_dir_the_test_made() -> anyhow::Result<()> {
+    let mut cleanup = Cleanup::default();
+    let me = std::process::id();
+    let real = tempfile::Builder::new()
+        .prefix("s")
+        .tempdir_in("/tmp")
+        .context("temp dir under /tmp")?;
+    let (ino, birth) = dir_identity(real.path())?;
+    let real_base = real.path().to_string_lossy().into_owned();
+
+    // (case, base as the watchdog is told it, inode, birth time)
+    let mut cases: Vec<(String, String, u64, u64)> = vec![
+        ("a wrong inode".into(), real_base.clone(), ino + 1, birth),
+        ("a wrong birth time".into(), real_base.clone(), ino, birth + 1),
+    ];
+    // A symlink whose name has the right shape, to the real dir: only the link check can refuse it.
+    let link = PathBuf::from("/tmp/s858001");
+    ensure!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "{} is in the way: remove it",
+        link.display()
+    );
+    std::os::unix::fs::symlink(real.path(), &link).context("a symlink with the right shape")?;
+    cleanup.dirs.push(link.clone());
+    cases.push((
+        "a symlinked base".into(),
+        link.to_string_lossy().into_owned(),
+        ino,
+        birth,
+    ));
+    // Real dirs with lookalike names, so only the name check can refuse them.
+    for name in ["s85800", "s8580001", "s858-01", "x858001"] {
+        let path = PathBuf::from("/tmp").join(name);
+        std::fs::create_dir(&path).with_context(|| format!("create {}", path.display()))?;
+        cleanup.dirs.push(path.clone());
+        let (i, b) = dir_identity(&path)?;
+        cases.push((
+            format!("the lookalike name {name}"),
+            path.to_string_lossy().into_owned(),
+            i,
+            b,
+        ));
+    }
+
+    for (case, base, i, b) in cases {
+        let victim = cleanup.sleeper("TMPDIR", &format!("{base}/dt"))?;
+        let mut watchdog = spawn_watchdog(me, 0, &base, i, b)?;
+        let status = wait_exit(&mut watchdog, 30, case.as_str())?;
+        ensure!(status.code() == Some(1), "{case}: the watchdog exited {status}, not 1");
+        ensure!(cleanup.is_alive(victim)?, "{case}: the process was killed");
+        ensure!(Path::new(&base).exists(), "{case}: the dir was removed");
+    }
+    ensure!(real.path().exists(), "the real dir was removed");
+
+    // An empty base, and a missing argument, exit 1 too (`set -u` and the argument check).
+    let mut empty = spawn_watchdog(me, 0, "", ino, birth)?;
+    ensure!(
+        wait_exit(&mut empty, 30, "an empty base")?.code() == Some(1),
+        "an empty base was accepted"
+    );
+    let mut short = Command::new("sh")
+        .args(["-c", WATCHDOG, "watchdog", "1", "0", &real_base, &ino.to_string()])
+        .stdin(Stdio::null())
+        .spawn()
+        .context("spawn a watchdog with four arguments")?;
+    ensure!(
+        wait_exit(&mut short, 30, "four arguments")?.code() == Some(1),
+        "four arguments were accepted"
+    );
     Ok(())
 }
