@@ -238,25 +238,59 @@ fn validate_clients(clients: &[Client], tls: bool) -> Result<auth::Pins, BrokerE
 /// owned by this user and not writable by others, and a key already there is a regular `0600` file of this user's.
 /// `sandy-conn` stays as it is, because the mesh uses the same loader. The directory is private, so nobody else can
 /// swap the key between this check and the load.
+///
+/// Each refusal names the path and the fix, because an upgrade from a broker that made the directory under a loose
+/// umask (0775, key 0644) meets them at startup.
 fn prepare_identity_dir(dir: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let owned = sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| e.to_string())?;
+    let me = sandy_fsutil::current_uid();
+    let shown = dir.display();
+    // Read the directory first: the staging helper's own refusal names no fix.
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "{shown} is a symlink: replace it with a real directory (`mkdir -m 700 {shown}`)"
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(format!("{shown} is not a directory"));
+        }
+        if meta.uid() != me {
+            return Err(format!(
+                "{shown} is owned by another user: give it to the broker's user (`chown`) and run `chmod 700 {shown}`"
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "{shown} is mode {:o}: group or world can write it; run `chmod 700 {shown}`",
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    let owned = sandy_fsutil::OwnedDir::open_or_create(dir)
+        .map_err(|e| format!("{e}; the directory must be mode 700 and owned by the broker's user"))?;
     let key = owned.path().join("identity.key.der");
     let meta = match std::fs::symlink_metadata(&key) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("{}: {e}", key.display())),
     };
+    let shown = key.display();
     if !meta.file_type().is_file() {
-        return Err(format!("{} is not a regular file (a symlink?)", key.display()));
+        return Err(format!(
+            "{shown} is not a regular file (a symlink is refused): replace it with a regular file, or remove it to \
+             mint a new identity (the fingerprint changes)"
+        ));
     }
-    if meta.uid() != sandy_fsutil::current_uid() {
-        return Err(format!("{} is not owned by the broker's user", key.display()));
+    if meta.uid() != me {
+        return Err(format!(
+            "{shown} is owned by another user: give it to the broker's user (`chown`), or remove it to mint a new \
+             identity (the fingerprint changes)"
+        ));
     }
     if meta.mode() & 0o077 != 0 {
         return Err(format!(
-            "{} is mode {:o}: group or world can read it; chmod 600",
-            key.display(),
+            "{shown} is mode {:o}: group or world can read it; run `chmod 600 {shown}`",
             meta.mode() & 0o777
         ));
     }

@@ -383,6 +383,11 @@ model on #607 and pulled forward remote callers with mTLS. The mesh already has 
 - Each refused handshake is one log line, so a scanner can fill the log of a broker exposed to the internet: firewall the
   port and rotate the log.
 - A compromised caller key is a compromised client: nothing binds a key to an address.
+- The identity check covers the directory and the key, not the directory's ancestors. A rename race on an ancestor needs a
+  parent that is writable by another user without the sticky bit. Keep the identity directory under a parent only the
+  broker's user can write.
+- An upgrade from a broker that created the directory under a loose umask (0775, key 0644) is refused at startup. The error
+  names the path and the `chmod`; the runbook has an upgrade note. The fingerprint does not change.
 - `sandy-mcp` keeps the bearer path on loopback. A remote caller uses its own mTLS HTTP client.
 
 **Set aside.** A CA bundle with subject-to-client mapping (a second trust model, chain and revocation rules to get right,

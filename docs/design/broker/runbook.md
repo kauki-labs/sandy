@@ -132,6 +132,18 @@ is not pinned, a timeout, plaintext on the TLS port) gets no HTTP answer; the br
 peer address, never a certificate. A scanner can fill that log, so rotate it. Unauthenticated peers can hold up to 128
 connection slots for the handshake timeout (10 s), so firewall the port to the callers' addresses.
 
+### Upgrading an existing broker identity directory
+
+An earlier mTLS broker created `--tls-identity-dir` with the process umask, so under umask 002 it is mode 0775 and its key 0644. The broker now refuses to start on such a directory, and the error names the path and the command:
+
+1. Run `chmod 700 <identity dir>`.
+2. Run `chmod 600 <identity dir>/identity.key.der`.
+3. Start the broker. The fingerprint does not change, so no caller re-pins.
+
+If the error says the key is a symlink, replace it with a regular file holding the key. If it says another user owns the
+directory or the key, `chown` it to the broker's user. Removing both identity files mints a new identity, and every caller
+must then pin the new fingerprint.
+
 ## Run an environment end to end
 
 `SANDY_ENV_BACKEND=process-insecure` makes sandyd run each environment's service as a host
