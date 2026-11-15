@@ -261,7 +261,7 @@ sequenceDiagram
   P-->>S: Minted(token, expiry, handle)
   S->>S: stage token 0600 in cred_dir (secret_dir)
   S->>B: run (plan + secret_dir)
-  B->>G: boot; token exported as $GITHUB_TOKEN
+  B->>G: boot, then token exported as $GITHUB_TOKEN
   S->>P: revoke(lease) at teardown
 ```
 
@@ -419,10 +419,12 @@ booted, guest_exit }`. It is band 3 and retryable whatever the guest exit, so a 
   `None` on an invalid-plan run (no `Running` record was ever written) and on
   `kill`'s synthetic cancellation (no backend run to observe).
   - `host_observed` (the guest cannot influence these): `who` (the submitter
-    cap's verified `scope.peer` with `authenticated: true`, or the local uid
-    with `authenticated: false` — today always the local uid: no run path yet
-    derives a verified submitter cap, since sandyd's dispatch core does not
-    persist a receipt at all yet, tracked in #413); `what`
+    cap's verified `scope.peer` with `authenticated: true`, the local uid
+    with `authenticated: false`, or, for a job the broker submitted for an API
+    client, `broker:<client_id>` with `authenticated: false` (the broker asserts
+    the id and nothing verifies it, #888, `sandyd.md` decision 39) — today never
+    verified: no run path yet derives a verified submitter cap, tracked in
+    #413); `what`
     (job id, template ref, and `Option`s for a resolved store path and a
     manifest digest — both `None` today, honestly, rather than an empty-string
     placeholder: no run path threads a resolved store path or a manifest

@@ -195,6 +195,7 @@ impl CredentialBracket {
     #[must_use]
     pub fn secret_ref(&self) -> SecretRef {
         SecretRef {
+            root: None,
             name: self.target.secret_name.clone(),
             source: SecretSource::File(self.token_path.clone()),
         }
@@ -360,6 +361,7 @@ fn lease_copy(lease: &Lease) -> Lease {
     };
     Lease {
         secret_ref: SecretRef {
+            root: None,
             name: lease.secret_ref.name.clone(),
             source: SecretSource::File(path),
         },

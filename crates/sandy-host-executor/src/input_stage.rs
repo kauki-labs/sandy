@@ -188,6 +188,7 @@ where
     let inputs = inputs
         .iter()
         .map(|input| Input {
+            root: None,
             host: root.path().join(&input.name),
             name: input.name.clone(),
             guest_path: input.guest_path.as_deref().map(std::path::PathBuf::from),
@@ -248,6 +249,7 @@ mod tests {
 
     fn declared(name: &str, guest: Option<&str>) -> sandy_executor_proto::Input {
         sandy_executor_proto::Input {
+            root: None,
             host: "/submitter/path/ignored".to_owned(),
             name: name.to_owned(),
             guest_path: guest.map(str::to_owned),
@@ -628,6 +630,7 @@ mod tests {
     async fn an_unnamed_input_is_refused_before_a_root_exists() -> anyhow::Result<()> {
         let parent = tempfile::tempdir().context("parent")?;
         let unnamed = sandy_executor_proto::Input {
+            root: None,
             host: "/x".to_owned(),
             name: String::new(),
             guest_path: None,
@@ -660,6 +663,7 @@ mod tests {
         ] {
             let parent = tempfile::tempdir().context("parent")?;
             let bad = sandy_executor_proto::Input {
+                root: None,
                 host: "/x".to_owned(),
                 name: name.to_owned(),
                 guest_path: None,

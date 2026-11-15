@@ -97,6 +97,7 @@ fn qemu_input_share_is_read_only() -> Result<()> {
     std::fs::write(tmp.path().join("f"), b"in")?;
     let n = stage_inputs(
         &[Input {
+            root: None,
             host: tmp.path().join("f"),
             name: "data".to_string(),
             guest_path: None,
@@ -140,6 +141,7 @@ fn vfkit_input_share_strips_ro() -> Result<()> {
     std::fs::write(tmp.path().join("f"), b"in")?;
     stage_inputs(
         &[Input {
+            root: None,
             host: tmp.path().join("f"),
             name: "data".to_string(),
             guest_path: None,
@@ -163,6 +165,7 @@ fn missing_host_input_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let err = stage_inputs(
         &[Input {
+            root: None,
             host: tmp.path().join("does-not-exist"),
             name: "data".to_string(),
             guest_path: None,
@@ -182,6 +185,7 @@ fn qemu_output_share_is_writable() -> Result<()> {
     let outputs_dir = tmp.path().join("outputs");
     prepare_outputs(
         &[Output {
+            root: None,
             name: Some("result".to_string()),
             dest: tmp.path().join("dest"),
         }],
@@ -216,6 +220,7 @@ fn vfkit_output_share_is_writable() -> Result<()> {
     let outputs_dir = tmp.path().join("outputs");
     prepare_outputs(
         &[Output {
+            root: None,
             name: Some("result".to_string()),
             dest: tmp.path().join("dest"),
         }],
@@ -240,10 +245,12 @@ fn outputs_collect_named_and_catch_all() -> Result<()> {
     let all_dest = tmp.path().join("all-dest");
     let outputs = [
         Output {
+            root: None,
             name: Some("result".to_string()),
             dest: named_dest.clone(),
         },
         Output {
+            root: None,
             name: None,
             dest: all_dest.clone(),
         },
@@ -285,6 +292,7 @@ fn output_symlink_escape_is_skipped() -> Result<()> {
     let secret = tmp.path().join("host-secret");
     std::fs::write(&secret, b"TOP-SECRET")?;
     let outputs = [Output {
+        root: None,
         name: Some("o".to_string()),
         dest: dest.clone(),
     }];
@@ -321,6 +329,7 @@ fn three_shares_only_outputs_writable() -> Result<()> {
     std::fs::write(tmp.path().join("f"), b"in")?;
     stage_inputs(
         &[Input {
+            root: None,
             host: tmp.path().join("f"),
             name: "data".to_string(),
             guest_path: None,
@@ -329,6 +338,7 @@ fn three_shares_only_outputs_writable() -> Result<()> {
     )?;
     prepare_outputs(
         &[Output {
+            root: None,
             name: None,
             dest: tmp.path().join("dest"),
         }],
@@ -392,15 +402,18 @@ fn plan_shares_stages_secret_input_output_with_the_right_flags() -> Result<()> {
     let outputs = tmp.path().join("outputs");
 
     let secrets = [SecretRef {
+        root: None,
         name: "TOK".to_string(),
         source: SecretSource::File(secret_src),
     }];
     let in_specs = [Input {
+        root: None,
         host: in_src,
         name: "data".to_string(),
         guest_path: None,
     }];
     let out_specs = [Output {
+        root: None,
         name: Some("r".to_string()),
         dest: tmp.path().join("dest"),
     }];

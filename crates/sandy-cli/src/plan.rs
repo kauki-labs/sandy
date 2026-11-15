@@ -40,6 +40,7 @@ pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
             ))
         })?;
         return Ok(Input {
+            root: None,
             host: resolve_input_host(host),
             name: format!("in{index}"),
             guest_path: Some(PathBuf::from(spec)),
@@ -49,6 +50,7 @@ pub fn parse_input(raw: &str, index: usize) -> Result<Input, PlanError> {
         return Err(invalid());
     }
     Ok(Input {
+        root: None,
         host: resolve_input_host(host),
         name: spec.to_string(),
         guest_path: None,
@@ -124,12 +126,14 @@ pub fn parse_output(raw: &str) -> Result<Output, PlanError> {
         && !dest.is_empty()
     {
         return Ok(Output {
+            root: None,
             name: Some(name.to_string()),
             dest: PathBuf::from(dest),
         });
     }
     // Catch-all: the whole token is the destination.
     Ok(Output {
+        root: None,
         name: None,
         dest: PathBuf::from(raw),
     })
@@ -151,6 +155,7 @@ pub fn parse_secret(raw: &str) -> Result<SecretRef, PlanError> {
         return Err(invalid());
     }
     Ok(SecretRef {
+        root: None,
         name: name.to_string(),
         source: SecretSource::File(PathBuf::from(path)),
     })

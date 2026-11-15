@@ -46,6 +46,7 @@ impl OutputStaging {
         for (position, output) in declared.iter().enumerate() {
             let dest = root.path().join(position.to_string());
             run_outputs.push(Output {
+                root: None,
                 name: output.name.clone(),
                 dest: dest.clone(),
             });
@@ -141,6 +142,7 @@ mod tests {
 
     fn declared(name: Option<&str>, dest: &str) -> sandy_executor_proto::Output {
         sandy_executor_proto::Output {
+            root: None,
             name: name.map(str::to_owned),
             dest: dest.to_owned(),
         }
@@ -163,10 +165,12 @@ mod tests {
             staging.run_outputs(),
             &[
                 Output {
+                    root: None,
                     name: Some("results".to_owned()),
                     dest: root.join("0")
                 },
                 Output {
+                    root: None,
                     name: None,
                     dest: root.join("1")
                 },
@@ -219,6 +223,7 @@ mod tests {
             .run_outputs()
             .iter()
             .map(|o| sandy::Output {
+                root: None,
                 name: o.name.clone(),
                 dest: o.dest.clone(),
             })
@@ -269,6 +274,7 @@ mod tests {
         let parent = tempfile::tempdir().context("parent")?;
         let staging = OutputStaging::new(parent.path(), &[declared(None, "/submitter/all")]).context("stage")?;
         let collect_into = [sandy::Output {
+            root: None,
             name: None,
             dest: staging.run_outputs()[0].dest.clone(),
         }];
@@ -292,6 +298,7 @@ mod tests {
         let parent = tempfile::tempdir().context("parent")?;
         let staging = OutputStaging::new(parent.path(), &[declared(None, "/submitter/all")]).context("stage")?;
         let collect_into = [sandy::Output {
+            root: None,
             name: None,
             dest: staging.run_outputs()[0].dest.clone(),
         }];

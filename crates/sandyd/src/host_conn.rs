@@ -1100,6 +1100,7 @@ mod tests {
 
     fn capabilities() -> Capabilities {
         Capabilities {
+            path_root: false,
             digests: false,
             supported_sandbox_kinds: vec![SandboxKind::Process.into()],
             arch: Arch::X8664.into(),
@@ -1973,6 +1974,7 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.data_outputs = vec![sandy_executor_proto::Output {
+            root: None,
             name: Some("out".to_owned()),
             dest: "/nowhere".to_owned(),
         }];
@@ -2179,6 +2181,41 @@ mod tests {
             assert_eq!(envelope.result_schema_version, sandy::RESULT_SCHEMA_VERSION, "{name}");
             assert_eq!(envelope.logs.tail, "hi\n", "{name}: the console is the log tail");
         }
+        Ok(())
+    }
+
+    /// #888: a finished run's receipt names the API client the job row holds (`broker:<id>`), so two clients are told
+    /// apart; a job with no client id keeps the uid.
+    #[tokio::test]
+    async fn a_finished_runs_receipt_names_its_client_and_two_clients_are_told_apart() -> anyhow::Result<()> {
+        let (store, job_registry) = (test_store(), test_job_registry());
+        for (job, client) in [("job-1", Some("alice")), ("job-2", Some("bob")), ("job-3", None)] {
+            running_job(&store, &job_registry, job).await?;
+            if let Some(client) = client {
+                store.set_client_id(job, client)?;
+            }
+            record_job_result(
+                &store,
+                &job_registry,
+                &mut HashSet::from([job.to_owned()]),
+                &mut HashSet::new(),
+                result_for(job, 0, false),
+            )
+            .await;
+        }
+        let identity = |job: &str| -> anyhow::Result<String> {
+            let envelope = store.envelope(job)?.context("a terminal job carries an envelope")?;
+            Ok(envelope
+                .receipt
+                .context("the audit receipt")?
+                .host_observed
+                .who
+                .identity)
+        };
+
+        assert_eq!(identity("job-1")?, "broker:alice");
+        assert_eq!(identity("job-2")?, "broker:bob");
+        assert_eq!(identity("job-3")?, sandy_fsutil::current_uid().to_string());
         Ok(())
     }
 

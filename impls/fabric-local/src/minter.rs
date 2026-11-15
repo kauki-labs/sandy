@@ -112,6 +112,7 @@ pub fn stage_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<SecretRef, S
         FsError::Unsafe { path, .. } => StageError::UnsafeDir(path),
     })?;
     Ok(SecretRef {
+        root: None,
         name: name.to_owned(),
         source: SecretSource::File(dest),
     })

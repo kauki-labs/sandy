@@ -637,6 +637,7 @@ mod tests {
         job.remote_link = Some(RemoteLink::with_token(addr.ip(), agent));
         job.data_link = Some(RemoteLink::with_token(addr.ip(), data));
         job.data_inputs = vec![Input {
+            root: None,
             host: source.path().join("in.txt").to_string_lossy().into_owned(),
             name: "in.txt".to_owned(),
             guest_path: None,
@@ -1133,6 +1134,7 @@ mod tests {
             .await
             .context("mint job channel")?;
         job.data_outputs = vec![sandy_executor_proto::Output {
+            root: None,
             name: Some("out".to_owned()),
             dest: dest.to_string_lossy().into_owned(),
         }];
@@ -1452,6 +1454,7 @@ mod tests {
             marker_token("send-end-agent"),
         ));
         job.data_inputs = vec![sandy_executor_proto::Input {
+            root: None,
             host: source.path().join("big").to_string_lossy().into_owned(),
             name: "big".to_owned(),
             guest_path: None,

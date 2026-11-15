@@ -162,6 +162,7 @@ fn trusted_process_capabilities() -> Capabilities {
         shares_submitter_filesystem: false,
         transfer: false,
         egress_proxy: false,
+        path_root: false,
     }
 }
 
@@ -180,6 +181,7 @@ async fn submit(
         conn,
         request_id,
         control_request::Op::Submit(SubmitRequest {
+            client_id: None,
             digests: false,
             manifest,
             manifest_encoding: "argv/v1".to_owned(),

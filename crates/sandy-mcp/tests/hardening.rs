@@ -166,7 +166,7 @@ async fn path_arguments_cannot_traverse() -> Result<()> {
     let (url, seen) = fake(Reply::json(200, &json!({})))?;
     let server = Server::new(Api::new(&url, "c"));
     for id in ["..", ".", "..\\environments\\env1", "a b", "a%2Fb", "x\n"] {
-        for tool in ["status", "cancel", "attach"] {
+        for tool in ["status", "cancel"] {
             assert!(call(&server, tool, json!({"job_id": id})).await?.0, "{tool} {id:?}");
         }
         assert!(
@@ -257,7 +257,7 @@ async fn every_tool_makes_exactly_one_api_request() -> Result<()> {
         .await
         .context("list")?;
     let tools = list["result"]["tools"].as_array().context("tools")?;
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 13);
     for t in tools {
         let schema = &t["inputSchema"];
         let mut args = serde_json::Map::new();

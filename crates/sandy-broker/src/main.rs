@@ -9,7 +9,8 @@ use sandy_broker::{BrokerConfig, Client, Tuning, serve_with_tuning};
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// sandyd's control socket.
+    /// sandyd's broker socket (`SANDYD_BROKER_SOCK`, in the main socket's directory), not its main control socket:
+    /// sandyd refuses the client id the broker puts in every submission anywhere else.
     #[arg(long)]
     control_socket: PathBuf,
     /// Directory for the 0600 job-owner table.

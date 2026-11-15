@@ -134,15 +134,21 @@ const MAX_HANDLERS: usize = 64;
 const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Refuses a clients list that could let one token act as another client:
-/// duplicate ids or hashes, an empty id, or a hash that is not 64 lowercase hex.
+/// duplicate ids or hashes, a client id `sandyd` would refuse (#888), or a hash that is not 64 lowercase hex.
 fn validate_clients(clients: &[Client]) -> Result<(), BrokerError> {
     let bad = |m: String| Err(BrokerError::InvalidClients(m));
     let mut ids = std::collections::HashSet::new();
     let mut hashes = std::collections::HashSet::new();
     let mut prefixes = std::collections::HashSet::new();
     for c in clients {
-        if c.id.is_empty() {
-            return bad("a client has an empty id".to_owned());
+        // The one check `sandyd` applies to a Submit's client id (#888), so a client whose id `sandyd` would refuse
+        // never starts, instead of failing every submit later.
+        if let Some(why) = sandy_control_proto::client_id_problem(&c.id) {
+            return bad(format!(
+                "client id {:?} {why}: a client id is 1 to {} bytes with no control character",
+                c.id,
+                sandy_control_proto::MAX_CLIENT_ID_BYTES
+            ));
         }
         let hex_ok = c.token_sha256.len() == 64
             && c.token_sha256
@@ -228,6 +234,13 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
         return Err(BrokerError::NonLoopback { addr: config.bind });
     }
     validate_clients(&config.clients)?;
+    // Each root is resolved once, here: the canonical path is what the broker sends to sandyd as the root (#618), so a
+    // client never controls it.
+    let mut config = config;
+    for client in &mut config.clients {
+        client.roots = paths::canonical_roots(&client.roots)
+            .map_err(|e| BrokerError::InvalidClients(format!("client {:?}: {e}", client.id)))?;
+    }
     let env_create = config
         .clients
         .iter()

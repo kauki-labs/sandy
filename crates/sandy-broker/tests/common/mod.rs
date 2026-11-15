@@ -58,6 +58,9 @@ pub struct Opts {
     pub output_join_backoff: Duration,
     /// Run sandyd as if a trusted-only environment backend were active.
     pub trusted_only_backend: bool,
+    /// Declare `transfer` and `shares_submitter_filesystem` on the stand-in host, so a submit with host paths of
+    /// every kind (a secret path needs the shared filesystem) can be placed.
+    pub path_host: bool,
 }
 
 impl Default for Opts {
@@ -73,6 +76,7 @@ impl Default for Opts {
             output_collectors_total: Tuning::default().output_collectors_total,
             output_join_backoff: Tuning::default().output_join_backoff,
             trusted_only_backend: false,
+            path_host: false,
         }
     }
 }
@@ -200,13 +204,14 @@ async fn build(
                 fingerprint,
                 "stand-in-host".to_owned(),
                 Capabilities {
+                    path_root: opts.path_host,
                     digests: false,
                     supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                     arch: Arch::X8664.into(),
                     attestation: false,
                     supported_isolation_classes: vec![HostClass::Trusted.into(), HostClass::Untrusted.into()],
-                    shares_submitter_filesystem: false,
-                    transfer: false,
+                    shares_submitter_filesystem: opts.path_host,
+                    transfer: opts.path_host,
                     egress_proxy: false,
                 },
             )
@@ -246,6 +251,7 @@ async fn build(
                 Arc::clone(&r),
                 Arc::clone(&h),
                 Some(forward_back),
+                sandyd::Caller::Broker,
             ));
         }
     });

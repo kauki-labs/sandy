@@ -95,13 +95,24 @@ cannot leave a job without an owner.
 **Consequence.** The contract is unchanged on the wire. These are new refusals, so `sandy-mcp`
 tests keep passing.
 
-**Residual risk (_owner_).** The check is a point in time. sandyd now opens the leaf of each input, output and
-secret path without following a link and works below it through that handle (guest-shares decision 14, #618), and no
-longer copies a link inside an input tree by value. That does not stop a hostile client: the client picks the path
-depth, so it can submit `root/a/leaf` and swap `root/a`, which is above the leaf and still followed. Closing that
-needs the client's root to reach sandyd, a public-API change tracked on #618 and #607. Until then, `roots` must be
-directories that the HTTP client cannot write to concurrently with a submit, or the client must be trusted with the
-daemon user's files.
+**Root sent to sandyd (#618).** The broker also sends the root that contains each path in the optional `root` of the
+control `Submit` input, output and secret messages, and rewrites the path onto it. The root is the operator's
+configured root in canonical form, resolved once at startup (a root that cannot be resolved, or whose real name is not valid UTF-8, refuses startup naming it: the wire carries text, and a lossy conversion would name another directory), never a spelling the client chose: `sandyd` follows the root, so a client that named its path through a symlink it
+controls would otherwise make that alias the root and retarget it after the check. When several of the client's roots
+contain the path, the nearest wins. The path a client sees back (an output destination in the result envelope) is the
+canonical one. The HTTP contract does not change. `root` is not a boundary on the local control RPC: only the broker
+sets it, per client, and a caller of the control socket can send any root. `sandyd` opens a rooted input or output beneath that root without following a link when the host has `transfer`, because it
+carries them over the data link. The executor opens every other rooted path the same way (`sandy::stage`): each rooted
+secret, and rooted inputs and outputs on a host with no `transfer`. Only a host that opens a rooted path itself needs
+`path_root`, because an older executor would drop the field. So a rooted secret, or a rooted input or output on a host
+with no `transfer`, is placed only on a host that declared it, and with no such host the submit is refused naming the
+capability. A host with `transfer` and no `path_root` still takes rooted inputs and outputs when no secret is rooted.
+
+**Residual risk (_owner_).** The broker's own check is a point in time. It is closed for the paths the broker sends
+(#618): `sandyd` and the executor open each beneath the client's canonical root without following a link, so a parent
+directory swapped after the check is refused. What remains is a client that can write inside its own root and so
+changes what its paths name there, and a hard link planted inside the root (guest-shares decision 14). A client must
+still be trusted with the files under its roots, and a path sent through the local control RPC has no root.
 
 ## 5. Deferred in this slice
 
@@ -227,9 +238,8 @@ long as the stream is open, up to the client's four. Closing the stream restores
 ## 8. Output is read by offset from a broker-held buffer (#643)
 
 **Context.** sandyd keeps no job output. Output reaches the broker only on the attach socket, and
-attach ends when the job does. A polling client (the `job_output` MCP tool) needs one request per
-call (`sandy-mcp`, `sandyd.md` decision 25) and needs output after exit. The owner chose a broker
-route over giving `sandy-mcp` a stream reader.
+attach ends when the job does. A polling client needs one request per call and needs output after exit. The owner chose a broker
+route over a stream reader.
 
 **Decision.**
 
@@ -275,10 +285,22 @@ no-store`. A `limit` below 1 is raised to 1.
 - Nothing is written to disk. A broker restart loses every buffer: the route answers
   `not_found` for jobs submitted before it, for good, and finds jobs submitted after it at once. The OpenAPI text says this.
 
-**MCP.** `sandy-mcp` has no output tool. Raw job output returned through a tool would bypass the
-secret guard (O8). Owner decision, still open.
+**MCP.** `sandy-mcp` has no output tool and no attach tool (#643). The attach tool returned a relative stream URL an
+agent cannot open, and raw job output returned through a tool would bypass the secret guard (O8). An agent reads output
+through `GET /v1/jobs/{id}/output`. Owner decision, 2026-11-14; `sandyd.md` decision 25 stays.
 
 **Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
+
+## 9. The broker names the client in the job receipt (#888)
+
+**Decision.** `sandyd` records one submitter, the broker's uid, so the broker passes the client id of the bearer token
+that made the request in `SubmitRequest.client_id`. The receipt's `who.identity` is then `broker:<client_id>`
+(`authenticated: false`, as nothing verifies the id until #413). A client cannot name another client: the submit body has
+no such field, and the id comes from the authenticated client only. The broker connects to `sandyd`'s broker socket
+(`SANDYD_BROKER_SOCK`), the only socket on which `sandyd` honours the field (`sandyd.md` decision 39). The broker
+derives the attach socket as a sibling of the control path, so the broker socket sits in the directory of the main
+socket (`sandyd` refuses to start otherwise). The broker refuses a clients file whose id is empty, longer than 128 bytes or holds a control character. The HTTP contract does not
+change.
 
 ## Consequences
 

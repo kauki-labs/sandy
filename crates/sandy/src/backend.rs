@@ -69,6 +69,7 @@ mod tests {
     #[test]
     fn secret_echoed_into_env_is_rejected() {
         let secrets = [SecretRef {
+            root: None,
             name: "TOK".to_string(),
             source: SecretSource::File(PathBuf::from("/run/token")),
         }];

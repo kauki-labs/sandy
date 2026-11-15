@@ -176,10 +176,24 @@ fn allow_list_from_policy(
     let Some(policy) = policy else {
         return Ok(None);
     };
+    if policy.rules.len() > sandy_api::egress::MAX_EGRESS_RULES {
+        return Err(DispatchError::EgressPolicyInvalid(format!(
+            "{} rules: a policy takes at most {}",
+            policy.rules.len(),
+            sandy_api::egress::MAX_EGRESS_RULES
+        )));
+    }
     let rules = policy
         .rules
         .iter()
         .map(|rule| {
+            let host_len = rule.host.strip_suffix('.').unwrap_or(&rule.host).len();
+            if host_len > sandy_api::egress::MAX_EGRESS_HOST_LEN {
+                return Err(DispatchError::EgressPolicyInvalid(format!(
+                    "a host of {host_len} bytes: a host takes at most {}",
+                    sandy_api::egress::MAX_EGRESS_HOST_LEN
+                )));
+            }
             let port = u16::try_from(rule.port).ok().filter(|port| *port != 0).ok_or_else(|| {
                 DispatchError::EgressPolicyInvalid(format!(
                     "port {} of `{}` is not a TCP port in 1..=65535",
@@ -227,6 +241,7 @@ fn to_run_inputs(inputs: &[sandy_executor_proto::Input]) -> Vec<Input> {
     inputs
         .iter()
         .map(|i| Input {
+            root: i.root.as_deref().map(PathBuf::from),
             host: PathBuf::from(&i.host),
             name: i.name.clone(),
             guest_path: i.guest_path.as_deref().map(PathBuf::from),
@@ -239,6 +254,7 @@ fn to_run_outputs(outputs: &[sandy_executor_proto::Output]) -> Vec<Output> {
     outputs
         .iter()
         .map(|o| Output {
+            root: o.root.as_deref().map(PathBuf::from),
             name: o.name.clone(),
             dest: PathBuf::from(&o.dest),
         })
@@ -253,6 +269,7 @@ fn to_run_secrets(secrets: &[sandy_executor_proto::SecretRef]) -> Vec<SecretRef>
     secrets
         .iter()
         .map(|s| SecretRef {
+            root: s.root.as_deref().map(PathBuf::from),
             name: s.name.clone(),
             source: SecretSource::File(PathBuf::from(&s.host_path)),
         })
@@ -1323,11 +1340,13 @@ mod tests {
     fn to_run_inputs_copies_every_field_including_guest_path() {
         let converted = to_run_inputs(&[
             sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/data".to_owned(),
                 name: "in0".to_owned(),
                 guest_path: Some("/workspace".to_owned()),
             },
             sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/plain".to_owned(),
                 name: "plain".to_owned(),
                 guest_path: None,
@@ -1343,10 +1362,12 @@ mod tests {
     fn to_run_outputs_copies_name_and_dest() {
         let converted = to_run_outputs(&[
             sandy_executor_proto::Output {
+                root: None,
                 name: Some("out0".to_owned()),
                 dest: "/submitter/dest".to_owned(),
             },
             sandy_executor_proto::Output {
+                root: None,
                 name: None,
                 dest: "/submitter/catchall".to_owned(),
             },
@@ -1359,6 +1380,7 @@ mod tests {
     #[test]
     fn to_run_secrets_always_produces_a_file_source() {
         let converted = to_run_secrets(&[sandy_executor_proto::SecretRef {
+            root: None,
             name: "token".to_owned(),
             host_path: "/submitter/secret.txt".to_owned(),
         }]);
@@ -1604,6 +1626,7 @@ mod tests {
             forward_back: forward_back.to_string(),
             required_isolation_class: IsolationClass::Trusted.into(),
             inputs: vec![sandy_executor_proto::Input {
+                root: None,
                 host: "/submitter/path".to_string(),
                 name: "data".to_string(),
                 guest_path: None,
@@ -1690,6 +1713,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let control = sandy_api::backend::RunControl::with_timeout_secs(60);
         let declared = [sandy_executor_proto::Output {
+            root: None,
             name: None,
             dest: "/submitter/all".to_owned(),
         }];
@@ -1798,6 +1822,80 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A DNS name of 253 bytes whose labels the proxy accepts: three 63-byte labels and one of 61 bytes.
+    fn valid_253_byte_host() -> String {
+        let label = "a".repeat(63);
+        format!("{label}.{label}.{label}.{}", "a".repeat(61))
+    }
+
+    /// #819: the executor re-checks the rule-count bound `sandyd` applies at Submit (256 rules), inclusive.
+    #[test]
+    fn an_egress_policy_over_the_rule_count_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let over = vec![("example.com", 443u32); 257];
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&over))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![("example.com", 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        Ok(())
+    }
+
+    /// #819: the executor re-checks the host bound (253 bytes, as the proxy measures: one trailing dot is stripped).
+    #[test]
+    fn an_egress_host_over_the_length_bound_is_refused_by_the_executor_too() -> anyhow::Result<()> {
+        let host = valid_253_byte_host();
+        let over = format!("a{host}");
+        assert!(matches!(
+            allow_list_from_policy(Some(&policy(&[(over.as_str(), 443u32)]))),
+            Err(DispatchError::EgressPolicyInvalid(_))
+        ));
+        let at_limit = vec![(host.as_str(), 443u32); 256];
+        assert!(allow_list_from_policy(Some(&policy(&at_limit)))?.is_some());
+        let dotted = format!("{host}.");
+        assert!(
+            allow_list_from_policy(Some(&policy(&[(dotted.as_str(), 443u32)])))?.is_some(),
+            "a trailing dot is not counted, as in the proxy"
+        );
+        Ok(())
+    }
+
+    /// #618: the root of a `Dispatch` path reaches the backend's own `Input`, `Output` and `SecretRef`, where the stage
+    /// opens the path beneath it. A path with no root has none.
+    #[test]
+    fn a_dispatch_root_reaches_the_backends_input_output_and_secret() {
+        let root = Some("/srv/a".to_owned());
+        let inputs = to_run_inputs(&[
+            sandy_executor_proto::Input {
+                root: root.clone(),
+                host: "/srv/a/in".to_owned(),
+                name: "in".to_owned(),
+                guest_path: None,
+            },
+            sandy_executor_proto::Input {
+                root: None,
+                host: "/srv/b/in".to_owned(),
+                name: "other".to_owned(),
+                guest_path: None,
+            },
+        ]);
+        let outputs = to_run_outputs(&[sandy_executor_proto::Output {
+            root: root.clone(),
+            name: None,
+            dest: "/srv/a/out".to_owned(),
+        }]);
+        let secrets = to_run_secrets(&[sandy_executor_proto::SecretRef {
+            root,
+            name: "TOKEN".to_owned(),
+            host_path: "/srv/a/token".to_owned(),
+        }]);
+
+        assert_eq!(inputs[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
+        assert_eq!(inputs[1].root, None);
+        assert_eq!(outputs[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
+        assert_eq!(secrets[0].root.as_deref(), Some(std::path::Path::new("/srv/a")));
     }
 
     /// macOS runs a VM job through vfkit and every other host through qemu: the choice is a pure function of the OS.

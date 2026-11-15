@@ -119,6 +119,7 @@ fn mint_lease_with<P: CredentialProvider + ?Sized>(
     tracing::debug!(name = secret_name, path = %path.display(), ?ttl, "staged scoped credential (0600)");
     Ok(Lease {
         secret_ref: SecretRef {
+            root: None,
             name: secret_name.to_string(),
             source: SecretSource::File(path),
         },
@@ -136,6 +137,7 @@ fn mint_lease_with<P: CredentialProvider + ?Sized>(
 pub(crate) fn revoke_orphan<P: CredentialProvider + ?Sized>(provider: &P, secret_name: &str, minted: &Minted) {
     let orphan = Lease {
         secret_ref: SecretRef {
+            root: None,
             name: secret_name.to_string(),
             source: SecretSource::File(PathBuf::new()),
         },
@@ -954,6 +956,7 @@ mod tests {
         let past = SystemTime::now() - Duration::from_secs(3_600);
         let mut lease = Lease {
             secret_ref: SecretRef {
+                root: None,
                 name: "GH_TOKEN".to_string(),
                 source: SecretSource::File(tmp.path().join("gone").join("GH_TOKEN")),
             },
@@ -1551,6 +1554,7 @@ mod tests {
         let provider = RotatingProvider::new();
         let mut lease = Lease {
             secret_ref: SecretRef {
+                root: None,
                 name: "GH_TOKEN".to_string(),
                 source: SecretSource::File(PathBuf::from("/unused/GH_TOKEN")),
             },

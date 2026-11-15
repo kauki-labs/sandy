@@ -289,6 +289,7 @@ mod tests {
             op: Some(host_executor_message::Op::Register(Register {
                 host_id: "remote-host".to_owned(),
                 capabilities: Some(Capabilities {
+                    path_root: false,
                     digests: false,
                     supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                     arch: Arch::X8664.into(),

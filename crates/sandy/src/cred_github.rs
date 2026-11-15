@@ -537,6 +537,7 @@ mod tests {
         );
         let lease = Lease {
             secret_ref: SecretRef {
+                root: None,
                 name: "GH_TOKEN".to_string(),
                 source: SecretSource::File(PathBuf::from("/dev/null")),
             },

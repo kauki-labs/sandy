@@ -74,7 +74,7 @@ paths:
       operationId: attachJob
       summary: Open the job's output stream.
       description: >-
-        Returns a single-use stream location, valid for expires_in_s seconds. The attach token and the channel-join cap stay in the API tier. A client holds at most 4 outstanding tickets plus open streams (quota_exceeded beyond that). A finished job is unavailable.
+        `sandy-mcp` offers no tool for this route: an agent reads output with `readJobOutput`. Returns a single-use stream location, valid for expires_in_s seconds. The attach token and the channel-join cap stay in the API tier. A client holds at most 4 outstanding tickets plus open streams (quota_exceeded beyond that). A finished job is unavailable.
       responses:
         "200":
           description: Stream location.
@@ -379,7 +379,9 @@ components:
             required: [host, name]
             additionalProperties: false
             properties:
-              host: {type: string}
+              host:
+                type: string
+                description: Absolute host path under one of the client's roots. The broker sends that root to sandyd, which opens the path beneath it without following a link. The broker rewrites it onto the operator's configured root in canonical form.
               name: {type: string}
               guest_path: {type: string}
         outputs:
@@ -390,7 +392,9 @@ components:
             additionalProperties: false
             properties:
               name: {type: string}
-              dest: {type: string}
+              dest:
+                type: string
+                description: Absolute host path under one of the client's roots, opened beneath that root without following a link. The broker rewrites it onto the operator's configured root in canonical form, never a spelling the client chose, so the destination a client sees back (in the result) is the canonical path.
         secrets:
           description: File-backed references. The value never travels.
           type: array
@@ -400,7 +404,9 @@ components:
             additionalProperties: false
             properties:
               name: {type: string}
-              host_path: {type: string}
+              host_path:
+                type: string
+                description: Absolute host path under one of the client's roots, opened beneath that root without following a link. The broker rewrites it onto the operator's configured root in canonical form.
     JobState:
       type: string
       enum: [pending, running, succeeded, failed, cancelled]

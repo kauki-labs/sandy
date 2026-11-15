@@ -117,6 +117,7 @@ async fn start_with_host(dir: &Path) -> anyhow::Result<Daemon> {
                 op: Some(host_executor_message::Op::Register(Register {
                     host_id: "stand-in-host".to_owned(),
                     capabilities: Some(Capabilities {
+                        path_root: false,
                         digests: false,
                         supported_sandbox_kinds: vec![SandboxKind::Process.into()],
                         arch: Arch::X8664.into(),

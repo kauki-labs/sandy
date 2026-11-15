@@ -91,9 +91,39 @@ async fn initialize_and_list_advertise_the_job_tools() -> Result<()> {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    for n in ["submit", "status", "cancel", "list", "attach"] {
+    for n in ["submit", "status", "cancel", "list"] {
         assert!(names.contains(&n), "missing tool {n}: {names:?}");
     }
+    Ok(())
+}
+
+/// #643: sandy-mcp offers no output tool. The attach tool returned a relative stream URL an agent cannot open, and a raw
+/// output tool would bypass the secret guard, so an agent reads output through the broker's
+/// `GET /v1/jobs/{id}/output`. `tools/list` must not name `attach`, and calling it is an unknown tool.
+#[tokio::test]
+async fn no_attach_tool_is_offered_and_calling_it_is_an_unknown_tool() -> Result<()> {
+    let api = fake_api(vec![(
+        "POST",
+        "/v1/jobs/j1/attach",
+        200,
+        json!({"stream_url": "http://x/s"}),
+    )])?;
+    let server = Server::new(Api::new(&api.url, "t"));
+    let list = server
+        .handle(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await
+        .context("list")?;
+    let names: Vec<_> = list["result"]["tools"]
+        .as_array()
+        .context("tools")?
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"attach"), "attach must not be offered: {names:?}");
+
+    let resp = call(&server, "attach", json!({"job_id": "j1"})).await?;
+    assert_eq!(resp["error"]["code"], json!(-32602), "an unknown tool: {resp}");
+    assert!(api.seen.lock().unwrap().is_empty(), "no API request may be made");
     Ok(())
 }
 
@@ -115,7 +145,6 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("GET", "/v1/jobs", 200, json!({"jobs":[job.clone()]})),
         ("GET", "/v1/jobs/j1", 200, job.clone()),
         ("POST", "/v1/jobs/j1/cancel", 200, job.clone()),
-        ("POST", "/v1/jobs/j1/attach", 200, json!({"stream_url":"http://x/s"})),
     ])?;
     let server = Server::new(Api::new(&api.url, "cred"));
     let submit = json!({"manifest":"AA==","manifest_encoding":"m.v1",
@@ -125,7 +154,6 @@ async fn each_job_tool_makes_exactly_one_api_request() -> Result<()> {
         ("list", json!({}), "GET", "/v1/jobs"),
         ("status", json!({"job_id":"j1"}), "GET", "/v1/jobs/j1"),
         ("cancel", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/cancel"),
-        ("attach", json!({"job_id":"j1"}), "POST", "/v1/jobs/j1/attach"),
     ];
     for (i, (tool, args, method, path)) in cases.iter().enumerate() {
         let resp = call(&server, tool, args.clone()).await?;

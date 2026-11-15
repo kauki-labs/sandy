@@ -1511,7 +1511,19 @@ separately scoped decision (tracked on #221, not blocking #480-#483).
   that declared `egress_proxy` (operator flag `SANDY_HOST_EGRESS_PROXY=1`, and only with VM capability); with none, or
   with no remote placement at all, the Submit is refused naming the capability, never run unfiltered locally. `sandyd`
   and the executor both check each rule (a host, a port in 1..=65535), and the executor refuses a policy on a process
-  job.
+  job. Both also bound it (#819): at most 256 rules, each host at most 253 bytes (the longest DNS name), the constants
+  `sandy_api::egress::MAX_EGRESS_RULES` and `MAX_EGRESS_HOST_LEN`. The host bound is the proxy's own
+  (`normalise_name`: 253 bytes after one trailing dot is stripped, labels of at most 63), measured the same way, so a
+  host the proxy accepts is never refused here. The proxy has no rule-count bound, so 256 is new. The direct
+  `sandy run --allow` stays unbounded.
+- Path roots (#618): a Submit path may carry an optional `root`, the trusted absolute directory it lies beneath (the
+  broker sets it from the client's `roots`, canonical and never client-spelled; a root is no boundary on the local
+  control RPC). `sandyd` refuses a root that is not absolute, a path not under it, a `..` below it and a NUL byte in
+  either, copies it into the `Dispatch`, and opens a rooted input or output it handles itself (the data link)
+  beneath the root without following a link. A root an executor would have to honour is placed only on a host that
+  declared `path_root` (secrets always, inputs and outputs when the host has no `transfer`), because an executor drops
+  a field it does not know without a word. The executor declares it (an implementation fact, not an operator flag) and
+  `sandy::stage` opens each rooted path beneath its root. See guest-shares decision 14.
 - A2 (#483): `sandyd` builds the result envelope with `sandy::build_envelope` and `classify_outcome`, stores it in
   `jobs.envelope` in the statement that makes the job terminal, and serves its JSON in `StatusResponse.result_envelope`.
   `who` is the local-uid fallback with `authenticated: false` (verified caps are #413). A run that carried an egress
@@ -2105,9 +2117,11 @@ transfer under a private root (5a, with the idle timeout, the entry budget that 
   and symlinks in the guest output are not carried (local creates empty directories and skips symlinks). A reader
   never sees a partial file at the final name, but the `.sandy-recv-*` temp is listable while the file is in flight
   and a crash leaves it (#782).
-- The receiver trusts `Dispatch.outputs[].dest`: `Beneath::create_dir_at` resolves and creates the ancestors of a
-  destination by path, as local collection does (#607). The caller must pass only Submit-validated destinations. A
-  symlink in an ancestor is followed, and one test pins it (#784).
+- The receiver trusts `Dispatch.outputs[].dest`: with no `root`, `Beneath::create_dir_at` resolves and creates the
+  ancestors of a destination by path, as local collection does (#607). The caller must pass only Submit-validated
+  destinations. A symlink in an ancestor is followed, and one test pins it (#784). With a `root` (#618) the receiver
+  uses `Beneath::create_dir_beneath` and refuses a link at any component below the root; `sandyd` has already refused,
+  at Submit, a root that is not absolute, a destination not under it and a `..` below it (guest-shares decision 14).
 - A failed flush discards the file before the error returns, so the unlink is done before the peer hears of it. The temp
   name is `.sandy-recv-<pid>-<n>` with `n` running across the receive; a collision with a stale name tries the next one,
   at most 1,000 name attempts per file, so a long receive is not failed by one stale name (#793).
@@ -2304,7 +2318,7 @@ so the environment operations need an MCP surface beside the job operations.
 
 **Decision.**
 
-- `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`, `attach`) and environment tools
+- `sandy-mcp` serves job tools (`submit`, `status`, `cancel`, `list`) and environment tools
   (`spawn_environment`, `get_environment`, `link_environment`, `cancel_environment`,
   `delete_environment`, `end_task`, `stop_environment`, `resume_environment`, `list_environments`).
 - **Ending a task (#815, owner decision).** Deleting an environment ends its task, and an ephemeral environment's TTL is
@@ -2914,3 +2928,58 @@ logs a warning at start-up.
 
 **Set aside** (the stub). Overriding the GitHub API base so the real adapter runs against a fake server (#736), and a
 tokenless vm mode, which is a policy change for the owner.
+
+## 39. The broker names its client in the receipt: `client_id` on a dedicated broker socket (#888)
+
+**Status:** accepted. The trust model (option A below) was decided by the coordinator, sandy-63, on 2026-11-15, as a
+decision for the owner to confirm or reverse.
+
+**Context.** `sandyd` sees one submitter. The broker serves several API clients with one uid, so every broker job's
+receipt (`who`, decision 11 and A2) names the daemon's uid, and two clients cannot be told apart. The owner decided on
+#607 not to wait for verified caps (#413, #566): the broker passes the client id in the submission. The control socket
+admits only the daemon's uid (`peer_cred`, #533), and the broker is a process of that uid. Peer credentials therefore
+cannot tell the broker from `sandy daemon submit`, `sandy-mcp`, or any other process of that user.
+
+**Decision.**
+
+- `SubmitRequest.client_id` (field 12, an optional string). A caller that omits it sees no change on the wire or in
+  any receipt.
+- A client id is valid when it is not empty, has at most 128 bytes and has no control character (NUL included).
+  `sandyd` refuses any other value at Submit, before placement and with no side effect, naming `client_id`. The broker
+  refuses a clients file with such an id at startup, naming the id.
+- A dedicated broker socket. `SANDYD_BROKER_SOCK` names a second UDS in the same private directory rules as
+  `SANDY_SOCK` (mode `0600`, the same `peer_cred` check). It is created only when the variable is set. With it unset
+  there is no broker listener and the behaviour is the one before this decision.
+- `sandyd` honours `client_id` only on a connection accepted on the broker socket. On the main socket a Submit that
+  carries the field is refused with an error that names `client_id` and the broker socket. It is never ignored. Every
+  other operation (attach, status, cancel, list, environments, prune) is served the same way on both sockets.
+- The broker is the only writer. The HTTP submit body has no such field (`deny_unknown_fields`), and the broker sets it
+  from the client its bearer token identified, so a client cannot name another client. The broker socket must be in the same directory as the
+  main socket: `sandyd` derives the attach socket as a fixed sibling of the control path (`attach_socket_path`), so
+  a broker socket there gives the broker the right attach path with no extra setting. `sandyd` refuses to start when
+  `SANDYD_BROKER_SOCK` is empty, is not an absolute path, names the main socket or the attach socket, or is in another
+  directory than `SANDY_SOCK`, naming both paths. The directories are compared after links and `..` are resolved, so a
+  broker socket reached through a symlinked directory is neither let through nor refused by mistake.
+- The receipt names the client: `who.identity = "broker:<client_id>"`, `who.authenticated = false`. The prefix says who
+  asserted the id and keeps a client id such as `1000` from being read as a uid. The broker asserts the id and nothing
+  verifies it, so `authenticated` stays false until verified caps exist (#413). The `sandy-api` `Who` struct does not
+  change.
+- The id is stored on the job row (`client_id`, an additive column, migrated like `attach_token`), written by the same
+  INSERT that creates the row, so a crash or a fault after it can never leave a job that names the uid. The store writes it
+  into the receipt of every terminal envelope that has one: a completed run, and the recovery of a job a daemon
+  restart found open. A cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to
+  name; its client id stays on the row.
+
+**Upgrade.** The broker now puts a client id in every submission, so a broker still pointed at the main socket is
+refused on every Submit (`unavailable` over HTTP): set `SANDYD_BROKER_SOCK`, restart `sandyd`, and point the broker at
+that socket (`docs/design/broker/runbook.md`). An older `sandyd` ignores the unknown field and records the uid, so
+upgrade `sandyd` first.
+
+**Residual.** A hostile process of the daemon's own uid can connect to the broker socket and set any client id. Nothing
+in a one-uid daemon can prevent that: that process can already submit, read and cancel every job as the daemon user. The
+broker socket separates the broker from the CLI and other tools by construction, so none of them writes a client id into
+a receipt by accident or by habit. It does not separate it from a same-uid adversary.
+
+**Set aside.** Honouring the field from any caller on the one socket: a local CLI or MCP caller could write any id into a
+receipt. A separate uid for the broker with a second allowed uid in `peer_cred`: it changes the deployment model and the
+socket permissions. A shared secret between the broker and `sandyd`: any process of the same uid can read it.

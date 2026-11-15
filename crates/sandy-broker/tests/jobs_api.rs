@@ -283,6 +283,92 @@ async fn a_host_path_outside_the_clients_roots_is_forbidden() -> Result<()> {
     Ok(())
 }
 
+/// #618: the broker sends the client's root with every host path, so sandyd opens each path beneath it without
+/// following a link. A path under a nested root gets the nested root, and a client's root is never sent for a path
+/// the client may not name.
+#[tokio::test]
+async fn the_broker_sends_the_clients_root_with_every_host_path() -> Result<()> {
+    let mut f = fixture_with_opts(Opts {
+        path_host: true,
+        ..Opts::default()
+    })
+    .await?;
+    // The broker sends the configured root in canonical form (#618), so `/tmp` on macOS is `/private/tmp`.
+    let root = f.root_a.canonicalize()?;
+    std::fs::write(root.join("in.txt"), b"x")?;
+    let mut body = submit_body();
+    body["inputs"] = json!([{"host": root.join("in.txt").to_string_lossy(), "name": "n"}]);
+    body["outputs"] = json!([{"name": "o", "dest": root.join("out").to_string_lossy()}]);
+    body["secrets"] = json!([{"name": "S", "host_path": root.join("secret").to_string_lossy()}]);
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), f._host_dispatch.recv())
+        .await
+        .context("the job was never dispatched")?
+        .context("the dispatch channel closed")?;
+    let want = Some(root.to_string_lossy().into_owned());
+    assert_eq!(dispatch.inputs[0].root, want);
+    assert_eq!(dispatch.outputs[0].root, want);
+    assert_eq!(dispatch.secrets[0].root, want);
+    Ok(())
+}
+
+/// #618 (review of #889): the root sandyd opens is followed, so it must be the operator's configured root, never a
+/// spelling the client chose. A client that names its path through a symlink it controls (`alias` here, in a directory
+/// the client can write) must not make that alias the root: it could retarget the alias after the broker's check.
+/// The Dispatch carries the canonical configured root, and what the sender reads after the retarget is still inside it.
+#[tokio::test]
+async fn a_client_controlled_alias_never_becomes_the_root_sandyd_opens() -> Result<()> {
+    let mut f = fixture_with_opts(Opts {
+        path_host: true,
+        ..Opts::default()
+    })
+    .await?;
+    let root = f.root_a.canonicalize()?;
+    std::fs::write(root.join("in.txt"), b"inside the root")?;
+    let outside = f._dir.path().join("outside");
+    std::fs::create_dir(&outside)?;
+    std::fs::write(outside.join("in.txt"), b"OUTSIDE THE ROOT")?;
+    let alias = f._dir.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias)?;
+    let mut body = submit_body();
+    body["inputs"] = json!([{"host": alias.join("in.txt").to_string_lossy(), "name": "n"}]);
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), f._host_dispatch.recv())
+        .await
+        .context("the job was never dispatched")?
+        .context("the dispatch channel closed")?;
+
+    assert_eq!(
+        dispatch.inputs[0].root.as_deref(),
+        Some(root.to_string_lossy().as_ref()),
+        "the root must be the configured one, not the alias the client spelled"
+    );
+    // The client retargets the alias after the broker's check; the sender then reads what the Dispatch names.
+    std::fs::remove_file(&alias)?;
+    std::os::unix::fs::symlink(&outside, &alias)?;
+    let (mut tx, mut rx) = tokio::io::duplex(1 << 20);
+    sandyd::data_link_send::send_inputs(&mut tx, &dispatch.inputs, sandyd::data_link_send::SendLimits::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("the permitted input must be sent: {e}"))?;
+    drop(tx);
+    let mut sent = Vec::new();
+    while let Some(message) = sandy_control_proto::read_frame::<sandy_executor_proto::DataLinkMessage>(&mut rx).await? {
+        if let Some(sandy_executor_proto::data_link_message::Op::InputChunk(chunk)) = message.op {
+            sent.extend(chunk.bytes);
+        }
+    }
+    assert_eq!(
+        sent, b"inside the root",
+        "the retargeted alias must not redirect the read outside the root, and the permitted read must still happen"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_planted_symlink_under_the_root_cannot_redirect_a_path() -> Result<()> {
     let f = fixture().await?;
@@ -320,6 +406,60 @@ async fn an_unknown_job_id_is_not_found_for_get_and_cancel() -> Result<()> {
     for (method, path) in [("GET", "/v1/jobs/nope"), ("POST", "/v1/jobs/nope/cancel")] {
         let (status, body) = f.call(method, path, Some(TOKEN_A), None).await?;
         assert_eq!((status, &body["code"]), (StatusCode::NOT_FOUND, &json!("not_found")));
+    }
+    Ok(())
+}
+
+/// #888: the receipt names the API client, so the broker puts the id of the client its bearer token identified into the
+/// Submit. Two clients are told apart. The job row holds the id `sandyd` writes into the receipt.
+#[tokio::test]
+async fn the_broker_names_the_authenticated_client_in_the_submission() -> Result<()> {
+    let f = fixture().await?;
+    let a = f.submit(TOKEN_A).await?;
+    let c = f.submit(common::TOKEN_C).await?;
+
+    assert_eq!(f.store.client_id(&a)?.as_deref(), Some("a"));
+    assert_eq!(f.store.client_id(&c)?.as_deref(), Some("c"));
+    Ok(())
+}
+
+/// #888: a client cannot name another client. The submit body has no `client_id` field, so one is refused, and no job
+/// is created.
+#[tokio::test]
+async fn a_submit_body_cannot_carry_a_client_id() -> Result<()> {
+    let f = fixture().await?;
+    let mut body = submit_body();
+    body["client_id"] = json!("c");
+
+    let (status, resp) = f.call("POST", "/v1/jobs", Some(TOKEN_A), Some(body)).await?;
+
+    assert_eq!(
+        (status, &resp["code"]),
+        (StatusCode::BAD_REQUEST, &json!("invalid_request")),
+        "{resp}"
+    );
+    assert!(f.store.list()?.is_empty(), "no job may be created");
+    Ok(())
+}
+
+/// #888: a client id `sandyd` would refuse (empty, over 128 bytes, a control character) is refused at startup, naming
+/// the id, so every submit of that client does not fail later.
+#[tokio::test]
+async fn a_client_id_sandyd_would_refuse_is_refused_at_startup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mk = |clients| BrokerConfig {
+        control_socket: Path::new("/nonexistent").to_path_buf(),
+        rpc_deadline: std::time::Duration::from_secs(30),
+        state_dir: dir.path().join("state"),
+        bind: "127.0.0.1:0".parse().expect("literal"),
+        clients,
+    };
+    for id in ["x".repeat(129), "bad\nid".to_owned(), "bad\0id".to_owned()] {
+        let r = serve(mk(vec![client(&id, "tok", IsolationClass::Trusted, vec![])])).await;
+        match r {
+            Err(BrokerError::InvalidClients(m)) => assert!(m.contains("client id"), "must name the problem: {m}"),
+            other => anyhow::bail!("{id:?}: expected InvalidClients, got {other:?}"),
+        }
     }
     Ok(())
 }

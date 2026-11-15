@@ -425,16 +425,22 @@ fn process_is_alive(pid: u32) -> bool {
     !matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH))
 }
 
-/// Open the destination beneath `root`, create the directories in `parts`, and a new temp file in the last one.
-/// Runs on the blocking pool. The returned guard removes the temp file if it is dropped before the file is renamed,
-/// including when the receive that asked for it is gone by the time this ends.
+/// Open the destination `root` (beneath `trusted_root` when one is given), create the directories in `parts`, and a new
+/// temp file in the last one. Runs on the blocking pool. The returned guard removes the temp file if it is dropped
+/// before the file is renamed, including when the receive that asked for it is gone by the time this ends.
 fn open_temp(
+    trusted_root: Option<&Path>,
     root: &Path,
     parts: &[String],
     mut seq: u64,
     sweep: bool,
 ) -> Result<(Cleanup, std::fs::File, u64), ReceiveError> {
-    let mut dir = Beneath::create_dir_at(root)?;
+    // With a trusted root (#618) the destination is walked below it without following a link; without one its
+    // ancestors resolve by path, as local collection does (#607).
+    let mut dir = match trusted_root {
+        Some(trusted) => Beneath::create_dir_beneath(trusted, root)?,
+        None => Beneath::create_dir_at(root)?,
+    };
     for part in parts {
         dir = dir.create_dir(OsStr::new(part))?;
     }
@@ -533,6 +539,7 @@ impl<'a> Receive<'a> {
     /// counted first; the directory work runs on the blocking pool.
     async fn start_file(&mut self, key: (u32, String)) -> Result<(), ReceiveError> {
         let (root, parts, name) = self.target(&key)?;
+        let trusted_root = self.target_root(&key)?;
         let mut prefix = String::new();
         for part in &parts {
             if !prefix.is_empty() {
@@ -547,9 +554,10 @@ impl<'a> Receive<'a> {
         let seq = self.temp_seq;
         // `prefix` is now the file's directory below its root: the first file there sweeps it.
         let sweep = self.swept.insert(entry_key(key.0, &prefix));
-        let (cleanup, file, seq) = tokio::task::spawn_blocking(move || open_temp(&root, &parts, seq, sweep))
-            .await
-            .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
+        let (cleanup, file, seq) =
+            tokio::task::spawn_blocking(move || open_temp(trusted_root.as_deref(), &root, &parts, seq, sweep))
+                .await
+                .map_err(|e| ReceiveError::Io(std::io::Error::other(e)))??;
         self.temp_seq = seq;
         self.current = Some(InFlight {
             key,
@@ -566,6 +574,15 @@ impl<'a> Receive<'a> {
             return Err(ReceiveError::TooManyEntries);
         }
         Ok(())
+    }
+
+    /// The trusted root the output's destination lies beneath, when the Submit named one (#618).
+    fn target_root(&self, key: &(u32, String)) -> Result<Option<std::path::PathBuf>, ReceiveError> {
+        let output = usize::try_from(key.0)
+            .ok()
+            .and_then(|i| self.outputs.get(i))
+            .ok_or(ReceiveError::BadIndex)?;
+        Ok(output.root.as_ref().map(std::path::PathBuf::from))
     }
 
     /// Where a chunk goes, pinned to local `collect_outputs`: the directory to open, the directories below it, and
@@ -623,6 +640,7 @@ mod tests {
 
     fn out(name: Option<&str>, dest: &Path) -> sandy_executor_proto::Output {
         sandy_executor_proto::Output {
+            root: None,
             name: name.map(str::to_owned),
             dest: dest.to_string_lossy().into_owned(),
         }
@@ -813,6 +831,7 @@ mod tests {
         let local_outputs: Vec<sandy::Output> = declared(roots[0].path())
             .into_iter()
             .map(|(name, dest)| sandy::Output {
+                root: None,
                 name: name.map(str::to_owned),
                 dest,
             })
@@ -1106,7 +1125,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 1000, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(None, dest.path(), &[], 1000, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1006, "the first free name after the stale ones");
         drop(cleanup);
         Ok(())
@@ -1120,7 +1139,7 @@ mod tests {
         for n in 1..=1000 {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
-        let Err(error) = open_temp(dest.path(), &[], 0, false) else {
+        let Err(error) = open_temp(None, dest.path(), &[], 0, false) else {
             anyhow::bail!("every name the search may try is taken, it must fail");
         };
         assert!(
@@ -1139,7 +1158,7 @@ mod tests {
             std::fs::write(dest.path().join(format!(".sandy-recv-{pid}-{n}")), b"").context("stale name")?;
         }
         let (cleanup, _file, seq) =
-            open_temp(dest.path(), &[], 0, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
+            open_temp(None, dest.path(), &[], 0, false).map_err(|e| anyhow::anyhow!("open_temp failed: {e}"))?;
         assert_eq!(seq, 1000);
         drop(cleanup);
         Ok(())
@@ -1265,6 +1284,7 @@ mod tests {
         let remote = tempfile::tempdir().context("remote dest")?;
 
         let local_outputs = [sandy::Output {
+            root: None,
             name: Some("report".to_owned()),
             dest: local.path().join("out.bin"),
         }];
@@ -1294,6 +1314,82 @@ mod tests {
         received.context("the receive")?;
 
         assert_eq!(std::fs::read(real.join("out/x.txt")).context("through the link")?, b"X");
+        Ok(())
+    }
+
+    /// #618: `root/sub` was a directory when the Submit's path check ran and is a symlink to somewhere else now. With
+    /// no root the receiver follows it and writes the output outside. With a root it walks `sub` without following a
+    /// link, refuses, and writes nothing outside.
+    #[tokio::test]
+    async fn a_swapped_parent_directory_escapes_without_a_root_and_is_refused_with_one() -> anyhow::Result<()> {
+        let outside = tempfile::tempdir().context("outside")?;
+        let root = tempfile::tempdir().context("root")?;
+        symlink(outside.path(), root.path().join("sub")).context("swap the parent for a link")?;
+        let dest = root.path().join("sub/out");
+
+        let unrooted = [out(None, &dest)];
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &unrooted, quick(), false).await?;
+        received.context("without a root the link is followed today")?;
+        assert_eq!(
+            std::fs::read(outside.path().join("out/x.txt")).context("escaped")?,
+            b"X"
+        );
+        std::fs::remove_dir_all(outside.path().join("out")).context("reset")?;
+
+        let rooted = [sandy_executor_proto::Output {
+            root: Some(root.path().to_string_lossy().into_owned()),
+            ..out(None, &dest)
+        }];
+        let (received, _peer) = run(&[chunk(0, "x.txt", b"X"), end()], &rooted, quick(), false).await?;
+        assert!(
+            received.is_err(),
+            "a destination through a swapped parent must be refused"
+        );
+        assert!(
+            !outside.path().join("out").exists(),
+            "nothing may be written outside the root"
+        );
+        Ok(())
+    }
+
+    /// `output` with `root` set to `root`: the destination lies beneath it.
+    fn rooted(output: sandy_executor_proto::Output, root: &Path) -> sandy_executor_proto::Output {
+        sandy_executor_proto::Output {
+            root: Some(root.to_string_lossy().into_owned()),
+            ..output
+        }
+    }
+
+    /// #618 (review of #889): a rooted output that lies beneath its root is received, not refused. A named tree lands
+    /// at the destination, a catch-all lands at the destination, and a bare named chunk is the destination file,
+    /// whose parent opens beneath the root. Each asserts the bytes and the final contents.
+    #[tokio::test]
+    async fn rooted_outputs_beneath_their_root_are_received() -> anyhow::Result<()> {
+        let root = tempfile::tempdir().context("root")?;
+
+        let named = root.path().join("named/deep");
+        let outputs = [rooted(out(Some("results"), &named), root.path())];
+        let messages = [
+            chunk(0, "results/a.txt", b"A"),
+            chunk(0, "results/sub/b.txt", b"BB"),
+            end(),
+        ];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert_eq!(received.context("a named tree")?, Received { files: 2, bytes: 3 });
+        assert_eq!(tree(&named)?, files(&[("a.txt", b"A"), ("sub/b.txt", b"BB")]));
+
+        let catch_all = root.path().join("all");
+        let outputs = [rooted(out(None, &catch_all), root.path())];
+        let messages = [chunk(0, "x.txt", b"X"), chunk(0, "d/y.txt", b"Y"), end()];
+        let (received, _peer) = run(&messages, &outputs, quick(), false).await?;
+        assert_eq!(received.context("a catch-all")?, Received { files: 2, bytes: 2 });
+        assert_eq!(tree(&catch_all)?, files(&[("x.txt", b"X"), ("d/y.txt", b"Y")]));
+
+        let file = root.path().join("files/report.bin");
+        let outputs = [rooted(out(Some("report"), &file), root.path())];
+        let (received, _peer) = run(&[chunk(0, "report", b"payload"), end()], &outputs, quick(), false).await?;
+        assert_eq!(received.context("a bare named file")?, Received { files: 1, bytes: 7 });
+        assert_eq!(std::fs::read(&file).context("the file")?, b"payload");
         Ok(())
     }
 
