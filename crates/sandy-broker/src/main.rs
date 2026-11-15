@@ -16,7 +16,7 @@ struct Args {
     /// Directory for the 0600 job-owner table.
     #[arg(long)]
     state_dir: PathBuf,
-    /// Listen address. Loopback only.
+    /// Listen address. Loopback unless --tls-identity-dir is set, which allows any address.
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
     /// JSON array of clients: id, token_sha256 (bearer mode) or certs (mTLS mode), max_isolation_class, roots. Must be

@@ -85,7 +85,7 @@ pub struct BrokerConfig {
     pub rpc_deadline: std::time::Duration,
     /// Directory holding the 0600 owner table.
     pub state_dir: PathBuf,
-    /// Listen address. Must be loopback.
+    /// Listen address. Loopback unless `tls` is set.
     pub bind: SocketAddr,
     /// Known clients.
     pub clients: Vec<Client>,
@@ -234,6 +234,35 @@ fn validate_clients(clients: &[Client], tls: bool) -> Result<auth::Pins, BrokerE
     auth::Pins::build(clients).map_err(BrokerError::InvalidClients)
 }
 
+/// Makes the identity directory safe before `sandy-conn` reads or writes the key in it (decision 10): created `0700`,
+/// owned by this user and not writable by others, and a key already there is a regular `0600` file of this user's.
+/// `sandy-conn` stays as it is, because the mesh uses the same loader. The directory is private, so nobody else can
+/// swap the key between this check and the load.
+fn prepare_identity_dir(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let owned = sandy_fsutil::OwnedDir::open_or_create(dir).map_err(|e| e.to_string())?;
+    let key = owned.path().join("identity.key.der");
+    let meta = match std::fs::symlink_metadata(&key) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", key.display())),
+    };
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file (a symlink?)", key.display()));
+    }
+    if meta.uid() != sandy_fsutil::current_uid() {
+        return Err(format!("{} is not owned by the broker's user", key.display()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is mode {:o}: group or world can read it; chmod 600",
+            key.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
 /// Binds the listener and serves until the returned [`Running`] drops.
 ///
 /// # Errors
@@ -311,8 +340,10 @@ pub async fn serve_with_tuning(config: BrokerConfig, tuning: Tuning) -> Result<R
                 "no usable certificate pin: every pin is past its not_after".to_owned(),
             ));
         }
-        let identity = sandy_conn::TlsIdentity::load_or_generate(&tls.identity_dir)
-            .map_err(|e| BrokerError::Tls(format!("identity in {}: {e}", tls.identity_dir.display())))?;
+        let tls_err =
+            |e: &dyn std::fmt::Display| BrokerError::Tls(format!("identity in {}: {e}", tls.identity_dir.display()));
+        prepare_identity_dir(&tls.identity_dir).map_err(|e| tls_err(&e))?;
+        let identity = sandy_conn::TlsIdentity::load_or_generate(&tls.identity_dir).map_err(|e| tls_err(&e))?;
         let fingerprint = identity.fingerprint().to_hex();
         let listener = sandy_conn::listen_tls(bind, identity, allowed, TLS_HANDSHAKE_TIMEOUT, None)
             .await

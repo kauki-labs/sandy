@@ -351,11 +351,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<[u8; 32]> {
-    // `is_ascii` first: a 64-*byte* string containing a multi-byte UTF-8
+    // Hex digits first: a 64-*byte* string containing a multi-byte UTF-8
     // character (e.g. one "€" plus 61 ASCII bytes) would pass the length
     // check below and then panic on a `&s[i*2..i*2+2]` slice that lands
     // mid-character. ASCII guarantees every byte is its own char boundary.
-    if !s.is_ascii() || s.len() != 64 {
+    // It also keeps out the sign `from_str_radix` takes: "+0" parses as 0.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
