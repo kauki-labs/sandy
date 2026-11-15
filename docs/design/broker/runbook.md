@@ -116,14 +116,15 @@ the broker with `--tls-identity-dir`: it then serves mutual TLS only, on any add
 
 3. Start the broker: `sandy-broker --control-socket /path/broker.sock --state-dir /path/broker-state --clients-file
 /path/clients.json --bind 0.0.0.0:8443 --tls-identity-dir /path/broker-tls`. It creates the identity on first use and
-   logs `fingerprint=...`: a caller pins that value. Keep the directory `0700`.
+   prints `broker mTLS fingerprint: <64 hex digits>` on stdout: a caller pins that value. Keep the directory `0700`.
 4. A caller connects with its certificate and key and pins the broker's fingerprint. Every caller needs a certificate,
    including a loopback one: `sandy-mcp` has no TLS client, so it keeps using a bearer broker on loopback.
 
 To revoke a caller, remove its pin and restart the broker. The clients file is read once, so there is no reload, and a
 restart ends every connection, attach stream and output collection in flight. A handshake that fails (a certificate that
-is not pinned, a timeout, plaintext on the TLS port) gets no HTTP answer; the broker logs `handshake refused` with the
-kind (`tls` or `handshake_timeout`) and the peer address, never a certificate. Unauthenticated peers can hold up to 128
+is not pinned, a timeout, plaintext on the TLS port) gets no HTTP answer; the broker logs `handshake refused` (set
+`RUST_LOG=warn` to see it: the default filter shows errors only) with the kind (`tls` or `handshake_timeout`) and the
+peer address, never a certificate. A scanner can fill that log, so rotate it. Unauthenticated peers can hold up to 128
 connection slots for the handshake timeout (10 s), so firewall the port to the callers' addresses.
 
 ## Run an environment end to end

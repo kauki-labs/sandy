@@ -323,8 +323,9 @@ model on #607 and pulled forward remote callers with mTLS. The mesh already has 
   handshake), no CA and no chain validation. The handshake runs in the connection's own task under a 10 s timeout, so
   one slow peer never delays the next accept.
 - **The broker's own identity** is `TlsIdentity::load_or_generate(dir)`: a self-signed certificate persisted in
-  `--tls-identity-dir` (the key file `0600`), so its fingerprint is stable across restarts. The broker logs the fingerprint
-  at start; a caller pins it. Keep the directory `0700`. The identity is separate from `sandyd`'s mesh identity.
+  `--tls-identity-dir` (the key file `0600`), so its fingerprint is stable across restarts. The broker prints the fingerprint
+  on stdout at start (`broker mTLS fingerprint: <hex>`), not only in the log, because the default log filter shows errors
+  only; a caller pins it. Keep the directory `0700`. The identity is separate from `sandyd`'s mesh identity.
 - **Clients are pinned by certificate fingerprint.** The clients file gives each client a `certs` list of
   `{"sha256": "<64 hex>", "not_after": <unix seconds, optional>}`. The fingerprint is the SHA-256 of the end-entity
   certificate's DER bytes, as `sandy-conn` computes it. A caller presents a certificate; the broker compares its
@@ -340,7 +341,8 @@ model on #607 and pulled forward remote callers with mTLS. The mesh already has 
   told how the broker authenticated the caller.
 - **A failed handshake is refused with a typed reason.** No HTTP exchange exists before a handshake, so the refusal is
   the TLS alert and a closed connection, not an HTTP status. The broker logs the typed `sandy_conn::ConnError`
-  (`Tls`, or `HandshakeTimeout`) at `warn`, with the peer address and never any certificate or key bytes. Startup problems
+  kind (`tls`, `handshake_timeout` or `io`) at `warn`, with the peer address and never any certificate or key bytes (the
+  line shows with `RUST_LOG=warn`; the default filter shows errors only). Startup problems
   are typed `BrokerError`s: `NonLoopback`, and `Tls` for an unreadable or corrupt identity or no usable pin.
 - **Startup validation, all fail-closed.** In mTLS mode every client needs at least one pin, no client may hold a bearer
   token (a dead credential is refused, not kept), and a fingerprint is valid only as exactly 64 ASCII hex digits.
@@ -369,6 +371,8 @@ model on #607 and pulled forward remote callers with mTLS. The mesh already has 
 - An unauthenticated peer can open connections and hold up to 128 slots for the handshake timeout (the connection cap
   is taken before the handshake). Firewall the port to the callers' addresses. A per-address limit is not built.
 - A revocation needs a restart, and a restart ends every connection, the attach streams and the collectors in flight.
+- Each refused handshake is one log line, so a scanner can fill the log of a broker exposed to the internet: firewall the
+  port and rotate the log.
 - A compromised caller key is a compromised client: nothing binds a key to an address.
 - `sandy-mcp` keeps the bearer path on loopback. A remote caller uses its own mTLS HTTP client.
 

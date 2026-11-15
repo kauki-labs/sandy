@@ -25,7 +25,8 @@ struct Args {
     clients_file: PathBuf,
     /// Serve mutual TLS only, on any address, authenticating each client by its pinned certificate and ignoring
     /// bearer tokens. The directory holds the broker's own TLS identity (created on first use); its fingerprint is
-    /// logged at start, for callers to pin. Without it the broker serves plaintext on loopback with bearer tokens.
+    /// printed on stdout at start, for callers to pin. Without it the broker serves plaintext on loopback with bearer
+    /// tokens.
     #[arg(long)]
     tls_identity_dir: Option<PathBuf>,
 }
@@ -113,7 +114,12 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing::info!(addr = %running.addr, fingerprint = ?running.fingerprint, "broker listening");
+    tracing::info!(addr = %running.addr, "broker listening");
+    // Printed, not only logged: the default log filter shows errors only, and the operator needs this value to pin the
+    // broker. It is a hash of the broker's public certificate, not a secret.
+    if let Some(fingerprint) = &running.fingerprint {
+        println!("broker mTLS fingerprint: {fingerprint}");
+    }
     tokio::select! {
         () = running.wait() => {}
         _ = tokio::signal::ctrl_c() => {}
