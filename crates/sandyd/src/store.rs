@@ -242,7 +242,7 @@ impl JobStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, StoreError> {
+    pub(crate) fn from_connection(conn: Connection) -> Result<Self, StoreError> {
         // Wait briefly instead of failing at once when `sandyd cancel` and a starting daemon open the
         // same file together (#545).
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -290,6 +290,9 @@ impl JobStore {
         // The revocation record of the job's daemon-minted credential (#830), as JSON: NULL for a job with none, and
         // again once its revoke succeeded. Never the token.
         ensure_column(&conn, "credential", "ALTER TABLE jobs ADD COLUMN credential TEXT")?;
+        // The API client the broker submitted the job for (#888): NULL for a job submitted by any other caller, and for
+        // a row from before this column existed. The store writes it into the receipt of every terminal envelope.
+        ensure_column(&conn, "client_id", "ALTER TABLE jobs ADD COLUMN client_id TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_rows: None,
@@ -321,6 +324,21 @@ impl JobStore {
         manifest: &[u8],
         manifest_encoding: &str,
     ) -> Result<InsertOutcome, StoreError> {
+        self.insert_pending_for(job_id, manifest, manifest_encoding, None)
+    }
+
+    /// [`JobStore::insert_pending`] for a job the broker submitted for an API client (#888): the client id is written
+    /// by the INSERT itself, so a crash or a fault after it can never leave a job that names the uid.
+    ///
+    /// # Errors
+    /// As [`JobStore::insert_pending`].
+    pub fn insert_pending_for(
+        &self,
+        job_id: &str,
+        manifest: &[u8],
+        manifest_encoding: &str,
+        client_id: Option<&str>,
+    ) -> Result<InsertOutcome, StoreError> {
         let conn = self.lock();
         // CF-M-2: counted under the same lock the insert itself takes, so a
         // concurrent insert can never slip the table past the cap between
@@ -333,17 +351,39 @@ impl JobStore {
         }
         let now = now_unix();
         conn.execute(
-            "INSERT INTO jobs (job_id, status, manifest, manifest_encoding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            "INSERT INTO jobs (job_id, status, manifest, manifest_encoding, created_at, updated_at, client_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
             (
                 job_id,
                 status_name(JobStatus::Pending),
                 manifest,
                 manifest_encoding,
                 now,
+                client_id,
             ),
         )?;
         Ok(InsertOutcome::Inserted)
+    }
+
+    /// Record the API client the broker submitted `job_id` for (#888), on an existing row. Production writes the id in
+    /// the INSERT ([`JobStore::insert_pending_for`]); this is for tests that need to set or change it afterwards.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the write faults.
+    #[cfg(test)]
+    pub(crate) fn set_client_id(&self, job_id: &str, client_id: &str) -> Result<(), StoreError> {
+        self.lock()
+            .execute("UPDATE jobs SET client_id = ?1 WHERE job_id = ?2", (client_id, job_id))?;
+        Ok(())
+    }
+
+    /// The API client the broker submitted `job_id` for (#888), or `None` for an unknown job, a job with no client id,
+    /// and a row from before the column existed.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] if the read faults.
+    pub fn client_id(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        read_client_id(&self.lock(), job_id)
     }
 
     /// Record `token` as `job_id`'s durable attach credential (#327): a
@@ -510,13 +550,6 @@ impl JobStore {
         console: &str,
         envelope: Option<&sandy::ResultEnvelope>,
     ) -> Result<Transition, StoreError> {
-        // An envelope that does not serialize must not strand the job `Running`: record the terminal status without it
-        // and say so, rather than refuse the transition.
-        let envelope_json = envelope.and_then(|envelope| {
-            serde_json::to_string(envelope)
-                .inspect_err(|e| tracing::warn!(job_id, error = %e, "could not serialize the job's result envelope"))
-                .ok()
-        });
         let conn = self.lock();
         let Some(current) = query_status(&conn, job_id)? else {
             return Ok(Transition::NotFound);
@@ -524,6 +557,17 @@ impl JobStore {
         if !matches!(current, JobStatus::Pending | JobStatus::Running) {
             return Ok(Transition::Refused(current));
         }
+        // An envelope that does not serialize must not strand the job `Running`: record the terminal status without it
+        // and say so, rather than refuse the transition. The client the broker submitted for is named in its receipt
+        // (#888).
+        let client_id = read_client_id(&conn, job_id)?;
+        let envelope_json = envelope.and_then(|envelope| {
+            let mut envelope = envelope.clone();
+            name_client(&mut envelope, client_id.as_deref());
+            serde_json::to_string(&envelope)
+                .inspect_err(|e| tracing::warn!(job_id, error = %e, "could not serialize the job's result envelope"))
+                .ok()
+        });
         conn.execute(
             "UPDATE jobs SET status = ?1, exit_code = ?2, console = ?3, envelope = ?4, updated_at = ?5 WHERE job_id = \
              ?6",
@@ -672,7 +716,9 @@ impl JobStore {
         for id in &open {
             // The same envelope the daemon writes for any infrastructure failure; no host is named, since none is
             // known after a restart. A failed serialization still ends the row, as `finish_with` does.
-            let envelope = serde_json::to_string(&crate::envelope::infra_fault(id, reason, None))
+            let mut fault = crate::envelope::infra_fault(id, reason, None);
+            name_client(&mut fault, read_client_id(&tx, id)?.as_deref());
+            let envelope = serde_json::to_string(&fault)
                 .inspect_err(|e| tracing::warn!(job_id = %id, error = %e, "could not serialize the recovery envelope"))
                 .ok();
             tx.execute(
@@ -768,6 +814,27 @@ fn parse_status(job_id: &str, raw: &str) -> Result<JobStatus, StoreError> {
         job_id: job_id.to_owned(),
         raw: raw.to_owned(),
     })
+}
+
+/// The API client the broker submitted `job_id` for, read on an open connection (#888).
+fn read_client_id(conn: &Connection, job_id: &str) -> Result<Option<String>, StoreError> {
+    match conn.query_row("SELECT client_id FROM jobs WHERE job_id = ?1", [job_id], |row| {
+        row.get::<_, Option<String>>(0)
+    }) {
+        Ok(client_id) => Ok(client_id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Name the broker's client in `envelope`'s receipt (#888): `who.identity` becomes `broker:<client_id>`. The broker
+/// asserts the id and nothing verifies it, so `authenticated` is forced to false, whatever it was: a verified cap
+/// (#413) must not make the broker's claim look verified. With no client id the receipt is unchanged.
+fn name_client(envelope: &mut sandy::ResultEnvelope, client_id: Option<&str>) {
+    if let (Some(client_id), Some(receipt)) = (client_id, envelope.receipt.as_mut()) {
+        receipt.host_observed.who.identity = format!("broker:{client_id}");
+        receipt.host_observed.who.authenticated = false;
+    }
 }
 
 /// Run `add_column_sql` only if `column` is not already on the `jobs` table —
@@ -1228,6 +1295,89 @@ mod tests {
                 console: "hi\n".to_owned(),
             })
         );
+        Ok(())
+    }
+
+    /// #888: the API client the broker submitted for round-trips on its job row, and a row with none (also one from
+    /// before the column existed) has none.
+    #[test]
+    fn a_client_id_round_trips_and_an_old_row_has_none() -> Result<(), StoreError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE jobs (
+                job_id             TEXT PRIMARY KEY,
+                status             TEXT NOT NULL,
+                manifest           BLOB NOT NULL,
+                manifest_encoding  TEXT NOT NULL,
+                created_at         INTEGER NOT NULL,
+                updated_at         INTEGER NOT NULL
+            )",
+            (),
+        )?;
+        conn.execute(
+            "INSERT INTO jobs VALUES ('job-1', 'JOB_STATUS_PENDING', X'6d', 'argv/v1', 0, 0)",
+            (),
+        )?;
+        let store = JobStore::from_connection(conn)?;
+
+        assert_eq!(store.client_id("job-1")?, None, "a row from before the column");
+        store.set_client_id("job-1", "alice")?;
+        assert_eq!(store.client_id("job-1")?.as_deref(), Some("alice"));
+        assert_eq!(store.client_id("ghost")?, None);
+        Ok(())
+    }
+
+    /// The `who.identity` of the receipt in `job_id`'s stored envelope.
+    fn receipt_identity(store: &JobStore, job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(store
+            .envelope(job_id)?
+            .and_then(|envelope| envelope.receipt)
+            .map(|receipt| receipt.host_observed.who.identity))
+    }
+
+    /// #888: naming the broker's client never marks the receipt authenticated, whatever it said before: nothing
+    /// verifies the id (#413), so the claim in the spec holds even once a verified cap sets `authenticated` elsewhere.
+    #[test]
+    fn naming_a_client_forces_the_receipt_to_unauthenticated() -> Result<(), StoreError> {
+        let mut envelope = crate::envelope::infra_fault("job-1", "reason", None);
+        let receipt = envelope.receipt.as_mut().expect("an infra fault carries a receipt");
+        receipt.host_observed.who.authenticated = true;
+
+        name_client(&mut envelope, Some("alice"));
+
+        let who = envelope.receipt.expect("the receipt").host_observed.who;
+        assert_eq!(who.identity, "broker:alice");
+        assert!(!who.authenticated, "an id the broker asserts is not verified");
+        Ok(())
+    }
+
+    /// #888: a cancelled job's envelope has no receipt (no backend run was observed), so there is nothing to name a
+    /// client in. The client id stays on the row.
+    #[test]
+    fn a_cancelled_job_has_no_receipt_and_keeps_its_client_id() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.set_client_id("job-1", "alice")?;
+
+        store.cancel("job-1")?;
+
+        assert_eq!(receipt_identity(&store, "job-1")?, None);
+        assert_eq!(store.client_id("job-1")?.as_deref(), Some("alice"));
+        Ok(())
+    }
+
+    /// #888: a job a restarted daemon found open and failed (recovery) names its client in the receipt too.
+    #[test]
+    fn a_recovered_job_names_its_client_in_the_receipt() -> Result<(), StoreError> {
+        let store = JobStore::open_in_memory()?;
+        store.insert_pending("job-1", b"m", "argv/v1")?;
+        store.mark_running("job-1")?;
+        store.set_client_id("job-1", "alice")?;
+
+        let recovered = store.recover_unfinished("the daemon restarted")?;
+
+        assert_eq!(recovered, ["job-1"]);
+        assert_eq!(receipt_identity(&store, "job-1")?.as_deref(), Some("broker:alice"));
         Ok(())
     }
 

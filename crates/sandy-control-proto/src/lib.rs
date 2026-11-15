@@ -212,6 +212,25 @@ pub async fn read_frame<M: prost::Message + Default>(
 /// crate for the control-socket conventions.
 pub const ATTACH_SOCKET_NAME: &str = "sandyd-attach.sock";
 
+/// The longest valid `SubmitRequest.client_id`, in bytes (#888).
+pub const MAX_CLIENT_ID_BYTES: usize = 128;
+
+/// Why `id` is not a valid `SubmitRequest.client_id` (#888), or `None` when it is: not empty, at most
+/// [`MAX_CLIENT_ID_BYTES`] bytes, no control character (NUL, newline and tab included). `sandyd` refuses a Submit with
+/// a bad id and the broker refuses a clients file with one, so both use this one check.
+#[must_use]
+pub fn client_id_problem(id: &str) -> Option<&'static str> {
+    if id.is_empty() {
+        Some("is empty")
+    } else if id.len() > MAX_CLIENT_ID_BYTES {
+        Some("is longer than 128 bytes")
+    } else if id.chars().any(char::is_control) {
+        Some("has a control character")
+    } else {
+        None
+    }
+}
+
 /// The attach data-plane socket path alongside `control_socket` (#327): same
 /// directory, fixed sibling name ([`ATTACH_SOCKET_NAME`]).
 #[must_use]

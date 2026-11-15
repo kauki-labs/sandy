@@ -268,6 +268,18 @@ fn path_root_refusal(submit: &SubmitRequest) -> Option<String> {
     })
 }
 
+/// Refuse a Submit whose `client_id` is not valid (#888): empty, over 128 bytes, or with a control character. Names the
+/// field. The id is honoured only on the broker socket; `serve_connection` refuses it on the main socket before this.
+fn client_id_refusal(submit: &SubmitRequest) -> Option<String> {
+    let id = submit.client_id.as_deref()?;
+    sandy_control_proto::client_id_problem(id).map(|why| {
+        format!(
+            "client_id {why}: a client id is 1 to {} bytes with no control character",
+            sandy_control_proto::MAX_CLIENT_ID_BYTES
+        )
+    })
+}
+
 /// The refusal for an egress policy with no host to enforce it on (A1, #483). It names the capability, so an
 /// operator knows what to declare and a submitter knows why the job cannot be placed.
 /// The refusal for a Submit that asks for digests with no host to compute them (A2c, #483). It names the capability:
@@ -664,6 +676,13 @@ pub async fn handle(
                     result: Some(control_response::Result::Error(ControlError { message })),
                 });
             }
+            // #888: a client id that is not valid is refused before placement, with no side effect.
+            if let Some(message) = client_id_refusal(&submit) {
+                return Ok(ControlResponse {
+                    request_id: request.request_id,
+                    result: Some(control_response::Result::Error(ControlError { message })),
+                });
+            }
             // #618: a path that cannot lie beneath its root is refused before placement, with no side effect.
             if let Some(message) = path_root_refusal(&submit) {
                 return Ok(ControlResponse {
@@ -778,6 +797,9 @@ pub async fn handle(
             }
 
             let job_id = Uuid::new_v4().to_string();
+            // Cloned before `submit.manifest` is moved out below: a partial move makes rustc refuse a later `&submit`.
+            // The id goes into the INSERT of the job row (#888), so no later write can be lost to a fault.
+            let client_id_for_job = submit.client_id.clone();
             let manifest = submit.manifest;
             let encoding = submit.manifest_encoding;
             let inserted_id = job_id.clone();
@@ -1022,8 +1044,10 @@ pub async fn handle(
                 }
             }
 
-            let insert_outcome =
-                tokio::task::spawn_blocking(move || store.insert_pending(&inserted_id, &manifest, &encoding)).await??;
+            let insert_outcome = tokio::task::spawn_blocking(move || {
+                store.insert_pending_for(&inserted_id, &manifest, &encoding, client_id_for_job.as_deref())
+            })
+            .await??;
             // CF-M-2: a capacity refusal must leave no trace, same as every
             // other Submit-time refusal above — never registered, never
             // dispatched, even though `dispatch_plan` may already have minted
@@ -1588,6 +1612,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest,
                 manifest_encoding: MANIFEST_ENCODING_JSON.to_owned(),
@@ -1678,6 +1703,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -3085,6 +3111,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"opaque".to_vec(),
                 manifest_encoding: "application/octet-stream".to_owned(),
@@ -3138,6 +3165,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: oversized,
                 manifest_encoding: "test/v1".to_owned(),
@@ -3187,6 +3215,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: at_cap,
                 manifest_encoding: "test/v1".to_owned(),
@@ -3291,6 +3320,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -3635,6 +3665,7 @@ mod tests {
         let request = req(
             1,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -4898,6 +4929,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest,
                 manifest_encoding: "flake/v1".to_owned(),
@@ -5226,6 +5258,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: flake_manifest_bytes(None),
                 manifest_encoding: "flake/v1".to_owned(),
@@ -5245,6 +5278,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -5264,6 +5298,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: b"m".to_vec(),
                 manifest_encoding: "test/v1".to_owned(),
@@ -5477,6 +5512,7 @@ mod tests {
         req(
             id,
             control_request::Op::Submit(SubmitRequest {
+                client_id: None,
                 digests: false,
                 manifest: serde_json::to_vec(argv).expect("encode argv manifest"),
                 manifest_encoding: "argv/v1".to_owned(),

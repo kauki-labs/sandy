@@ -291,6 +291,17 @@ through `GET /v1/jobs/{id}/output`. Owner decision, 2026-11-14; `sandyd.md` deci
 
 **Set aside.** Persisting output to disk, and retention in sandyd. Both are separate work.
 
+## 9. The broker names the client in the job receipt (#888)
+
+**Decision.** `sandyd` records one submitter, the broker's uid, so the broker passes the client id of the bearer token
+that made the request in `SubmitRequest.client_id`. The receipt's `who.identity` is then `broker:<client_id>`
+(`authenticated: false`, as nothing verifies the id until #413). A client cannot name another client: the submit body has
+no such field, and the id comes from the authenticated client only. The broker connects to `sandyd`'s broker socket
+(`SANDYD_BROKER_SOCK`), the only socket on which `sandyd` honours the field (`sandyd.md` decision 39). The broker
+derives the attach socket as a sibling of the control path, so the broker socket sits in the directory of the main
+socket (`sandyd` refuses to start otherwise). The broker refuses a clients file whose id is empty, longer than 128 bytes or holds a control character. The HTTP contract does not
+change.
+
 ## Consequences
 
 - Every broker refusal is typed (`unauthenticated`, `forbidden`, `not_found`,

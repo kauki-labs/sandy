@@ -160,6 +160,11 @@ message SubmitRequest {
   // in the result envelope. False (also a client that predates the field) records none. Needs an executor that declared
   // `digests`; `sandyd` refuses the Submit otherwise, because an executor drops a field it does not know without a word.
   bool digests = 11;
+  // The API client the broker submits for (#888). The broker is the only writer: `sandyd` honours it only on the
+  // broker socket (`SANDYD_BROKER_SOCK`) and refuses a Submit that carries it on the main socket. It is stored on the
+  // job and the receipt's `who.identity` becomes `broker:<client_id>`. Absent keeps today's behaviour. A valid id is not
+  // empty, has at most 128 bytes and no control character; `sandyd` refuses any other value naming this field.
+  optional string client_id = 12;
 }
 
 // A job's egress allow-list: the only destinations the guest may reach.

@@ -269,6 +269,9 @@ async fn submit(state: &Arc<State>, client: &Client, req: Request<Incoming>) -> 
         IsolationClass::Untrusted => WireClass::Untrusted,
     };
     let submit = SubmitRequest {
+        // The authenticated client, from its bearer token: the body has no such field, so a client cannot name another
+        // one (#888). `sandyd` honours it on the broker socket and writes `broker:<id>` into the receipt.
+        client_id: Some(client.id.clone()),
         digests: false,
         manifest,
         manifest_encoding: body.manifest_encoding,
