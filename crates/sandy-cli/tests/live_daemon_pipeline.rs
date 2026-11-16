@@ -514,8 +514,8 @@ fn input_secret_and_output_compose_and_the_secret_stays_out_of_the_logs() -> any
             "--",
             "sh",
             "-c",
-            "echo console-canary; echo $TOK; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = \
-             SECRET-\"\"VALUE ] && printf done > /run/sandy/outputs/result/out",
+            "echo console-canary; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = SECRET-\"\"VALUE ] && \
+             printf done > /run/sandy/outputs/result/out",
         ],
     )?;
 
