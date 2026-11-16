@@ -31,7 +31,7 @@ use tokio::{net::UnixStream, sync::mpsc};
 use crate::{
     Client,
     body::Body,
-    server::{ApiError, NOT_FOUND, Reply, State, UNAVAILABLE, error, rpc, status_of},
+    server::{ApiError, NOT_FOUND, Peer, Reply, State, UNAVAILABLE, error, rpc, status_of},
 };
 
 /// Most tickets plus live streams one client holds at once.
@@ -213,7 +213,7 @@ pub(crate) async fn issue(state: &State, client: &Client, id: &str) -> Reply {
 }
 
 /// `GET /v1/jobs/{id}/stream/{ticket}`: spends the ticket, joins, and streams NDJSON.
-pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket: &str) -> Response<Body> {
+pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket: &str, peer: Peer) -> Response<Body> {
     let Some(slot) = state.tickets.redeem(ticket, &client.id, id) else {
         return error(&NOT_FOUND);
     };
@@ -229,7 +229,7 @@ pub(crate) async fn stream(state: Arc<State>, client: &Client, id: &str, ticket:
         }
     };
     let (tx, rx) = mpsc::channel(CHUNK_DEPTH);
-    tokio::spawn(pump(state, id.to_owned(), joined, tx, slot));
+    tokio::spawn(pump(state, id.to_owned(), joined, tx, slot, peer));
     let mut response = Response::new(Body::Stream(rx));
     response
         .headers_mut()
@@ -343,15 +343,15 @@ enum End {
 
 /// Runs one stream to its end. The write half of the connection is held but never written or
 /// shut down: a client EOF makes sandyd's relay leave the channel.
-async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<Bytes>, _slot: StreamSlot) {
+async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<Bytes>, _slot: StreamSlot, peer: Peer) {
     let (read_half, _write_half) = tokio::io::split(conn);
     let (mut frames, _reader) = spawn_reader(read_half);
-    if let End::Exit(reason) = run(&state, &id, &tx, &mut frames).await {
+    if let End::Exit(reason) = run(&state, &id, &tx, &mut frames, peer).await {
         let _ = tokio::time::timeout(state.send_timeout, tx.send(line(&Event::Exit { reason }))).await;
     }
 }
 
-async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames) -> End {
+async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, _peer: Peer) -> End {
     // The first poll waits a full period: the job's replay is already flowing by then.
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + POLL, POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -569,9 +569,12 @@ mod tests {
         let state = dead_state(dir.path())?;
         let (tx, _rx) = mpsc::channel(1);
         let (_frames_tx, mut frames): (mpsc::Sender<Result<Option<LinkFrame>, ()>>, Frames) = mpsc::channel(1);
-        let end = tokio::time::timeout(Duration::from_secs(12), run(&state, "job", &tx, &mut frames))
-            .await
-            .map_err(|_| anyhow::anyhow!("the stream held its slot while status kept failing"))?;
+        let end = tokio::time::timeout(
+            Duration::from_secs(12),
+            run(&state, "job", &tx, &mut frames, Peer::Bearer),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the stream held its slot while status kept failing"))?;
         assert_eq!(exit_reason(&end), Some("fault:status unavailable"));
         Ok(())
     }
@@ -582,7 +585,7 @@ mod tests {
         let state = silent_state(dir.path())?;
         let (tx, rx) = mpsc::channel(1);
         let (_frames_tx, mut frames): (mpsc::Sender<Result<Option<LinkFrame>, ()>>, Frames) = mpsc::channel(1);
-        let running = tokio::spawn(async move { run(&state, "job", &tx, &mut frames).await });
+        let running = tokio::spawn(async move { run(&state, "job", &tx, &mut frames, Peer::Bearer).await });
         // The first poll starts after POLL and then hangs for the whole rpc deadline.
         tokio::time::sleep(POLL + Duration::from_millis(300)).await;
         drop(rx);

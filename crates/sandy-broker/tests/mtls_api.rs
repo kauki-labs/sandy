@@ -193,6 +193,90 @@ async fn the_per_client_policies_still_apply_over_mtls() -> Result<()> {
     Ok(())
 }
 
+/// Opens a job's attach stream over mutual TLS as `client` and returns the connection, past the response head. The job
+/// is submitted by the same client.
+async fn open_stream_as(
+    f: &common::Fixture,
+    client: &str,
+) -> Result<(Box<dyn sandy_conn::Conn>, String, common::Agent)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let m = f.mtls.as_ref().context("an mTLS fixture")?;
+    let (status, job) = m.call(client, "POST", "/v1/jobs", Some(submit_body()), None).await?;
+    assert_eq!(status, 202, "{job}");
+    let id = job["job_id"].as_str().context("job id")?.to_owned();
+    let agent = f.agent(&id)?;
+    let (status, ticket) = m
+        .call(client, "POST", &format!("/v1/jobs/{id}/attach"), Some(json!({})), None)
+        .await?;
+    assert_eq!(status, 200, "{ticket}");
+    let url = ticket["stream_url"].as_str().context("stream_url")?;
+    let mut conn = m.connect(m.identity(client)).await?;
+    conn.write_all(format!("GET {url} HTTP/1.1\r\nHost: broker\r\nConnection: close\r\n\r\n").as_bytes())
+        .await?;
+    let mut head = Vec::new();
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut chunk = [0u8; 1024];
+        let n = conn.read(&mut chunk).await.context("read the stream head")?;
+        anyhow::ensure!(n > 0, "the stream closed before a response head");
+        head.extend_from_slice(&chunk[..n]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    anyhow::ensure!(head.starts_with("HTTP/1.1 200"), "the stream was not admitted: {head}");
+    Ok((conn, id, agent))
+}
+
+/// An attach stream admitted before the pin's `not_after` is closed within a bounded delay after it (#904): the client
+/// sees an `exit` line with a fixed fault text, then the end of the stream. Output sent before the deadline arrived.
+#[tokio::test]
+async fn an_admitted_attach_stream_is_cut_when_the_pin_expires() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let deadline = now() + 4;
+    let f = fixture_with_opts(Opts {
+        mtls_not_after_c: Some(deadline),
+        ..mtls()
+    })
+    .await?;
+    let (mut conn, _id, agent) = open_stream_as(&f, "c").await?;
+    agent.stdout(b"before\n").await?;
+
+    let mut body = Vec::new();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(15), conn.read_to_end(&mut body)).await;
+    let text = String::from_utf8_lossy(&body).into_owned();
+
+    assert!(
+        ended.is_ok(),
+        "the stream outlived its pin by more than the bound: {text}"
+    );
+    assert!(now() > deadline, "the stream ended before the pin expired: {text}");
+    assert!(
+        text.contains("\"type\":\"output\""),
+        "the output sent before the deadline: {text}"
+    );
+    assert!(
+        text.contains("\"reason\":\"fault:credential expired\""),
+        "the stream must end with the fixed fault text: {text}"
+    );
+    Ok(())
+}
+
+/// A pin with no `not_after` is never cut: its stream is still open well past the time the other pin's stream ended.
+#[tokio::test]
+async fn a_pin_without_a_deadline_keeps_its_stream() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let f = fixture_with_opts(mtls()).await?;
+    let (mut conn, _id, _agent) = open_stream_as(&f, "a").await?;
+
+    let mut body = Vec::new();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(8), conn.read_to_end(&mut body)).await;
+
+    assert!(
+        ended.is_err(),
+        "a stream with no pin deadline ended: {}",
+        String::from_utf8_lossy(&body)
+    );
+    Ok(())
+}
+
 /// A pin past its `not_after` at start is left out of the handshake allowlist: its certificate is refused, and the
 /// other clients are unaffected.
 #[tokio::test]
