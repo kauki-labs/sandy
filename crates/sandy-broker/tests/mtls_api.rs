@@ -243,10 +243,10 @@ async fn an_admitted_attach_stream_is_cut_when_the_pin_expires() -> Result<()> {
     let ended = tokio::time::timeout(std::time::Duration::from_secs(15), conn.read_to_end(&mut body)).await;
     let text = String::from_utf8_lossy(&body).into_owned();
 
-    assert!(
-        ended.is_ok(),
-        "the stream outlived its pin by more than the bound: {text}"
-    );
+    // Both layers: the timeout, and the read itself, so the stream ended cleanly and not on a read error.
+    ended
+        .with_context(|| format!("the stream outlived its pin by more than the bound: {text}"))?
+        .with_context(|| format!("the stream ended on a read error, not a clean end: {text}"))?;
     assert!(now() > deadline, "the stream ended before the pin expired: {text}");
     assert!(
         text.contains("\"type\":\"output\""),
