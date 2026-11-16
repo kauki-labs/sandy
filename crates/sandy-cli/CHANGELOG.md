@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.4...sandy-cli-v0.2.5) - 2026-11-16
+
+### Added
+
+- *(sandyd,broker)* name the API client in the receipt through a dedicated broker socket (closes #888) ([#900](https://github.com/kauki-labs/sandy/pull/900))
+- *(stage,host-executor)* open a rooted input, output and secret beneath its root (slice 2 of #618) ([#890](https://github.com/kauki-labs/sandy/pull/890))
+- *(sandyd,broker,fsutil)* open a rooted path beneath its root without following a link (slice 1 of #618) ([#889](https://github.com/kauki-labs/sandy/pull/889))
+
+### Fixed
+
+- *(sandyd)* refuse a Submit with no capable host instead of leaving it Pending (refs #868) ([#882](https://github.com/kauki-labs/sandy/pull/882))
+
+### Other
+
+- *(sandy-cli)* K14 compose and K9 through sandyd on qemu (refs #858) ([#905](https://github.com/kauki-labs/sandy/pull/905))
+- *(sandy-cli)* a live two-process harness re-proves K1, K2 and K3 through sandyd (refs #858) ([#892](https://github.com/kauki-labs/sandy/pull/892))
+- *(api)* rename VmBackend to VirtualizationBackend ([#869](https://github.com/kauki-labs/sandy/pull/869))
+
 ## [0.2.4](https://github.com/kauki-labs/sandy/compare/sandy-cli-v0.2.3...sandy-cli-v0.2.4) - 2026-11-13
 
 ### Added
