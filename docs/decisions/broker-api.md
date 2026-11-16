@@ -384,11 +384,14 @@ model on #607 and pulled forward remote callers with mTLS. The mesh already has 
   stream loop re-checks the connection's pin every second (`PIN_CHECK`). Once the pin is past `not_after`, or the clock
   cannot be read, the stream ends with the `exit` line `fault:credential expired`. The one-second check is not a hard
   bound: it cannot run while a send to a slow reader waits (up to the send timeout, 30 s) or while a hung status poll
-  waits (up to the RPC deadline, 30 s), so a stream can outlive `not_after` by about a minute in the worst case (#911
-  tightens this). A stream whose job has already ended is draining and no longer checks the pin: it ends with
+  waits (up to the RPC deadline, 30 s). The loop's `select!` is not biased, so when a frame and the pin tick are both
+  ready it picks at random, and a slow reader can cost several sends in a row. The delay is therefore about a minute for
+  one blocked send plus one hung poll, and has no fixed bound while a slow reader keeps frames arriving (#911 tightens
+  this). A stream whose job has already ended is draining and no longer checks the pin: it ends with
   `job_terminal:<STATUS>` or `job_terminal_truncated:<STATUS>`, not `fault:credential expired`, and drains for at most
   30 s. Read that exit as the normal drain end, not as a failure of expiry enforcement. A
-  pin with no `not_after`, and a bearer stream, are never cut by this check. A stream also ends when the job ends, the
+  pin with no `not_after` is never cut by this check while the clock can be read; when it cannot, every pin is refused and
+  the stream ends like any other. A bearer stream is never cut by this check. A stream also ends when the job ends, the
   client disconnects or stops reading (the send timeout), the data plane fails (`fault:data plane error`), status polling
   fails five times in a row (`fault:status unavailable`), or the broker restarts. Revoking a pin that has no `not_after`
   still needs a restart.
