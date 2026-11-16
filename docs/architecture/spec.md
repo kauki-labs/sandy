@@ -558,6 +558,7 @@ A real guest boots. Behind the `live` cargo feature (off by default, so CI and
 | Test file                                                                          | Proves (KPI)                                                                                    |
 | ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | `live_boot.rs`, `live_inputs.rs`, `live_outputs.rs`, `live_e2e.rs`, `live_cred.rs` | removed in #483 with the direct path (K1-K10, K14); not yet re-proven through the daemon (#858) |
+| `live_daemon_pipeline.rs`                                                          | K1-K3, K9 and K14 without a credential, through `sandyd` and `sandy-host-executor` (qemu, #858) |
 | `live_refresh.rs`, `live_egress.rs`                                                | removed in #483; K11 (mid-run refresh) and K13 (nftables NIC allow-list) retired                |
 | `cred_e2e.rs`, `sandy/tests/cred_github_live.rs`                                   | the real GitHub App adapter (operator-gated)                                                    |
 

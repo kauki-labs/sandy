@@ -381,6 +381,25 @@ impl Stack {
         Ok((code, json))
     }
 
+    /// Fails when `value` appears in the serialised `envelope` or in any log the harness captured from `sandyd` and the
+    /// executor (K9). The envelope's `logs.tail` is bounded (about 4 KiB, 40 lines), so a leak the guest printed
+    /// early in a long boot can fall off its front; the daemon and executor logs and the whole envelope are checked
+    /// as well, and a leak that is trimmed from all of them is outside what this proves.
+    fn ensure_secret_absent(&self, envelope: &Value, value: &str) -> anyhow::Result<()> {
+        ensure!(
+            !envelope.to_string().contains(value),
+            "the secret is in the envelope: {envelope}"
+        );
+        for name in ["d.log", "d.err", "e.log", "e.err"] {
+            let log = std::fs::read(self.dir.path().join(name)).with_context(|| format!("read {name}"))?;
+            ensure!(
+                !String::from_utf8_lossy(&log).contains(value),
+                "the secret is in the harness log {name}"
+            );
+        }
+        Ok(())
+    }
+
     /// Children of the executor that are the guest itself: a long-lived qemu with a boot drive, not a `--version`
     /// probe.
     fn guest_qemus(&self) -> Vec<(u32, u64)> {
@@ -458,6 +477,68 @@ fn a_nonzero_guest_exit_is_a_task_fault_not_an_infrastructure_one() -> anyhow::R
     ensure!(
         envelope["result"]["receipt"]["guest_reported"]["exit_code"] == 7,
         "the guest did not report its own exit: {envelope}"
+    );
+    Ok(())
+}
+
+/// K14 (without a credential) and K9: an input, a secret and an output compose in one boot, and the secret's value
+/// never reaches `logs.tail`. The job exits 0 only when the guest saw the input and the secret, and the console is
+/// proved non-empty first, so an absent value is not an absent console. The job's own text splits the secret literal,
+/// so a console that echoes the command line cannot hold the value by itself.
+#[test]
+fn input_secret_and_output_compose_and_the_secret_stays_out_of_the_logs() -> anyhow::Result<()> {
+    let stack = Stack::start()?;
+    let staging = stack.dir.path().join("k14");
+    let input_dir = staging.join("in");
+    std::fs::create_dir_all(&input_dir)?;
+    std::fs::write(input_dir.join("f"), b"INPUT-MARKER")?;
+    let secret_file = staging.join("tok");
+    std::fs::write(&secret_file, b"SECRET-VALUE")?;
+    std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600))?;
+    let out_dest = staging.join("collected");
+    let input_arg = format!("{}:data", input_dir.display());
+    let secret_arg = format!("TOK=@{}", secret_file.display());
+    let out_arg = format!("result:{}", out_dest.display());
+
+    let (code, envelope) = stack.sandy(
+        "k14-compose",
+        &[
+            "run",
+            "--input",
+            &input_arg,
+            "--secret",
+            &secret_arg,
+            "--out",
+            &out_arg,
+            TEMPLATE,
+            "--",
+            "sh",
+            "-c",
+            "echo console-canary; grep -q INPUT-MARKER /run/sandy/inputs/data/f && [ \"$TOK\" = SECRET-\"\"VALUE ] && \
+             printf done > /run/sandy/outputs/result/out",
+        ],
+    )?;
+
+    ensure!(code == 0, "sandy run exited {code}: {envelope}");
+    ensure!(str_at(&envelope, &["result", "status"]) == "succeeded", "{envelope}");
+    ensure!(
+        envelope["exit_code"] == 0,
+        "the guest did not see the input and the secret: {envelope}"
+    );
+    ensure!(
+        std::fs::read(out_dest.join("out")).context("the output was not collected")? == b"done",
+        "the output bytes differ"
+    );
+    let listed = envelope["result"]["outputs"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|o| o["path"] == "result/out"));
+    ensure!(listed, "the envelope does not list result/out: {envelope}");
+    stack.ensure_secret_absent(&envelope, "SECRET-VALUE")?;
+    let tail = str_at(&envelope, &["result", "logs", "tail"]);
+    ensure!(tail.contains("console-canary"), "the console tail is empty: {envelope}");
+    ensure!(
+        !tail.contains("SECRET-VALUE"),
+        "the secret leaked into logs.tail: {tail}"
     );
     Ok(())
 }
