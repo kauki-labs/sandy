@@ -300,7 +300,7 @@ async fn an_expired_pin_is_refused_at_the_handshake() -> Result<()> {
     Ok(())
 }
 
-/// A pin that expires while a connection is open stops working on that connection: the next request is
+/// A pin that expires while a connection is open stops working for the next request on it: the next request is
 /// `unauthenticated`, not served on the strength of the handshake alone.
 #[tokio::test]
 async fn a_pin_that_expires_during_a_connection_stops_working() -> Result<()> {

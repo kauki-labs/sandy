@@ -48,6 +48,9 @@ pub(crate) const POLL: Duration = Duration::from_secs(1);
 pub(crate) const QUIET: Duration = Duration::from_millis(500);
 /// Consecutive failed status polls after which a stream ends with `fault:status unavailable`.
 pub(crate) const MAX_FAILED_POLLS: u32 = 5;
+/// How often an mTLS stream re-checks its client's pin (#904): the longest a stream outlives `not_after`, plus the
+/// drain time when the job has already ended.
+const PIN_CHECK: Duration = Duration::from_secs(1);
 /// The most a stream drains after the job ended, however much keeps arriving.
 pub(crate) const DRAIN_CAP: Duration = Duration::from_secs(30);
 /// Chunks buffered between the producer and the HTTP body.
@@ -351,14 +354,33 @@ async fn pump(state: Arc<State>, id: String, conn: UnixStream, tx: mpsc::Sender<
     }
 }
 
-async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, _peer: Peer) -> End {
+/// Whether the stream's client may still be served. Over mutual TLS the pin is checked again, because a stream admitted
+/// before `not_after` would otherwise outlive it (#904); a plaintext bearer stream has no pin.
+fn still_authenticated(state: &State, peer: Peer) -> bool {
+    match peer {
+        Peer::Bearer => true,
+        Peer::Cert(fingerprint) => state
+            .pins
+            .client(&state.clients, &fingerprint, crate::auth::now_unix())
+            .is_some(),
+    }
+}
+
+async fn run(state: &State, id: &str, tx: &mpsc::Sender<Bytes>, frames: &mut Frames, peer: Peer) -> End {
     // The first poll waits a full period: the job's replay is already flowing by then.
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + POLL, POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pin_check = tokio::time::interval(PIN_CHECK);
+    pin_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failed_polls = 0_u32;
     loop {
         tokio::select! {
             () = tx.closed() => return End::ClientGone,
+            _ = pin_check.tick() => {
+                if !still_authenticated(state, peer) {
+                    return End::Exit("fault:credential expired".to_owned());
+                }
+            }
             frame = frames.recv() => match frame {
                 Some(Ok(Some(frame))) => {
                     if !forward(tx, frame, state.send_timeout).await {
