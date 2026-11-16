@@ -73,7 +73,8 @@ impl Pins {
     }
 
     /// The client `fingerprint` is pinned to, unless its pin is past `not_after` at `now`. Checked on every request,
-    /// so a connection that outlives its pin stops working at the deadline. The fingerprint is a hash of a public
+    /// so a request made after the deadline is refused, a new request on an existing connection included. An attach
+    /// stream re-checks it on a timer (`attach::PIN_CHECK`). The fingerprint is a hash of a public
     /// certificate, so nothing secret is compared and the lookup need not be constant time.
     pub(crate) fn client<'a>(
         &self,

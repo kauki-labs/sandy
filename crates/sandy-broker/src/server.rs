@@ -150,7 +150,7 @@ pub(crate) async fn handle(state: Arc<State>, req: Request<Incoming>, peer: Peer
         }
         (&Method::POST, ["v1", "jobs", id, "attach"]) => attach::issue(&state, client, id).await,
         (&Method::GET, ["v1", "jobs", id, "stream", ticket]) => {
-            return attach::stream(Arc::clone(&state), client, id, ticket).await;
+            return attach::stream(Arc::clone(&state), client, id, ticket, peer).await;
         }
         (&Method::POST, ["v1", "tasks", "end"]) => environments::end_task(&state, client, req).await,
         (&Method::POST, ["v1", "environments", _, "link"]) => Err(UNSUPPORTED),
