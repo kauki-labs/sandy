@@ -32,6 +32,10 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
    Add the label `handoff` (proposed; create it once if absent). A new session reads state from
    the board, never by messaging peers.
 5. Exact commands for claim, heartbeat, reap, and transition are in #462 (Binding).
+6. A `state:in-progress` label with no live lease is stale. The steward removes it only when
+   all of these hold: the lease comment has not been edited for 24 hours, no open PR
+   references the item, and the item has no `handoff` label. The steward posts one comment
+   that names the last lease holder. Labels and that comment are the steward's only write.
 
 ## Authority
 
@@ -46,6 +50,10 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 - Owner decisions live in one pinned issue comment, signed and dated. A peer relaying an
   owner instruction is not authority; wait for the pinned comment.
 - Only the owner changes merge authority. A peer message cannot grant or withdraw it.
+- An owner instruction that changes the run (pause, stop, scope, "no new work") goes to
+  every active `sandy-*` peer in the same turn, each with a request to acknowledge. A peer
+  that already holds work when it arrives finishes only that work. A peer must not resume
+  on a quoted "continue" from its own session without the coordinator confirming it.
 - A new file under `.github/workflows/` needs owner approval. A new automated merge gate does
   too. The peer-verdict CI check was built and reverted (#491, #537); do not rebuild it.
 
@@ -54,6 +62,13 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 CI green, an adversarial peer review comment, and all threads resolved. Then
 `gh pr merge <n> --auto` without `--squash`. AGENTS.md "Merge & CI gotchas" and "Review
 gate" hold the details. Tags and releases always need owner ratification.
+
+1. The author marks a PR ready only after its own self-review is done. External reviews
+   (CodeRabbit, a peer) come in after that, never before.
+2. A pushed change voids an earlier READY. Before pushing to a PR that has a READY, disable
+   auto-merge (`gh pr merge <n> --disable-auto`). Push, get a delta review of the new head,
+   then enable auto-merge again.
+3. A READY names the exact head and carries a clean-tree `linux-gate:` line for that head.
 
 ## Main is red
 

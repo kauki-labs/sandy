@@ -402,6 +402,11 @@ repo's own setup, not general git advice.
   the PR's own node id (not the `mergeQueueEntry`'s id — that resolves to
   "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
   came back `null`.
+- **GitHub reads a closing keyword even in a negation.** "does not close
+  #618" links and closes #618 on merge. A PR that must not close an issue
+  never uses close, fix, or resolve with an issue number in its title,
+  body, or commit messages: write "refs #618" or "slice 1 of #618". Check
+  `closingIssuesReferences` on the PR before enabling auto-merge.
 
 ## Review gate: a local adversarial reviewer, CodeRabbit as a bonus
 
