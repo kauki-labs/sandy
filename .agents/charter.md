@@ -76,11 +76,16 @@ gate" hold the details. Tags and releases always need owner ratification.
 2. A pushed change voids an earlier READY. Before pushing to a PR that has a READY, remove
    it from auto-merge: `gh pr merge <n> --disable-auto`, and when it is already queued
    `dequeuePullRequest` on the PR's node id, then confirm `mergeQueueEntry` is `null`
-   (see AGENTS.md "Merge & CI gotchas"). Push, get a delta review of the new head, then
-   `gh pr merge <n> --auto` again.
-3. A READY names the exact head. The PR body carries a `linux-gate:` line whose 9-character
-   rev equals the prefix of that head; `scripts/dev/linux-gate.sh` prints a different rev
-   for a dirty tree.
+   (see AGENTS.md "Merge & CI gotchas"). Push, then read `mergeQueueEntry` again: repository
+   automation can re-enqueue a PR without a `gh pr merge` call, and a re-queued PR can merge
+   the old head. If it is not `null`, dequeue again. Only then get a delta review of the new
+   head, and `gh pr merge <n> --auto` again.
+3. A READY names the exact head. A PR that changes code, build files, or CI carries a
+   `linux-gate:` line in its body whose 9-character rev equals the prefix of that head;
+   `scripts/dev/linux-gate.sh` prints a different rev for a dirty tree. A PR that changes
+   only documentation needs no such line; it states that in its body. AGENTS.md
+   "Linux-platform pre-PR gate" says how to produce the line on a macOS host; this rule says
+   which PRs must carry it.
 
 ## Main is red
 

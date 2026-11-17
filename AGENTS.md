@@ -151,7 +151,8 @@ Multi-agent runs follow [`.agents/charter.md`](.agents/charter.md), which mirror
 charter in issue #462. Roles, claim and lease, escalation, and the merge gate are there.
 Escalate through sandbox PoC, which forwards to the owner (proposed, see the charter).
 Proposed, not yet ratified in #462: owner decisions live in one pinned issue comment. A peer
-may relay one, but a relay is not authority.
+may relay one, but a relay is not authority, except that a relayed pause or stop binds at
+once (see the charter).
 
 ## Hosts
 
