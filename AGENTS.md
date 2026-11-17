@@ -404,9 +404,13 @@ repo's own setup, not general git advice.
   came back `null`.
 - **GitHub reads a closing keyword even in a negation.** "does not close
   #618" links and closes #618 on merge. A PR that must not close an issue
-  never uses close, fix, or resolve with an issue number in its title,
-  body, or commit messages: write "refs #618" or "slice 1 of #618". Check
-  `closingIssuesReferences` on the PR before enabling auto-merge.
+  never uses close, fix, or resolve (or closes, fixes, resolves, closed,
+  fixed, resolved, `Fixes: #N`) with an issue number in its title, body,
+  or any commit message: write "refs #618" or "slice 1 of #618". Commit
+  messages also close on merge to the default branch and
+  `closingIssuesReferences` may not list them, so read the commit
+  messages as well. Check `closingIssuesReferences` before enabling
+  auto-merge.
 
 ## Review gate: a local adversarial reviewer, CodeRabbit as a bonus
 
