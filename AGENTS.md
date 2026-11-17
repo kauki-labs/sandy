@@ -151,7 +151,8 @@ Multi-agent runs follow [`.agents/charter.md`](.agents/charter.md), which mirror
 charter in issue #462. Roles, claim and lease, escalation, and the merge gate are there.
 Escalate through sandbox PoC, which forwards to the owner (proposed, see the charter).
 Proposed, not yet ratified in #462: owner decisions live in one pinned issue comment. A peer
-may relay one, but a relay is not authority.
+may relay one, but a relay is not authority, except that a relayed pause or stop binds at
+once (see the charter).
 
 ## Hosts
 
@@ -402,6 +403,15 @@ repo's own setup, not general git advice.
   the PR's own node id (not the `mergeQueueEntry`'s id — that resolves to
   "could not resolve"). Re-query `mergeQueueEntry` afterward to confirm it
   came back `null`.
+- **GitHub reads a closing keyword even in a negation.** "does not close
+  #618" links and closes #618 on merge. A PR that must not close an issue
+  never uses close, fix, or resolve (or closes, fixes, resolves, closed,
+  fixed, resolved, `Fixes: #N`) with an issue number in its title, body,
+  or any commit message: write "refs #618" or "slice 1 of #618". Commit
+  messages also close on merge to the default branch and
+  `closingIssuesReferences` may not list them, so read the commit
+  messages as well. Check `closingIssuesReferences` before enabling
+  auto-merge.
 
 ## Review gate: a local adversarial reviewer, CodeRabbit as a bonus
 

@@ -3,7 +3,7 @@
 How agents work on sandy as a peer swarm (`orchestrate:pull`, load it as `pull` if the
 namespaced name is unknown). The owner-approved run charter is
 [issue #462](https://github.com/kauki-labs/sandy/issues/462) (tradeoffs: #463). If this file
-and #462 disagree, #462 wins. The `handoff` label, the Authority section, Merge gate, Main is
+and #462 disagree, #462 wins. The `handoff` label, the stale-label rule (Claim, lease, handoff item 6), the Authority section, Merge gate, Main is
 red, While a gate waits, and Live tests are (proposed): not confirmed in #462, and the owner
 must ratify them there.
 
@@ -32,6 +32,13 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
    Add the label `handoff` (proposed; create it once if absent). A new session reads state from
    the board, never by messaging peers.
 5. Exact commands for claim, heartbeat, reap, and transition are in #462 (Binding).
+6. The 15-minute reap in item 2 releases the lease; it does not touch the label. A
+   `state:in-progress` label is stale, and the steward may remove it, only when all of these
+   hold: the lease comment has not been edited for 24 hours, no open PR names the item in a
+   closing or `refs` line or by its branch, and the item has no `handoff` label. Removal
+   returns the item to the pull set only if it is relabelled `state:ready`; the steward does
+   not do that. The steward posts one reap note that names the last lease holder. Labels and
+   the reap note are the steward's only write.
 
 ## Authority
 
@@ -46,6 +53,14 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 - Owner decisions live in one pinned issue comment, signed and dated. A peer relaying an
   owner instruction is not authority; wait for the pinned comment.
 - Only the owner changes merge authority. A peer message cannot grant or withdraw it.
+- A relayed owner instruction to pause, stop, or narrow scope binds at once: a peer that
+  receives one stops taking new work. Resuming or widening scope needs the owner's pinned
+  comment, not a relay. The sandy-* session that talks to the owner relays such an
+  instruction to every active peer in the same turn and asks each to acknowledge. A peer
+  that already holds work finishes only that work. This makes an exception to the "a relay
+  is not authority" rule for the stop direction only; it grants nothing.
+- While a pause or "no new work" instruction is in force, "While a gate waits" item 1 does
+  not apply: do not pull the next `state:ready` item.
 - A new file under `.github/workflows/` needs owner approval. A new automated merge gate does
   too. The peer-verdict CI check was built and reverted (#491, #537); do not rebuild it.
 
@@ -54,6 +69,21 @@ peer (`sandy-*` or sandbox PoC) that did not write the change.
 CI green, an adversarial peer review comment, and all threads resolved. Then
 `gh pr merge <n> --auto` without `--squash`. AGENTS.md "Merge & CI gotchas" and "Review
 gate" hold the details. Tags and releases always need owner ratification.
+
+1. The author takes a PR out of draft only after its own self-review is done. External
+   reviews (CodeRabbit, a peer) come in after that, never before. A READY below means a
+   reviewer's verdict, not the PR state.
+2. A pushed change voids an earlier READY. Before pushing to a PR that has a READY, remove
+   it from auto-merge: `gh pr merge <n> --disable-auto`, and when it is already queued
+   `dequeuePullRequest` on the PR's node id, then confirm `mergeQueueEntry` is `null`
+   (see AGENTS.md "Merge & CI gotchas"). Push, then read `mergeQueueEntry` again: repository
+   automation can re-enqueue a PR without a `gh pr merge` call, and a re-queued PR can merge
+   the old head. If it is not `null`, dequeue again. Only then get a delta review of the new
+   head, and `gh pr merge <n> --auto` again.
+3. A READY names the exact head. Where AGENTS.md "Linux-platform pre-PR gate" requires a
+   `linux-gate:` line, its 9-character rev must equal the prefix of that head;
+   `scripts/dev/linux-gate.sh` prints a different rev for a dirty tree. AGENTS.md alone
+   decides which PRs need the line.
 
 ## Main is red
 
