@@ -1,6 +1,7 @@
 ---
 name: sandy
-description: Run an untrusted or isolated job in sandy's ephemeral NixOS microVM/process sandbox (kauki-labs/sandy's `sandy` CLI) instead of running it directly on the host. Use this whenever you (the agent) need to execute code you don't fully trust, a job that could touch the network or write files you don't want to risk on the host, or anything that wants CPU/memory/timeout/egress bounds and a locked result envelope you can inspect afterward. Trigger on "run this in a sandbox", "box this up", "run via sandy", "isolate this job", "spin up a microVM for this", or whenever a task calls for running arbitrary/untrusted code or commands with resource or network limits. Not for developing or modifying the sandy codebase itself (that's the repo's own AGENTS.md) — this skill is about USING the already-built `sandy` CLI as a tool from inside an agent session.
+description: >
+  Run untrusted code or commands in sandy's ephemeral microVM sandbox with CPU, memory, timeout and egress limits: "run this in a sandbox", "box this up", "run via sandy", "isolate this job". Not for developing sandy or the sandy-* peer agents.
 ---
 
 # sandy: run a job in an isolated microVM/process sandbox
