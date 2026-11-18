@@ -134,7 +134,8 @@ nix develop -c cargo shear --fix              # Prune unused dependencies
 4. `cd` into a fresh worktree triggers direnv and a Nix evaluation. Use `git -C <path>` or
    absolute paths instead.
 5. Reindex the code graph (graph MCP is `codebase-memory-mcp`): `index_repository` with this
-   repo's path.
+   repo's path. The graph `project` is `Users-teebor-Fun-kauki.xyz-products-sandy` (worktrees
+   share it; note the dot). Never pass `sandy`. `search_graph` before `get_code_snippet`.
 
 ## Generated architecture docs
 
@@ -160,6 +161,10 @@ once (see the charter).
   alias fails, ask the owner for the direct address rather than guessing or hardcoding one.
   Wake it before asking the owner. `strings` is absent; use `grep -a`. Leave no artifacts:
   remove `/tmp/sandy-<name>` when done. The deploy recipe is in `~/.config/nix/AGENTS.md`.
+  Access: ssh as `teebor@<alias>` (the default local user gets `Permission denied (publickey)`);
+  run `tailscale ping` on the mesh address first (a bare ssh timeout means the host is
+  asleep); sudo needs a password, so no `tcpdump` or `/proc` fd inspection: use the `sandyd`
+  trace logs.
 - Running `sandyd` plus the executor across a Mac and Linux host: the manual smoke test in
   [`docs/design/host-executor/spec.md`](docs/design/host-executor/spec.md).
 - The audit log is at `../audit.md` (`products/audit.md`, one level above this repo).
