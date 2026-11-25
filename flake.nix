@@ -175,7 +175,11 @@
             };
             programs.nixfmt.enable = true;
             programs.taplo.enable = true;
-            programs.shfmt.enable = true;
+            programs.shfmt = {
+              enable = true;
+              # treefmt-nix stopped defaulting to 2 (it now uses tabs); keep the repo's style.
+              indent_size = 2;
+            };
             programs.yamlfmt.enable = true;
             programs.prettier = {
               enable = true;
