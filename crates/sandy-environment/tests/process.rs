@@ -273,7 +273,7 @@ fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Resu
     let keys: Vec<&str> = dumped
         .lines()
         .filter_map(|l| l.split('=').next())
-        .filter(|k| !k.starts_with("__LLVM_PROFILE_"))
+        .filter(|k| *k != "__LLVM_PROFILE_RT_INIT_ONCE")
         .collect();
     for key in &keys {
         assert!(
