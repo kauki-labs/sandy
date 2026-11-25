@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-agent"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "sandy-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "sandyd"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "fs2",
