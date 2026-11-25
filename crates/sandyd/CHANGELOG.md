@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.4...sandyd-v0.2.5) - 2026-11-25
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.2.4](https://github.com/kauki-labs/sandy/compare/sandyd-v0.2.3...sandyd-v0.2.4) - 2026-11-16
 
 ### Added
