@@ -435,4 +435,18 @@ tcp4       0      0  127.0.0.1.13773        127.0.0.1.50003        ESTABLISHED\n
         assert_eq!(count_netstat(NETSTAT, 50000), 1);
         assert_eq!(count_netstat("", 3773), 0);
     }
+
+    /// The host's own socket table, not a fixture: a client that connected to a listener is one
+    /// established connection on the listener's port (#692: macOS reported none).
+    #[test]
+    fn a_connected_client_is_counted_against_the_listeners_port() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind")?;
+        let port = listener.local_addr().context("local addr")?.port();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).context("connect")?;
+        let (_accepted, _) = listener.accept().context("accept")?;
+        let count = established_to(port).map_err(anyhow::Error::msg)?;
+        assert_eq!(count, 1, "the accepted connection is the one established socket on {port}");
+        Ok(())
+    }
 }
