@@ -3,7 +3,9 @@
 # comment naming the cause (which crate pulls it in) and the exit condition
 # (what makes it safe to remove), e.g.:
 #   "RUSTSEC-2026-0194", # quick-xml 0.26.0 via pprof -> inferno; dev-only
-ignore = []
+ignore = [
+  "RUSTSEC-2026-0543", # chrono 0.4.45 unmaintained via octocrab 0.54.9 (sandy-cli, sandy-lib); remove when octocrab drops chrono or the advisory is withdrawn
+]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
 

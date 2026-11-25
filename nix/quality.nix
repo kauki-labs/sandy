@@ -101,6 +101,10 @@ in
     cargoRoot = "rust";
     buildAndTestSubdir = "rust";
     cargoHash = "sha256-wFmQjNspdmeWc9k1yhQbQ0xTyXlz92DaH+NZlJUJ7bA=";
+    # nixpkgs' cargo-setup-hook sets RUSTONIG_SYSTEM_LIBONIG, so onig_sys needs
+    # a system oniguruma found through pkg-config.
+    nativeBuildInputs = [ pkgs.pkg-config ];
+    buildInputs = [ pkgs.oniguruma ];
     # Builds both `cpd` and `jscpd` bins; the discovery check wants `jscpd`.
     cargoBuildFlags = [
       "-p"
