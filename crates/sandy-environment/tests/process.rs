@@ -268,7 +268,13 @@ fn the_service_sees_a_clean_environment_with_only_the_passed_variables() -> Resu
     wait_for(&b, "env-1", |p| matches!(p, Probe::Ready { .. }))?;
     let dir = env_dir(state.path(), "env-1");
     let dumped = std::fs::read_to_string(dir.join("env.txt")).context("env.txt")?;
-    let keys: Vec<&str> = dumped.lines().filter_map(|l| l.split('=').next()).collect();
+    // Under cargo-llvm-cov the instrumented dump helper sets its own profile-runtime variable at
+    // startup (`__LLVM_PROFILE_RT_INIT_ONCE`); the backend never passed it.
+    let keys: Vec<&str> = dumped
+        .lines()
+        .filter_map(|l| l.split('=').next())
+        .filter(|k| !k.starts_with("__LLVM_PROFILE_"))
+        .collect();
     for key in &keys {
         assert!(
             ["PATH", "HOME", "LANG", "TMPDIR", "CARGO_MANIFEST_DIR"].contains(key),
