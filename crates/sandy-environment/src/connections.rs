@@ -1,6 +1,6 @@
 //! Established client connections to a local TCP port, for the idle-stop lease (#645), and who listens on it (#637).
 //!
-//! Linux reads `/proc/net/tcp` and `/proc/net/tcp6`; other Unix hosts parse `/usr/sbin/netstat -an -p tcp` (an absolute
+//! Linux reads `/proc/net/tcp` and `/proc/net/tcp6`; other Unix hosts parse `/usr/sbin/lsof` output (an absolute
 //! path, so a daemon with a minimal PATH still finds it). Only sockets whose local port is the service port count, so
 //! the service's own outbound connections never read as use.
 
@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The longest a `netstat` run may take. The driver's pass waits on it.
-const NETSTAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest a host tool (`lsof`, `ps`) may take. The driver's pass waits on it.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of established connections whose local port is `port`.
 ///
@@ -30,11 +30,19 @@ pub(crate) fn established_to(port: u16) -> Result<usize, String> {
         }
         Ok(total)
     } else {
-        let out = run_bounded(
-            Command::new("/usr/sbin/netstat").args(["-an", "-p", "tcp"]),
-            NETSTAT_TIMEOUT,
-        )?;
-        Ok(count_netstat(&out, port))
+        // Not `netstat`: on macOS (Darwin 27.2) it printed no TCP rows when spawned from some programs
+        // (a test binary, python, awk, xargs; cause unknown), so every client read as absent (#692).
+        // `lsof` saw those sockets from each of them. It lists only processes the caller may inspect,
+        // which covers the service: it is this daemon's child.
+        match run_bounded(
+            Command::new("/usr/sbin/lsof").args(["-nP", "-a", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED", "-Fn"]),
+            COMMAND_TIMEOUT,
+        ) {
+            Ok(out) => Ok(count_lsof(&out, port)),
+            // `lsof` exits 1 when it finds nothing.
+            Err(e) if e.ends_with("exit status: 1") => Ok(0),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -83,7 +91,7 @@ pub(crate) fn listener_holder(port: u16, pgid: i32) -> Result<Holder, String> {
     } else {
         let out = match run_bounded(
             Command::new("/usr/sbin/lsof").args(["-nP", "-a", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"]),
-            NETSTAT_TIMEOUT,
+            COMMAND_TIMEOUT,
         ) {
             Ok(out) => out,
             // `lsof` exits 1 when it finds nothing.
@@ -98,7 +106,7 @@ pub(crate) fn listener_holder(port: u16, pgid: i32) -> Result<Holder, String> {
         // A listener that exited since `lsof` ran is gone: ask again on the next probe.
         let Ok(rows) = run_bounded(
             Command::new("/bin/ps").args(["-o", "pid=,pgid=", "-p", &list]),
-            NETSTAT_TIMEOUT,
+            COMMAND_TIMEOUT,
         ) else {
             return Ok(Holder::Nobody);
         };
@@ -300,16 +308,13 @@ fn count_proc_net_tcp(text: &str, port: u16) -> usize {
         .count()
 }
 
-/// Counts `ESTABLISHED` rows of BSD `netstat -an` output with local port `port`.
-fn count_netstat(text: &str, port: u16) -> usize {
-    let suffix = format!(".{port}");
+/// Counts the sockets of `lsof -Fn` output whose local end is `port`: `n` names `LOCAL->REMOTE`, with
+/// `127.0.0.1:P` or `[::1]:P` as a local end. A socket open in two processes is listed twice.
+fn count_lsof(text: &str, port: u16) -> usize {
     text.lines()
-        .filter(|line| line.starts_with("tcp") && line.trim_end().ends_with("ESTABLISHED"))
-        .filter(|line| {
-            line.split_whitespace()
-                .nth(3)
-                .is_some_and(|local| local.ends_with(&suffix))
-        })
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter_map(|name| name.split_once("->"))
+        .filter(|(local, _)| local.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()) == Some(port))
         .count()
 }
 
@@ -418,21 +423,40 @@ mod tests {
         assert_eq!(count_proc_net_tcp("", 0x0ECD), 0, "an empty table has no connections");
     }
 
-    const NETSTAT: &str = "Active Internet connections (including servers)\n\
-Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)\n\
-tcp4       0      0  127.0.0.1.3773         127.0.0.1.50000        ESTABLISHED\n\
-tcp4       0      0  127.0.0.1.50000        127.0.0.1.3773         ESTABLISHED\n\
-tcp46      0      0  *.3773                 *.*                    LISTEN\n\
-tcp6       0      0  ::1.3773               ::1.50001              ESTABLISHED\n\
-tcp4       0      0  127.0.0.1.3773         127.0.0.1.50002        TIME_WAIT\n\
-tcp4       0      0  127.0.0.1.13773        127.0.0.1.50003        ESTABLISHED\n";
+    /// `lsof -Fn` output in the format macOS prints (captured on Darwin 27.2). The listener and the
+    /// wildcard rows are synthetic edge cases: the real command's filters would not list them.
+    const LSOF: &str = concat!(
+        "p59151\nf4\nn127.0.0.1:50000->127.0.0.1:3773\n",
+        "f5\nn127.0.0.1:3773->127.0.0.1:50000\n",
+        "p59152\nf7\nn[::1]:3773->[::1]:50001\n",
+        "f8\nn127.0.0.1:3773\n",
+        "f9\nn*:13773->*:50003\n",
+        "f10\nn127.0.0.1:13773->127.0.0.1:3773\n",
+    );
 
     #[test]
-    fn netstat_rows_count_only_established_sockets_on_the_local_port() {
-        // The IPv4 and IPv6 server-side rows qualify. The client end, the listener, TIME_WAIT
-        // and a port that only ends in the digits (13773) do not.
-        assert_eq!(count_netstat(NETSTAT, 3773), 2);
-        assert_eq!(count_netstat(NETSTAT, 50000), 1);
-        assert_eq!(count_netstat("", 3773), 0);
+    fn lsof_names_count_only_sockets_whose_local_end_is_the_port() {
+        // The IPv4 and IPv6 server-side names qualify. The client end (local 50000), a listener
+        // (no `->`), and a port that only ends in the digits (13773) do not.
+        assert_eq!(count_lsof(LSOF, 3773), 2);
+        assert_eq!(count_lsof(LSOF, 50000), 1);
+        assert_eq!(count_lsof("", 3773), 0);
+    }
+
+    /// The host's own socket table, not a fixture: a client that connected to a listener is one
+    /// established connection on the listener's port (#692: macOS reported none).
+    #[test]
+    fn a_connected_client_is_counted_against_the_listeners_port() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind")?;
+        let port = listener.local_addr().context("local addr")?.port();
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port)).context("connect")?;
+        let (_accepted, _) = listener.accept().context("accept")?;
+        let count = established_to(port).map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            count, 1,
+            "the accepted connection is the one established socket on {port}"
+        );
+        Ok(())
     }
 }
