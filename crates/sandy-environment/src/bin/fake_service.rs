@@ -107,6 +107,9 @@ fn serve(args: &[String]) -> ExitCode {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let mut buf = [0u8; 512];
+                // BSD and macOS hand back an accepted socket that inherited the listener's
+                // non-blocking flag, so the read below would return at once and miss `HOLD` (#692).
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let n = stream.read(&mut buf).unwrap_or(0);
                 // A client that sends `HOLD` keeps its connection open until it closes it, like a
