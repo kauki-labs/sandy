@@ -30,5 +30,12 @@ prev.rustPlatform.buildRustPackage {
   ];
   doCheck = false;
   env.SANDY_BUILD_REV = rev;
+  # nixpkgs' cargo-setup-hook exports AWS_LC_SYS_USE_SYSTEM=1, but nothing here
+  # provides a system AWS-LC, so aws-lc-sys's build script panics. Build it
+  # from source. Set it in preBuild: the hook's export is still in force after
+  # preConfigure.
+  preBuild = ''
+    export AWS_LC_SYS_USE_SYSTEM=0
+  '';
   meta.mainProgram = pname;
 }
